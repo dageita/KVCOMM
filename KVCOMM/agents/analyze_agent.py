@@ -66,7 +66,7 @@ class AnalyzeAgent(Node):
                             wiki = await search_wiki_main(queries)
                         except Exception:
                             wiki = []
-                        if wiki:
+                        if wiki and any(str(s).strip() for s in wiki):
                             summary = (
                                 "The key entities of the problem are explained in Wikipedia as follows:"
                                 + "\n".join(wiki)
@@ -145,8 +145,11 @@ class AnalyzeAgent(Node):
         for id, info in spatial_info.items():
             if self.role == 'Wiki Searcher' and info['role']=='Knowledgeable Expert':
                 queries = find_strings_between_pluses(info['output'])
-                wiki = await search_wiki_main(queries)
-                if len(wiki):
+                try:
+                    wiki = await search_wiki_main(queries)
+                except Exception:
+                    wiki = []
+                if wiki and any(str(s).strip() for s in wiki):
                     self.wiki_summary = ".\n".join(wiki)
                     token_ids = self.llm.tokenizer(self.wiki_summary, return_tensors="pt", add_special_tokens=False)
                     token_ids = {k: v[:, :WIKI_TOKEN_LENGTH].to(self.llm.model.device) for k, v in token_ids.items() if isinstance(v, torch.Tensor)}

@@ -1052,7 +1052,12 @@ class LLMChat(LLM):
             ttft_tracer = _TTFTTracer(prompt_length)
             generation_kwargs["stopping_criteria"] = StoppingCriteriaList([ttft_tracer])
             ttft_tracer.reset(prompt_length)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             outputs = self.model.generate(**inputs, **generation_kwargs)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_to_end_latency = perf_counter() - ttft_tracer.start_time
             if ttft_tracer.ttft is None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -1079,6 +1084,12 @@ class LLMChat(LLM):
                 metadata["agent_name"] = agent_name
             if agent_role:
                 metadata["agent_role"] = agent_role
+            metadata["kvcomm_latency"] = 0.0
+            metadata["first_token_decode"] = ttft_value
+            metadata["generation_ttft"] = ttft_value
+            metadata["others_ttft"] = max(0.0, ttft_value - metadata["kvcomm_latency"] - metadata["first_token_decode"])
+            metadata["others_e2e"] = max(0.0, end_to_end_latency - ttft_value)
+            metadata["others_latency"] = metadata["others_e2e"]
             if return_cache:
                 metadata["kv_cache"] = outputs.past_key_values
             return GenerationResult(
@@ -1435,6 +1446,14 @@ class LLMChat(LLM):
         if preprocess_start is not None:
             metadata["preprocess_latency"] = preprocess_latency
             metadata["generation_ttft"] = generation_ttft
+            metadata["kvcomm_latency"] = preprocess_latency
+            metadata["first_token_decode"] = generation_ttft
+            metadata["others_ttft"] = max(
+                0.0,
+                ttft_value - preprocess_latency - generation_ttft,
+            )
+            metadata["others_e2e"] = None
+            metadata["others_latency"] = metadata["others_ttft"]
         if request_uid:
             metadata["request_uid"] = request_uid
         if agent_id:
@@ -1449,6 +1468,11 @@ class LLMChat(LLM):
             "ttft": float(ttft_value),
             "generation_ttft": float(generation_ttft),
             "preprocess_latency": float(preprocess_latency) if preprocess_start is not None else None,
+            "kvcomm_latency": float(preprocess_latency) if preprocess_start is not None else 0.0,
+            "first_token_decode": float(generation_ttft),
+            "others_ttft": float(max(0.0, ttft_value - preprocess_latency - generation_ttft)),
+            "others_e2e": None,
+            "others_latency": float(max(0.0, ttft_value - preprocess_latency - generation_ttft)),
             "request_uid": request_uid,
             "agent_id": agent_id,
             "agent_name": agent_name,
@@ -1622,9 +1646,10 @@ class LLMChat(LLM):
         ttft_tracer.reset(prefix_token_length)
         outputs = self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
         torch.cuda.synchronize()
+        kvcomm_generation_ttft = ttft_tracer.ttft if ttft_tracer.ttft is not None else 0.0
         if mode == "kv_reuse" and preprocess_start is not None:
             kvcomm_end_to_end_latency = perf_counter() - ttft_tracer.start_time
-            kvcomm_ttft_value = ttft_tracer.ttft + preprocess_latency
+            kvcomm_ttft_value = kvcomm_generation_ttft + preprocess_latency
             logger.opt(colors=True).info(
                 f"<green>Agent {self.node_id} Role {self.role} Message {_escape_loguru_markup(message)} KVCOMM E2E Latency: {kvcomm_end_to_end_latency:.4f}s TTFT: {kvcomm_ttft_value:.4f}s (Preprocess: {preprocess_latency:.4f}s)</green>",
             )
@@ -1638,7 +1663,7 @@ class LLMChat(LLM):
         _ = self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
         torch.cuda.synchronize()
         dense_end_to_end_latency = perf_counter() - ttft_tracer.start_time
-        dense_prefill_ttft = ttft_tracer.ttft
+        dense_prefill_ttft = ttft_tracer.ttft if ttft_tracer.ttft is not None else 0.0
         logger.opt(colors=True).info(
             f"<cyan>Agent {self.node_id} Role {self.role} Message {_escape_loguru_markup(message)} Dense Prefill E2E Latency: {dense_end_to_end_latency:.4f}s TTFT: {dense_prefill_ttft:.4f}s</cyan>",
         )
@@ -1742,6 +1767,23 @@ class LLMChat(LLM):
         if preprocess_start is not None:
             metadata["preprocess_latency"] = preprocess_latency
             metadata["generation_ttft"] = ttft_value - preprocess_latency
+            metadata["kvcomm_latency"] = preprocess_latency
+            metadata["first_token_decode"] = metadata["generation_ttft"]
+            metadata["others_ttft"] = max(
+                0.0,
+                ttft_value - metadata["kvcomm_latency"] - metadata["first_token_decode"],
+            )
+            if mode == "kv_reuse":
+                metadata["others_e2e"] = max(
+                    0.0,
+                    kvcomm_end_to_end_latency - ttft_value,
+                )
+            else:
+                metadata["others_e2e"] = max(
+                    0.0,
+                    dense_end_to_end_latency - ttft_value,
+                )
+            metadata["others_latency"] = metadata["others_e2e"]
         if request_uid:
             metadata["request_uid"] = request_uid
         if agent_id:
@@ -1757,6 +1799,11 @@ class LLMChat(LLM):
                 "ttft": float(ttft_value),
                 "generation_ttft": float(metadata["generation_ttft"]) if "generation_ttft" in metadata else None,
                 "preprocess_latency": float(preprocess_latency) if preprocess_start is not None else None,
+                "kvcomm_latency": float(metadata["kvcomm_latency"]) if "kvcomm_latency" in metadata else 0.0,
+                "first_token_decode": float(metadata["first_token_decode"]) if "first_token_decode" in metadata else None,
+                "others_ttft": float(metadata["others_ttft"]) if "others_ttft" in metadata else None,
+                "others_e2e": float(metadata["others_e2e"]) if "others_e2e" in metadata else None,
+                "others_latency": float(metadata["others_latency"]) if "others_latency" in metadata else None,
                 "dense_prefill_ttft": float(dense_prefill_ttft),
                 "kvcomm_end_to_end_latency": float(kvcomm_end_to_end_latency),
                 "dense_end_to_end_latency": float(dense_end_to_end_latency),
@@ -1775,6 +1822,11 @@ class LLMChat(LLM):
                 "ttft": float(ttft_value),
                 "generation_ttft": float(metadata["generation_ttft"]) if "generation_ttft" in metadata else None,
                 "preprocess_latency": float(preprocess_latency) if preprocess_start is not None else None,
+                "kvcomm_latency": float(metadata["kvcomm_latency"]) if "kvcomm_latency" in metadata else 0.0,
+                "first_token_decode": float(metadata["first_token_decode"]) if "first_token_decode" in metadata else float(dense_prefill_ttft),
+                "others_ttft": float(metadata["others_ttft"]) if "others_ttft" in metadata else float(max(0.0, ttft_value - preprocess_latency - (metadata["first_token_decode"] if "first_token_decode" in metadata else dense_prefill_ttft))),
+                "others_e2e": float(metadata["others_e2e"]) if "others_e2e" in metadata else float(max(0.0, dense_end_to_end_latency - ttft_value)),
+                "others_latency": float(metadata["others_latency"]) if "others_latency" in metadata else float(max(0.0, dense_end_to_end_latency - ttft_value)),
                 "dense_prefill_ttft": float(dense_prefill_ttft),
                 "dense_end_to_end_latency": float(dense_end_to_end_latency),
                 "request_uid": request_uid,

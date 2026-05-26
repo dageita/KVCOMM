@@ -124,6 +124,21 @@ class RequestMetricsRecorder:
             generation_ttft = metadata.get("generation_ttft")
             if generation_ttft is not None:
                 ttft_payload["generation_ttft"] = generation_ttft
+            kvcomm_latency = metadata.get("kvcomm_latency")
+            if kvcomm_latency is not None:
+                ttft_payload["kvcomm_latency"] = kvcomm_latency
+            first_token_decode = metadata.get("first_token_decode")
+            if first_token_decode is not None:
+                ttft_payload["first_token_decode"] = first_token_decode
+            others_ttft = metadata.get("others_ttft")
+            if others_ttft is not None:
+                ttft_payload["others_ttft"] = others_ttft
+            others_e2e = metadata.get("others_e2e")
+            if others_e2e is not None:
+                ttft_payload["others_e2e"] = others_e2e
+            others_latency = metadata.get("others_latency")
+            if others_latency is not None:
+                ttft_payload["others_latency"] = others_latency
             logger.opt(colors=True).info(
                 "<cyan>[TTFT:{mode}]</cyan> {}",
                 json.dumps(ttft_payload, ensure_ascii=False),

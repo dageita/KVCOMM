@@ -1,0 +1,32 @@
+# 编译产物
+*.class
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 依赖目录
+node_modules/
+vendor/
+.env
+venv/
+__pycache__/
+
+# 日志和临时文件
+*.log
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# IDE 配置（如不团队共享）
+.vscode/
+.idea/
+*.sublime-*
+
+# 敏感信息
+.env.local
+config/secrets.yml
+*.pem
+*.key

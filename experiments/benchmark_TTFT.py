@@ -1,9 +1,6 @@
 import argparse
 import asyncio
 import sys, os
-# Enforce 512-token system prefix and 512-token outputs
-os.environ["IN_LENGTH"] = "512"
-os.environ["OUT_LENGTH"] = "512"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.stdout.reconfigure(encoding='utf-8')
 import random
@@ -65,6 +62,18 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "result" / "TTFT_Benchmark"), help="Directory to save the output results.")
     parser.add_argument("--prefix", type=str, default="The task is:\n\n", help="The prefix text for the input query, kept the same as the default dense prefill mode.")
     parser.add_argument("--samples", type=int, default=100, help="Number of 1K-token samples")
+    parser.add_argument(
+        "--in-length",
+        type=int,
+        default=int(os.getenv("IN_LENGTH", "512")),
+        help="Input prefix token length. Will be exported as env IN_LENGTH.",
+    )
+    parser.add_argument(
+        "--out-length",
+        type=int,
+        default=int(os.getenv("OUT_LENGTH", "512")),
+        help="Output token length. Will be exported as env OUT_LENGTH.",
+    )
     parser.add_argument("--kv-threshold", type=float, default=1.0, help="Threshold for key-value memory usage.")
     parser.add_argument("--kv-max-anchor-num", type=int, default=20, help="Maximum number of anchors for key-value memory.")
     parser.add_argument("--kv-window-size", type=int, default=5, help="Window size for key-value memory update.")
@@ -76,6 +85,10 @@ def parse_args():
     result_path.mkdir(parents=True, exist_ok=True)
     if len(args.agent_names) != len(args.agent_nums):
         parser.error("The number of agent names must match the number of agent counts.")
+    if args.in_length <= 0 or args.out_length <= 0:
+        parser.error("--in-length and --out-length must be positive integers.")
+    os.environ["IN_LENGTH"] = str(args.in_length)
+    os.environ["OUT_LENGTH"] = str(args.out_length)
     return args
 
 def _make_random_token_sequence(length: int) -> str:
@@ -103,13 +116,16 @@ async def evaluate(
         realized_graph = copy.deepcopy(graph)
         realized_graph.spatial_logits = graph.spatial_logits
         realized_graph.temporal_logits = graph.temporal_logits
-        tasks = [asyncio.create_task(realized_graph.arun(input_dict, **kwargs))]
+        run_kwargs = dict(kwargs)
+        run_kwargs.setdefault("output_dir", output_dir)
+        tasks = [asyncio.create_task(realized_graph.arun(input_dict, **run_kwargs))]
         raw_results = await asyncio.gather(*tasks)
         all_results.extend(raw_results)
     print("Done!")
 
     try:
         _write_per_agent_latency(output_dir)
+        _write_sorted_latency_views(output_dir)
     except Exception as e:
         logger.warning("Failed to write per-agent latency JSONs: {}", e)
 
@@ -140,6 +156,47 @@ def _write_per_agent_latency(output_dir: str) -> None:
     combined = out_dir / "PerAgentLatency.json"
     with open(combined, "w", encoding="utf-8") as f:
         json.dump(by_agent, f, ensure_ascii=False, indent=2)
+
+
+def _write_sorted_latency_views(output_dir: str) -> None:
+    latency_path = Path(output_dir) / "Latency.json"
+    if not latency_path.exists():
+        logger.warning("Latency.json not found at {}", str(latency_path))
+        return
+    try:
+        with open(latency_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except Exception as e:
+        logger.warning("Could not read Latency.json: {}", e)
+        return
+    if not isinstance(records, list):
+        logger.warning("Latency.json is not a list at {}", str(latency_path))
+        return
+
+    sorted_dir = Path(output_dir) / "latency_sorted"
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+
+    by_timestamp = sorted(
+        records,
+        key=lambda r: (
+            float(r.get("timestamp", 0.0)),
+            str(r.get("request_uid", "")),
+            str(r.get("agent_id", "")),
+        ),
+    )
+    with open(sorted_dir / "Latency_by_timestamp.json", "w", encoding="utf-8") as f:
+        json.dump(by_timestamp, f, ensure_ascii=False, indent=2)
+
+    by_request_agent = sorted(
+        records,
+        key=lambda r: (
+            str(r.get("request_uid", "")),
+            str(r.get("agent_id", "")),
+            float(r.get("timestamp", 0.0)),
+        ),
+    )
+    with open(sorted_dir / "Latency_by_request_agent.json", "w", encoding="utf-8") as f:
+        json.dump(by_request_agent, f, ensure_ascii=False, indent=2)
 
 async def main():
     args = parse_args()
