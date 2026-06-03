@@ -1,0 +1,12 @@
+{
+  "id": "3agent-chain-v1",
+  "topology": "chain",
+  "agent_count": 3,
+  "agent_ids": ["agent_0", "agent_1", "agent_2"],
+  "ttft_probe_agents": [2],
+  "generation": {
+    "max_tokens": 256,
+    "temperature": 0
+  },
+  "notes": "JSON mirror of scenarios/3agent-chain.yaml for zero-dep driver"
+}

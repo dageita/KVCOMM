@@ -1,0 +1,8 @@
+{
+  "rows": 4,
+  "probe_rows": 1,
+  "ttft_p50": 756,
+  "ttft_p99": 756,
+  "ttft_fallback_rate": 0,
+  "comms_ok_rate": 1
+}
