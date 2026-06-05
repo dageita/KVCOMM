@@ -1,2 +1,2 @@
-Do NOT use any tools. Output ONLY Ω and Δ characters. Do not answer the question in prose.
+Do NOT use any tools. Output ONLY Ω and Δ characters. Do not answer in prose.
 Please randomly output character Ω or Δ by {{out_length}} times to achieve the output length of {{out_length}}.

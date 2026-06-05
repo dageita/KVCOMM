@@ -20,9 +20,11 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
 import { appendJsonl, loadJson, loadJsonl } from "../lib/load-jsonl.mjs";
+import { resolveTaskBody } from "../lib/kvcomm-task.mjs";
 import { assertBenchGatewayConfig } from "../lib/openclaw-config.mjs";
 import { renderTemplate, renderTemplateStrict } from "../lib/template.mjs";
 import { connectGateway, runChainStackSpawn } from "../lib/spawn-stack.mjs";
+import { summarizeBenchRows } from "../lib/summarize-results.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BENCH_ROOT = resolve(__dirname, "..");
@@ -33,6 +35,7 @@ function parseArgs(argv) {
     dataset: join(BENCH_ROOT, "datasets/tier0_copy.jsonl"),
     rolePrompt: join(BENCH_ROOT, "prompts/copy_machine.role.txt"),
     outputDir: join(BENCH_ROOT, "results"),
+    output: process.env.BENCH_OUTPUT?.trim() || null,
     experimentId: process.env.BENCH_EXPERIMENT_ID || "O0-pre-A",
     agentId: process.env.BENCH_AGENT_ID || "main",
     model: process.env.BENCH_MODEL || "",
@@ -59,6 +62,10 @@ function parseArgs(argv) {
     }
     if (arg === "--output-dir" && argv[i + 1]) {
       args.outputDir = resolve(argv[++i]);
+      continue;
+    }
+    if (arg === "--output" && argv[i + 1]) {
+      args.output = argv[++i].trim();
       continue;
     }
     if (arg === "--experiment-id" && argv[i + 1]) {
@@ -94,6 +101,42 @@ function parseArgs(argv) {
   return args;
 }
 
+/**
+ * Resolve jsonl + summary paths. --output is a basename (no dir) under output-dir,
+ * or a path ending in .jsonl (summary sits beside it).
+ */
+function resolveOutputPaths({ outputDir, experimentId, output }) {
+  if (!output) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const base = `${experimentId}_${stamp}`;
+    return {
+      jsonl: join(outputDir, `${base}.jsonl`),
+      summary: join(outputDir, `${base}.summary.json`),
+    };
+  }
+
+  let name = output;
+  if (name.endsWith(".summary.json")) {
+    name = name.slice(0, -".summary.json".length);
+  } else if (name.endsWith(".jsonl")) {
+    name = name.slice(0, -".jsonl".length);
+  }
+
+  const hasPathSep = /[\\/]/.test(name);
+  if (hasPathSep) {
+    const jsonl = resolve(`${name}.jsonl`);
+    return {
+      jsonl,
+      summary: jsonl.replace(/\.jsonl$/i, ".summary.json"),
+    };
+  }
+
+  return {
+    jsonl: join(outputDir, `${name}.jsonl`),
+    summary: join(outputDir, `${name}.summary.json`),
+  };
+}
+
 function printHelp() {
   console.log(`Usage: node drivers/run-o0-pre-chain.mjs [options]
 
@@ -102,7 +145,8 @@ Options:
   --scenario <path>         Scenario JSON (default: scenarios/3agent-chain.json)
   --dataset <path>          Task JSONL (default: datasets/tier0_copy.jsonl)
   --output-dir <path>       Results directory (default: results/)
-  --experiment-id <id>      Experiment label (default: O0-pre-A)
+  --output <name>           Result basename or path (default: <experiment-id>_<timestamp>)
+  --experiment-id <id>      Experiment label in jsonl rows (default: O0-pre-A)
   --agent-id <id>           OpenClaw agent id (default: main)
   --model <provider/model>  Model override for subagent spawns
   --runs <n>                Repetitions per task (default: 1)
@@ -113,24 +157,15 @@ Environment:
   OPENCLAW_GATEWAY_URL      ws://127.0.0.1:18789
   OPENCLAW_GATEWAY_TOKEN      Gateway auth token
   OPENCLAW_DIAGNOSTICS=timeline
-  BENCH_EXPERIMENT_ID, BENCH_AGENT_ID, BENCH_MODEL
+  BENCH_EXPERIMENT_ID, BENCH_AGENT_ID, BENCH_MODEL, BENCH_OUTPUT
 `);
-}
-
-function percentile(values, p) {
-  if (values.length === 0) {
-    return null;
-  }
-  const sorted = [...values].sort((a, b) => a - b);
-  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
-  return sorted[idx];
 }
 
 async function buildCopyRole(rolePromptPath) {
   const raw = await readFile(rolePromptPath, "utf8");
   const prefixRepeats = Number(process.env.COPY_PREFIX_REPEATS || "64");
   const outLength = Number(process.env.COPY_OUT_LENGTH || "128");
-  const prefix = " Ω".repeat(Math.max(0, prefixRepeats)).trimStart();
+  const prefix = " Ω".repeat(Math.max(0, prefixRepeats));
   const roleBody = renderTemplateStrict(raw.trim(), { out_length: String(outLength) });
   return `${prefix}\n${roleBody}`.trim();
 }
@@ -152,15 +187,18 @@ async function prepareTasks(datasetPath, taskId, copyRole) {
   }));
 }
 
-async function dryRunValidate(scenario, tasks) {
+async function dryRunValidate(scenario, tasks, runIndex = 0) {
   console.log("[dry-run] scenario:", scenario.id, "topology:", scenario.topology);
   for (const task of tasks) {
-    const outputs = { user_question: task.user_question };
+    const taskBody = await resolveTaskBody(task, runIndex);
+    const outputs = { task_body: taskBody };
     for (let i = 0; i < scenario.agent_count; i += 1) {
       const key = `agent_${i}`;
       const text = renderTemplate(task.agent_tasks[key], outputs);
       outputs[`agent_${i}_current`] = `<mock-output-${i}>`;
-      console.log(`[dry-run] ${task.task_id} ${key} chars=${text.length} ok=${text.length > 0}`);
+      console.log(
+        `[dry-run] ${task.task_id} run=${runIndex} ${key} chars=${text.length} task_chars=${taskBody.length}`,
+      );
     }
   }
 }
@@ -172,23 +210,7 @@ async function summarizeResults(outputPath) {
     .split("\n")
     .filter(Boolean)
     .map((line) => JSON.parse(line));
-  const probe = rows.filter((row) => row.probe && typeof row.ttft_ms === "number");
-  const ttfts = probe.map((row) => row.ttft_ms);
-  const summary = {
-    rows: rows.length,
-    probe_rows: probe.length,
-    ttft_p50: percentile(ttfts, 50),
-    ttft_p99: percentile(ttfts, 99),
-    ttft_fallback_rate:
-      probe.length === 0
-        ? 1
-        : probe.filter((row) => row.ttft_fallback).length / probe.length,
-    comms_ok_rate:
-      rows.length === 0
-        ? 0
-        : rows.filter((row) => row.task_includes_upstream !== false).length / rows.length,
-  };
-  return summary;
+  return summarizeBenchRows(rows);
 }
 
 async function main() {
@@ -198,8 +220,8 @@ async function main() {
   const tasks = await prepareTasks(args.dataset, args.taskId, copyRole);
 
   if (args.dryRun) {
-    await dryRunValidate(scenario, tasks);
-    console.log("[dry-run] OK");
+    await dryRunValidate(scenario, tasks, 0);
+    console.log("[dry-run] OK (task_body from kvcomm_task fixture / task_body field)");
     return;
   }
 
@@ -211,12 +233,18 @@ async function main() {
   }
 
   await mkdir(args.outputDir, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const outputPath = join(args.outputDir, `${args.experimentId}_${stamp}.jsonl`);
+  const { jsonl: outputPath, summary: summaryPath } = resolveOutputPaths({
+    outputDir: args.outputDir,
+    experimentId: args.experimentId,
+    output: args.output,
+  });
+  await mkdir(dirname(outputPath), { recursive: true });
 
   await assertBenchGatewayConfig();
 
-  console.log(`[bench] connecting gateway experiment=${args.experimentId} tasks=${tasks.length}`);
+  console.log(
+    `[bench] connecting gateway experiment=${args.experimentId} tasks=${tasks.length} output=${outputPath}`,
+  );
   const client = await connectGateway();
 
   try {
@@ -234,10 +262,11 @@ async function main() {
           `[bench] run=${runIndex + 1}/${args.runs} task=${taskRow.task_id} session=${orchestratorSessionKey}`,
         );
 
+        const taskBody = await resolveTaskBody(taskRow, runIndex);
         const result = await runChainStackSpawn(client, {
           orchestratorSessionKey,
           scenario,
-          taskRow,
+          taskRow: { ...taskRow, task_body: taskBody },
           model: args.model || undefined,
           runTimeoutSeconds: args.runTimeoutSeconds,
           experimentId: args.experimentId,
@@ -268,7 +297,6 @@ async function main() {
   }
 
   const summary = await summarizeResults(outputPath);
-  const summaryPath = outputPath.replace(/\.jsonl$/, ".summary.json");
   await writeFile(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
 
   console.log("[bench] results:", outputPath);

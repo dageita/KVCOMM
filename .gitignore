@@ -21,6 +21,7 @@ datasets/
 *.swo
 .DS_Store
 Thumbs.db
+experiments/bench/results/
 
 # IDE 配置（如不团队共享）
 .vscode/

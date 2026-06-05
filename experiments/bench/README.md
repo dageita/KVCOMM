@@ -110,6 +110,8 @@ openclaw gateway run
 }
 ```
 
+可合并片段：[`config/openclaw.models.snippet.json`](config/openclaw.models.snippet.json)（写入 `~/.openclaw/openclaw.json` 的 `agents.defaults.models`）。**修改后须冷重启 Gateway**。
+
 3. **Agent 工具 profile**：orchestrator 需要 `sessions_spawn`，必须用 **`coding`** 或 **`full`**。`minimal` 不含该工具，会报 `Tool not available: sessions_spawn`。
 
 4. **Subagent 工具对齐（L1 限制）**：OpenClaw leaf subagent 若通过 `deny` 禁用全部 action 工具，会与 `gateway.tools.allow` 传入的 inherited allowlist 冲突，报 `No callable tools remain`。当前可用配置：
@@ -171,6 +173,36 @@ OpenClaw 侧：`tools.profile: coding`，`contextWindow: 16384`，`compaction.re
 
 验证：`curl -s http://<vllm-host>:8001/v1/models` 中 `max_model_len` ≥ 16384。
 
+## 与 KVCOMM `benchmark_TTFT.py` 对齐（不改 KVCOMM 代码）
+
+OpenClaw 侧通过 `datasets/tier0_copy.jsonl` + `fixtures/kvcomm_tasks_seed42.json` 复现 benchmark 默认 workload：
+
+| 维度 | KVCOMM（保持默认） | OpenClaw bench（已对齐） |
+|------|-------------------|-------------------------|
+| Task | `SEED=42` 下每次 sample 1000 个 `Δ`/`Ω`（空格分隔） | `kvcomm_task` 读同一 fixture；`advance_per_run: true` 时 run `i` 用 index `base+i` |
+| 拓扑 | `Chain`，agent `i` 只见 predecessor `i-1` | agent_2 模板只注入 `agent_1_current`（非 agent_0+1） |
+| Upstream 句式 | `Agent {id}, role is Copy Machine, output is:\n\n {out}` | 同上，见 `agent_1` / `agent_2` 模板 |
+| User task 行 | `The task is: {task}\n` | `The task is: {{task_body}}\n` |
+| Prefix / 输出指令 | `IN_LENGTH` / `OUT_LENGTH`（system） | `COPY_PREFIX_REPEATS` / `COPY_OUT_LENGTH`（拼进 spawn task） |
+| 生成长度 | `DEFAULT_MAX_TOKENS` / `OUT_LENGTH` = 512 | 在 `openclaw.json` 模型上设 `max_tokens: 512`；`sessions_spawn` 无此参数 |
+
+**推荐命令（与 `chain_3_512_512_default` 同预算）：**
+
+```bash
+cd KVCOMM/experiments/bench
+export COPY_PREFIX_REPEATS=512 COPY_OUT_LENGTH=512
+npm run dry-run
+npm run run -- --runs 30 --task-id micro-001 --model vllm/Meta-Llama-3.1-8B-Instruct \
+  --output chain_3_512_openclaw_aligned
+```
+
+生成 `results/chain_3_512_openclaw_aligned.jsonl` 与 `.summary.json`（或 `BENCH_OUTPUT=同名`）。
+
+- `micro-001` + `--runs 30`：task index 0..29，对应 KVCOMM `--samples 30` 的前 30 条随机 task（同 SEED=42）。
+- 固定某次 KVCOMM run 的 task：在 jsonl 行上设 `"task_body": "<从 log REQUEST REUSE 的 task 字段粘贴>"`，并去掉 `kvcomm_task`。
+
+**仍无法消除：** copy 约束在 KVCOMM 为 **system**，OpenClaw 在 **user task**；框架 system ~5.8k tokens；TTFT 口径不同。
+
 ## 快速开始
 
 ```bash
@@ -180,11 +212,13 @@ npm install
 # 仅验证 dataset/scenario 渲染（无需 Gateway）
 npm run dry-run
 
-# 跑 1 条 task
-npm run run -- --runs 1 --task-id micro-001 --model vllm/your-model
+# 跑 1 条 task（与 KVCOMM sample 0 同 task 文本）
+COPY_PREFIX_REPEATS=512 COPY_OUT_LENGTH=512 \
+  npm run run -- --runs 1 --task-id micro-001 --model vllm/your-model
 
-# 跑完整 tier0（每条 task 30 次）
-npm run run -- --runs 30
+# 跑 30 次（对齐 KVCOMM --samples 30 的前 30 个 task）
+COPY_PREFIX_REPEATS=512 COPY_OUT_LENGTH=512 \
+  npm run run -- --runs 30 --task-id micro-001 --model vllm/your-model
 ```
 
 ## 工作原理
@@ -205,8 +239,8 @@ npm run run -- --runs 30
 
 ## 输出
 
-- `results/O0-pre-A_<timestamp>.jsonl`：每条 agent 一行 + run_summary
-- `results/O0-pre-A_<timestamp>.summary.json`：p50/p99/fallback 率
+- `results/O0-pre-A_<timestamp>.jsonl`：每条 agent 一行 + run_summary（行内 `ttft_ms` 仍为毫秒）
+- `results/O0-pre-A_<timestamp>.summary.json`：汇总统计，**TTFT 均为秒（`_s` 后缀）**；`by_agent["0"|"1"|"2"].ttft_avg_s` 为各 agent 平均 TTFT；`probe` 为 scenario 中 probe agent（默认 agent 2）的 p50/p99/avg
 
 ## 环境变量
 
@@ -217,8 +251,10 @@ npm run run -- --runs 30
 | `OPENCLAW_DIAGNOSTICS_TIMELINE_PATH` | | TTFT 真源 |
 | `BENCH_AGENT_ID` | `main` | Orchestrator agent |
 | `BENCH_MODEL` | | Subagent 模型 |
-| `COPY_PREFIX_REPEATS` | `64` | Copy 域 prefix 长度（调试用） |
-| `COPY_OUT_LENGTH` | `128` | Copy 输出 token 预算 |
+| `BENCH_OUTPUT` | | 结果文件 basename（同 `--output`） |
+| `COPY_PREFIX_REPEATS` | `64` | Copy 域 prefix：`" Ω"` 重复次数（对齐 KVCOMM `IN_LENGTH` 时请设 `512`） |
+| `COPY_OUT_LENGTH` | `128` | Copy 输出目标（对齐 KVCOMM `OUT_LENGTH` 时请设 `512`） |
+| `SEED` | （fixture 内固定 42） | Task 序列见 `fixtures/kvcomm_tasks_seed42.json` |
 
 ## 迁入 ClawBench
 

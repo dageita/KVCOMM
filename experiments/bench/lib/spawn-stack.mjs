@@ -64,6 +64,7 @@ export async function runChainStackSpawn(client, params) {
 
     const variables = {
       user_question: taskRow.user_question ?? "",
+      task_body: taskRow.task_body ?? "",
       ...Object.fromEntries(
         Object.entries(outputs).map(([key, value]) => [key, value]),
       ),
@@ -155,8 +156,10 @@ export async function runChainStackSpawn(client, params) {
           ? true
           : agentIndex === 1
             ? taskText.includes(outputs.agent_0_current ?? "__missing__")
-            : taskText.includes(outputs.agent_0_current ?? "__missing__") &&
-              taskText.includes(outputs.agent_1_current ?? "__missing__"),
+            : scenario.topology === "chain"
+              ? taskText.includes(outputs.agent_1_current ?? "__missing__")
+              : taskText.includes(outputs.agent_0_current ?? "__missing__") &&
+                taskText.includes(outputs.agent_1_current ?? "__missing__"),
       output_text: outputText,
       output_len: outputText.length,
       ...outputFormat,
