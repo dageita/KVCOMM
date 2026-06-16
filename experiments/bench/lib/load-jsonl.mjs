@@ -21,6 +21,11 @@ export async function loadJson(filePath) {
   return JSON.parse(raw);
 }
 
+export async function initJsonlOutput(filePath) {
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(filePath, "", "utf8");
+}
+
 export async function appendJsonl(filePath, record) {
   const { appendFile } = await import("node:fs/promises");
   await appendFile(filePath, `${JSON.stringify(record)}\n`, "utf8");

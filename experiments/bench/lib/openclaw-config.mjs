@@ -92,3 +92,23 @@ export async function assertBenchGatewayConfig() {
   }
   return { configPath, config };
 }
+
+const DEFAULT_CAPABILITY_SUBAGENT_TOOLS = [
+  "read",
+  "write",
+  "edit",
+  "apply_patch",
+  "exec",
+  "process",
+  "session_status",
+];
+
+/** tools.subagents.tools.allow from openclaw.json (ClawBench capability lane). */
+export async function resolveCapabilitySubagentTools() {
+  const { config } = await readOpenClawConfig();
+  const allow = config?.tools?.subagents?.tools?.allow;
+  if (!Array.isArray(allow) || allow.length === 0) {
+    return DEFAULT_CAPABILITY_SUBAGENT_TOOLS;
+  }
+  return allow.map((name) => String(name).trim()).filter(Boolean);
+}

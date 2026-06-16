@@ -102,6 +102,50 @@ class _TTFTTracer(StoppingCriteria):
             self.ttft = perf_counter() - self.start_time
         return False
 
+
+class _TokenStreamCallback(StoppingCriteria):
+    """Emit decoded token deltas during generation for OpenClaw SSE streaming."""
+
+    def __init__(self, tokenizer: Any, prompt_length: int, on_token: Any):
+        self.tokenizer = tokenizer
+        self.prompt_length = prompt_length
+        self.on_token = on_token
+        self._last_len = prompt_length
+
+    def reset(self, prompt_length: int) -> None:
+        self.prompt_length = prompt_length
+        self._last_len = prompt_length
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any) -> bool:
+        if input_ids is None or input_ids.numel() == 0:
+            return False
+        # With past_key_values, HF often passes only the newest token each step.
+        if input_ids.shape[-1] == 1:
+            text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        else:
+            cur_len = int(input_ids.shape[-1])
+            if cur_len <= self._last_len:
+                return False
+            new_ids = input_ids[0, self._last_len:cur_len]
+            self._last_len = cur_len
+            if new_ids.numel() == 0:
+                return False
+            text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
+        if text:
+            self.on_token(text)
+        return False
+
+
+def _bench_no_think_enabled() -> bool:
+    raw = os.environ.get("KVCOMM_BENCH_NO_THINK", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _chat_template_kwargs() -> Dict[str, Any]:
+    if not _bench_no_think_enabled():
+        return {}
+    return {"enable_thinking": False}
+
 @retry(wait=wait_random_exponential(max=100), stop=stop_after_attempt(3))
 async def achat(model: str, msg: List[Dict],):
     """Call an OpenAI-compatible chat endpoint asynchronously."""
@@ -405,10 +449,16 @@ class LLMChat(LLM):
         assistant_prompt = assistant_prompt or self.default_assistant_prompt
         prompt_text = ""
         try:
+            template_kwargs = _chat_template_kwargs()
+            apply_kwargs: Dict[str, Any] = {
+                "add_generation_prompt": add_generation_prompt,
+                "tokenize": False,
+            }
+            if template_kwargs:
+                apply_kwargs["chat_template_kwargs"] = template_kwargs
             prompt_text = self.tokenizer.apply_chat_template(
                 normalised,
-                add_generation_prompt=add_generation_prompt,
-                tokenize=False,
+                **apply_kwargs,
             ) + assistant_prompt
 
             tokenized = self.tokenizer.encode(prompt_text, return_tensors="pt", add_special_tokens=False)
@@ -695,12 +745,25 @@ class LLMChat(LLM):
         placeholder_info = agent_memory.get("placeholder_info")
         safe_message = _escape_loguru_markup(message)
 
+        def _record_input_anchor_metrics(
+            mode: str,
+            *,
+            pooled_tokens: int = 0,
+            prediction: bool = False,
+        ) -> str:
+            state.input_anchor_metrics = {
+                "input_routing_mode": mode,
+                "input_anchor_prediction": prediction,
+                "input_anchor_pooled_tokens": int(pooled_tokens),
+            }
+            return mode
+
         if message in shared_mem.get("input", {}):
             if not placeholder_info:
                 logger.opt(colors=True).warning(
                     f"<yellow>No placeholder info found for agent '{agent_id}' while reusing input cache.</yellow>"
                 )
-                return "kv_reuse"
+                return _record_input_anchor_metrics("kv_reuse")
             placeholder_entries = list(placeholder_info.items())[::-1]
             for ph_id, _ in placeholder_entries:
                 safe_ph_id = _escape_loguru_markup(ph_id)
@@ -711,15 +774,15 @@ class LLMChat(LLM):
                         logger.opt(colors=True).debug(
                             f"<green>The message has repeatedly received for message '{safe_message}' at placeholder '{safe_ph_id}'. So we will reuse the KV cache.</green>"
                         )
-                        return "kv_reuse"
+                        return _record_input_anchor_metrics("kv_reuse")
                     logger.opt(colors=True).debug(
                         f"<yellow>Existing Anchor for message '{safe_message}' at placeholder '{safe_ph_id}'.</yellow>"
                     )
-                    return "dense_prefill"
+                    return _record_input_anchor_metrics("dense_prefill")
             logger.opt(colors=True).debug(
                 f"<green>Reusing KV caches for message '{safe_message}' in all placeholders</green>."
             )
-            return "kv_reuse"
+            return _record_input_anchor_metrics("kv_reuse")
 
         token_ids = self.tokenize_segment(
             role=role,
@@ -811,14 +874,19 @@ class LLMChat(LLM):
                 uq_info_bucket[msg_key] = anchor_activated_list[idx]
                 bucket_entry = global_bucket.setdefault(msg_key, [0, 0])
                 bucket_entry[0] = anchor_activated_list[idx]
-            return "kv_reuse"
+            return _record_input_anchor_metrics("kv_reuse")
 
+        pooled_tokens = int(input_cache.get_seq_length() - drop_num)
         uq_info_bucket[message] = 0
         global_bucket[message] = [
             0,
-            input_cache.get_seq_length() - drop_num,
+            pooled_tokens,
         ]
-        return "dense_prefill"
+        return _record_input_anchor_metrics(
+            "dense_prefill",
+            pooled_tokens=pooled_tokens,
+            prediction=True,
+        )
 
     async def generate_for_agent(
         self,
@@ -832,6 +900,7 @@ class LLMChat(LLM):
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        on_token: Optional[Any] = None,
         **kwargs: Any,
     ) -> GenerationResult:
         """Generate a response using the requested strategy with sensible fallbacks."""
@@ -843,6 +912,7 @@ class LLMChat(LLM):
         else:
             mode = "kv_reuse"
 
+        stream_kwargs = {**kwargs, "on_token": on_token} if on_token is not None else kwargs
         if mode == "dense_prefill":
             return await self.generate_with_dense_prefill(
                 message,
@@ -855,7 +925,7 @@ class LLMChat(LLM):
                 agent_name=agent_name,
                 agent_role=agent_role,
                 output_dir=latency_target,
-                **kwargs,
+                **stream_kwargs,
             )
         return await self.generate_with_kv_reuse(
             message,
@@ -866,7 +936,7 @@ class LLMChat(LLM):
             agent_name=agent_name,
             agent_role=agent_role,
             output_dir=latency_target,
-            **kwargs,
+            **stream_kwargs,
         )
 
     def _map_in_pool(self, fn, iterable, timeout=None):
@@ -923,22 +993,429 @@ class LLMChat(LLM):
         self._shared_kv_cache_memory[node_id]["prefix"] = LLMChat._shared_kv_cache_memory[node_id]["prefix"] = segment_kv_list          
         self._shared_kv_cache_memory[node_id]["placeholder_info"] = LLMChat._shared_kv_cache_memory[node_id]["placeholder_info"] = placeholder_info
         self._shared_kv_cache_memory[node_id]["token_ids"] = LLMChat._shared_kv_cache_memory[node_id]["token_ids"] = token_id_list            
+        self._shared_kv_cache_memory[node_id]["system_prompt"] = prefix
+        self._shared_kv_cache_memory[node_id]["user_template"] = user_prompt
 
         self._initialization[node_id] = LLMChat._initialization[node_id] = True
+
+    def get_prefix_turn_count(self, node_id: str) -> int:
+        bucket = LLMChat._shared_kv_cache_memory.get(node_id, {})
+        try:
+            return int(bucket.get("turn_count", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_prefix_turn_count(self, node_id: str, turn_count: int) -> None:
+        bucket = LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
+        bucket["turn_count"] = int(turn_count)
+
+    async def append_prefix_segment(
+        self,
+        node_id: str,
+        segment_template: str,
+        *,
+        system_prompt: str | None = None,
+    ) -> None:
+        """Append a templated segment (with turn placeholders) to an existing prefix."""
+        bucket = LLMChat._shared_kv_cache_memory.get(node_id, {})
+        stored_user = str(bucket.get("user_template") or "").strip()
+        stored_system = str(system_prompt or bucket.get("system_prompt") or "").strip()
+        merged_user = f"{stored_user}\n{segment_template.strip()}\n".strip()
+        await self.prepare_prefix_kv_segments(node_id, stored_system, merged_user)
+
+    async def materialize_turn_placeholders(
+        self,
+        node_id: str,
+        message_key: str,
+        turn_content: Dict[str, str],
+    ) -> None:
+        """Materialize KV caches for completed assistant/tool turn placeholders."""
+        if not turn_content:
+            return
+        mem = LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
+        turn_root = mem.setdefault("turn", {})
+        for ph_id, content in turn_content.items():
+            if not ph_id.startswith("turn_") or not str(content).strip():
+                continue
+            bucket = turn_root.setdefault(ph_id, {})
+            if bucket.get(message_key):
+                continue
+            token_ids = self.tokenizer(
+                str(content),
+                add_special_tokens=False,
+                return_tensors="pt",
+            )
+            token_ids = {
+                key: value.to(self.model.device) if isinstance(value, torch.Tensor) else value
+                for key, value in token_ids.items()
+            }
+            token_ids["attention_mask"] = torch.ones_like(token_ids["input_ids"]).to(self.model.device)
+            with torch.no_grad():
+                output = self.model.generate(
+                    **token_ids,
+                    use_cache=True,
+                    max_length=token_ids["input_ids"].shape[-1] + 1,
+                    return_dict_in_generate=True,
+                    return_legacy_cache=False,
+                )
+            kv_cache = output.past_key_values.slice_(
+                start=0,
+                end=token_ids["input_ids"].shape[-1],
+            )
+            bucket[message_key] = {
+                "kv": kv_cache,
+                "ids": token_ids,
+                "drop_num": 0,
+            }
+
+    @staticmethod
+    def _pretrained_kwargs(model_name: str) -> dict[str, Any]:
+        """Use local_files_only when model_name points at an on-disk snapshot."""
+        expanded = os.path.expanduser(model_name)
+        if os.path.isdir(expanded):
+            return {"local_files_only": True}
+        return {}
+
+    @staticmethod
+    def _resolve_hf_dtype(model_name: str) -> torch.dtype:
+        """Pick load dtype: bf16 for Qwen (matches checkpoint), fp16 for Llama."""
+        name = model_name.lower()
+        if "llama" in name:
+            return torch.float16
+        if "qwen" in name:
+            return torch.bfloat16
+        return torch.float32
+
+    @staticmethod
+    def _parse_gpu_pool(device: str) -> list[int]:
+        if not device or device in ("auto", "balanced", "balanced_low_0", "sequential"):
+            if not torch.cuda.is_available():
+                return []
+            return list(range(torch.cuda.device_count()))
+        if "," in device:
+            return [int(part.strip()) for part in device.split(",") if part.strip().isdigit()]
+        if device.isdigit():
+            return [int(device)]
+        return []
+
+    @staticmethod
+    def _estimate_model_weight_gib(model_name: str) -> float:
+        """Estimate on-disk weight bytes for device_map planning."""
+        expanded = os.path.expanduser(model_name)
+        if os.path.isdir(expanded):
+            index_path = Path(expanded) / "model.safetensors.index.json"
+            if index_path.exists():
+                try:
+                    data = json.loads(index_path.read_text(encoding="utf-8"))
+                    total = data.get("metadata", {}).get("total_size")
+                    if total:
+                        return float(total) / (1024**3)
+                except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                    pass
+            shard_bytes = sum(
+                shard.stat().st_size for shard in Path(expanded).glob("*.safetensors")
+            )
+            if shard_bytes:
+                return shard_bytes / (1024**3)
+        return 64.0
+
+    @staticmethod
+    def _gpu_total_gib(gpu_id: int) -> float:
+        return torch.cuda.get_device_properties(gpu_id).total_memory / (1024**3)
+
+    @staticmethod
+    def _gpu_free_gib(gpu_id: int) -> float:
+        free, _ = torch.cuda.mem_get_info(gpu_id)
+        return free / (1024**3)
+
+    @staticmethod
+    def _auto_plan_multi_gpu(model_name: str, gpu_pool: list[int]) -> dict[str, Any]:
+        """Pick minimum GPUs from pool and cap per-GPU weight bytes to leave KV headroom."""
+        if not gpu_pool:
+            raise RuntimeError("KVCOMM_HF_DEVICE pool is empty and no CUDA devices are visible.")
+
+        weight_gib = LLMChat._estimate_model_weight_gib(model_name)
+        headroom_gib = float(os.environ.get("KVCOMM_HF_INFERENCE_HEADROOM_GIB", "12"))
+        weight_margin_gib = float(os.environ.get("KVCOMM_HF_WEIGHT_MARGIN_GIB", "2"))
+        dtype = LLMChat._resolve_hf_dtype(model_name)
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available for HF KVCOMM engine.")
+
+        gpu_stats: list[dict[str, float | int]] = []
+        for gpu_id in gpu_pool:
+            total_gib = LLMChat._gpu_total_gib(gpu_id)
+            free_gib = LLMChat._gpu_free_gib(gpu_id)
+            # Explicit pool = user-designated HF cards; plan on total VRAM, not snapshot free.
+            effective_total = total_gib
+            if free_gib < total_gib * 0.20:
+                logger.warning(
+                    "GPU {} only {:.1f}GiB free of {:.1f}GiB total — ensure it is dedicated to HF sidecar.",
+                    gpu_id,
+                    free_gib,
+                    total_gib,
+                )
+            weight_budget = max(1.0, effective_total - headroom_gib - weight_margin_gib)
+            gpu_stats.append(
+                {
+                    "id": gpu_id,
+                    "total_gib": total_gib,
+                    "free_gib": free_gib,
+                    "weight_budget_gib": weight_budget,
+                }
+            )
+
+        selected: list[int] = []
+        cumulative_budget = 0.0
+        for stat in gpu_stats:
+            selected.append(int(stat["id"]))
+            cumulative_budget += float(stat["weight_budget_gib"])
+            if cumulative_budget >= weight_gib * 1.01:
+                break
+
+        if cumulative_budget < weight_gib:
+            raise RuntimeError(
+                f"HF model needs ~{weight_gib:.1f}GiB weights (+{headroom_gib:.0f}GiB/GPU KV headroom). "
+                f"Pool {gpu_pool} only budgets ~{cumulative_budget:.1f}GiB across "
+                f"{len(gpu_pool)} GPU(s). Add more GPUs to KVCOMM_HF_DEVICE or free VRAM."
+            )
+
+        weight_share_gib = weight_gib / len(selected)
+        max_memory: dict[int, str] = {}
+        for gpu_id in selected:
+            stat = next(item for item in gpu_stats if item["id"] == gpu_id)
+            cap_gib = min(
+                weight_share_gib + weight_margin_gib,
+                float(stat["total_gib"]) * 0.90,
+            )
+            max_memory[gpu_id] = f"{max(1, int(cap_gib))}GiB"
+
+        return {
+            "device_map": "auto",
+            "max_memory": max_memory,
+            "torch_dtype": dtype,
+            "_selected_gpus": selected,
+            "_weight_gib": round(weight_gib, 2),
+            "_headroom_gib": headroom_gib,
+        }
+
+    @staticmethod
+    def _resolve_hf_load_kwargs(model_name: str) -> dict[str, Any]:
+        """Build from_pretrained kwargs with automatic multi-GPU sharding.
+
+        KVCOMM_HF_DEVICE: comma-separated **available GPU pool** (e.g. 2,3,4,5).
+          The planner auto-picks the minimum subset that fits weights + KV headroom.
+        KVCOMM_HF_INFERENCE_HEADROOM_GIB: KV/activation reserve per GPU (default 12).
+        KVCOMM_HF_WEIGHT_MARGIN_GIB: extra weight cap margin per GPU (default 2).
+        """
+        device = os.environ.get("KVCOMM_HF_DEVICE", "").strip()
+        dtype = LLMChat._resolve_hf_dtype(model_name)
+
+        if device in ("auto", "balanced", "balanced_low_0", "sequential"):
+            return {"device_map": device, "torch_dtype": dtype}
+
+        gpu_pool = LLMChat._parse_gpu_pool(device)
+        if not gpu_pool:
+            return {"device_map": device or "cuda:0", "torch_dtype": dtype}
+
+        weight_gib = LLMChat._estimate_model_weight_gib(model_name)
+        headroom_gib = float(os.environ.get("KVCOMM_HF_INFERENCE_HEADROOM_GIB", "12"))
+        weight_margin_gib = float(os.environ.get("KVCOMM_HF_WEIGHT_MARGIN_GIB", "2"))
+
+        if len(gpu_pool) == 1:
+            gpu_id = gpu_pool[0]
+            if torch.cuda.is_available():
+                total_gib = LLMChat._gpu_total_gib(gpu_id)
+                effective = total_gib
+                if weight_gib + headroom_gib + weight_margin_gib > effective:
+                    needed = max(
+                        2,
+                        int(
+                            (weight_gib + headroom_gib + weight_margin_gib - 1)
+                            // max(1.0, effective - headroom_gib - weight_margin_gib)
+                        )
+                        + 1,
+                    )
+                    raise RuntimeError(
+                        f"GPU {gpu_id} has ~{effective:.1f}GiB usable but model needs "
+                        f"~{weight_gib:.1f}GiB weights + {headroom_gib:.0f}GiB KV headroom. "
+                        f"Use at least {needed} GPUs in KVCOMM_HF_DEVICE."
+                    )
+            cap = int(min(weight_gib + weight_margin_gib, LLMChat._gpu_total_gib(gpu_id) * 0.90))
+            return {
+                "device_map": f"cuda:{gpu_id}",
+                "max_memory": {gpu_id: f"{max(1, cap)}GiB"},
+                "torch_dtype": dtype,
+                "_selected_gpus": [gpu_id],
+                "_weight_gib": round(weight_gib, 2),
+            }
+
+        plan = LLMChat._auto_plan_multi_gpu(model_name, gpu_pool)
+        manual_cap = os.environ.get("KVCOMM_HF_MAX_MEMORY", "").strip()
+        if manual_cap and plan.get("max_memory"):
+            plan["max_memory"] = {
+                gpu_id: manual_cap for gpu_id in plan["max_memory"]
+            }
+        return plan
+
+    @staticmethod
+    def _pretrained_load_kwargs(plan: dict[str, Any]) -> dict[str, Any]:
+        """Strip planner metadata before passing kwargs to from_pretrained."""
+        return {key: value for key, value in plan.items() if not str(key).startswith("_")}
+
+    @classmethod
+    def configured_gpu_pool(cls) -> list[int]:
+        """Physical GPU ids configured for HF inference (never all visible devices)."""
+        device = os.environ.get("KVCOMM_HF_DEVICE", "").strip()
+        pool = cls._parse_gpu_pool(device)
+        if pool:
+            return pool
+        try:
+            plan = cls._resolve_hf_load_kwargs(
+                os.environ.get("KVCOMM_HF_MODEL", "") or os.environ.get("KVCOMM_HF_MODEL_PATH", "")
+            )
+            selected = plan.get("_selected_gpus")
+            if isinstance(selected, list):
+                return [int(gpu_id) for gpu_id in selected]
+        except Exception:
+            pass
+        return []
+
+    @classmethod
+    def _clear_shared_kv_memory(cls) -> None:
+        store = cls._shared_kv_cache_memory
+        if not isinstance(store, dict):
+            cls._shared_kv_cache_memory = None
+            return
+        store.clear()
+        cls._shared_kv_cache_memory = None
+
+    @classmethod
+    def _dispose_hf_model(cls, model: Any) -> None:
+        if model is None:
+            return
+        try:
+            from accelerate.hooks import remove_hook_from_module
+        except ImportError:
+            remove_hook_from_module = None
+        if remove_hook_from_module is not None:
+            for module in list(model.modules()):
+                try:
+                    remove_hook_from_module(module)
+                except Exception:
+                    pass
+        try:
+            model.to("cpu")
+        except Exception:
+            pass
+        del model
+
+    @classmethod
+    def _flush_cuda_pool(cls, gpu_pool: list[int]) -> None:
+        if not torch.cuda.is_available():
+            return
+        if not gpu_pool:
+            try:
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            return
+        for gpu_id in gpu_pool:
+            try:
+                with torch.cuda.device(gpu_id):
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    if hasattr(torch.cuda, "ipc_collect"):
+                        torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+    @classmethod
+    def release_shared_resources(cls) -> bool:
+        """Unload shared HF weights/tokenizer and free GPU memory."""
+        import gc
+
+        gpu_pool = cls.configured_gpu_pool()
+        model = None
+        tokenizer = None
+        released = False
+        with cls._model_lock:
+            if (
+                cls._shared_model is None
+                and cls._shared_tokenizer is None
+                and not cls._shared_kv_cache_memory
+            ):
+                return False
+            model = cls._shared_model
+            tokenizer = cls._shared_tokenizer
+            cls._shared_model = None
+            cls._shared_tokenizer = None
+            cls._clear_shared_kv_memory()
+            cls._initialization = {}
+            released = True
+        if cls._THREAD_POOL is not None:
+            try:
+                cls._THREAD_POOL.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            cls._THREAD_POOL = None
+            cls._THREAD_POOL_WORKERS = None
+        cls._dispose_hf_model(model)
+        if tokenizer is not None:
+            del tokenizer
+        cls._request_states.clear()
+        cls._active_requests.clear()
+        cls._staged_commits.clear()
+        gc.collect()
+        cls._flush_cuda_pool(gpu_pool)
+        return released
+
+    @staticmethod
+    def describe_hf_load_plan(model_name: str | None = None) -> str:
+        """Human-readable summary for /health and logs."""
+        model_name = model_name or os.environ.get("KVCOMM_HF_MODEL", "")
+        plan = LLMChat._resolve_hf_load_kwargs(model_name)
+        device_map = plan.get("device_map")
+        dtype = plan.get("torch_dtype")
+        max_memory = plan.get("max_memory")
+        selected = plan.get("_selected_gpus")
+        weight_gib = plan.get("_weight_gib")
+        headroom = plan.get("_headroom_gib")
+        parts = [f"device_map={device_map}", f"dtype={dtype}"]
+        if selected:
+            parts.append(f"selected_gpus={selected}")
+        if weight_gib is not None:
+            parts.append(f"weight_gib={weight_gib}")
+        if headroom is not None:
+            parts.append(f"kv_headroom_gib={headroom}")
+        if max_memory:
+            parts.append(f"max_memory={max_memory}")
+        return " ".join(parts)
 
     def _initialize_shared_resources(self):
         """Lazy-load shared tokenizer/model and shared KV memory storage."""
         with LLMChat._model_lock:
             if LLMChat._shared_model is None:
-                LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                local_kwargs = self._pretrained_kwargs(self.model_name)
+                load_plan = self._resolve_hf_load_kwargs(self.model_name)
+                load_kwargs = self._pretrained_load_kwargs(load_plan)
+                LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_name, **local_kwargs
+                )
                 LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=torch.float16 if 'llama' in self.model_name else torch.float32,
                     low_cpu_mem_usage=True,
-                    device_map="cuda:0",
-                    trust_remote_code=True
+                    trust_remote_code=True,
+                    **local_kwargs,
+                    **load_kwargs,
                 )
-                logger.info("Model {} loaded and shared across instances.", self.model_name)
+                logger.info(
+                    "Model {} loaded ({}) and shared across instances.",
+                    self.model_name,
+                    self.describe_hf_load_plan(self.model_name),
+                )
             if LLMChat._shared_kv_cache_memory is None:
                 LLMChat._shared_kv_cache_memory = {}
 
@@ -955,7 +1432,9 @@ class LLMChat(LLM):
             encoding or (encoding, segments): Tokenized input and optional segments.
         """
 
-        placeholder_pattern = r'\{((?:agent|condition)_\w+_(?:current|history)|user_question)\}'
+        placeholder_pattern = (
+            r'\{((?:agent|condition)_\w+_(?:current|history)|user_question|turn_\d+_(?:assistant|tool))\}'
+        )
 
         matches = list(re.finditer(placeholder_pattern, original_text))
 
@@ -1182,6 +1661,8 @@ class LLMChat(LLM):
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        on_token: Optional[Any] = None,
+        **kwargs: Any,
     ) -> GenerationResult:
         """Core KV-aware generation entry.
 
@@ -1197,7 +1678,7 @@ class LLMChat(LLM):
         if request_uid is None:
             raise ValueError("request_uid must be provided for agen_kvcomm.")
         state = self.kv_engine.resolve_request_state(request_uid)
-        preprocess_start = perf_counter() if mode == "kv_reuse" else None
+        preprocess_start = perf_counter()
 
         if isinstance(messages, List):
             message = messages[0]
@@ -1251,6 +1732,25 @@ class LLMChat(LLM):
             cum_offset += delta_len
             ph_cum_len += real_len
             ph_id_list.append(ph_id)
+
+        reuse_kv_segments: List[Dict[str, Any]] = []
+        if mode == "kv_reuse":
+            for m in meta:
+                ph_cache_ids = m.get("ph_cache_ids")
+                real_len = int(m["ph_cache"]._seen_tokens - m["drop_num"])
+                seg_text = ""
+                if isinstance(ph_cache_ids, dict) and "input_ids" in ph_cache_ids:
+                    seg_text = self.tokenizer.decode(
+                        ph_cache_ids["input_ids"][0],
+                        skip_special_tokens=True,
+                    )
+                reuse_kv_segments.append(
+                    {
+                        "ph_id": m["ph_id"],
+                        "tokens": real_len,
+                        "text": seg_text[:500],
+                    }
+                )
 
         if mode == "dense_prefill":
             tasks = [(message, m) for m in meta]
@@ -1315,21 +1815,32 @@ class LLMChat(LLM):
             generation_kwargs["past_key_values"] = merged_prefix_kv
 
         ttft_tracer = _TTFTTracer(prefix_token_length)
-        generation_kwargs["stopping_criteria"] = StoppingCriteriaList([ttft_tracer])
         ttft_tracer.reset(prefix_token_length)
-        preprocess_latency = 0.0
-        if preprocess_start is not None:
-            preprocess_latency = max(0.0, perf_counter() - preprocess_start)
-        outputs = self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
+        stream_cb = None
+        token_cb = on_token or kwargs.get("on_token")
+        if token_cb is not None:
+            stream_cb = _TokenStreamCallback(self.tokenizer, prefix_token_length, token_cb)
+            stream_cb.reset(prefix_token_length)
+        criteria: List[StoppingCriteria] = [ttft_tracer]
+        if stream_cb is not None:
+            criteria.append(stream_cb)
+        generation_kwargs["stopping_criteria"] = StoppingCriteriaList(criteria)
+        preprocess_latency = max(0.0, perf_counter() - preprocess_start)
+
+        def _run_model_generate():
+            return self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
+
+        if token_cb is not None:
+            outputs = await asyncio.to_thread(_run_model_generate)
+        else:
+            outputs = _run_model_generate()
         if ttft_tracer.ttft is None:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             generation_ttft = 0.0
         else:
             generation_ttft = ttft_tracer.ttft
-        ttft_value = generation_ttft
-        if preprocess_start is not None:
-            ttft_value += preprocess_latency
+        ttft_value = generation_ttft + preprocess_latency
 
         full_kv_cache = outputs.past_key_values
 
@@ -1371,6 +1882,9 @@ class LLMChat(LLM):
         response_mask = torch.ones(seq.size(0), attn_len, device=self.model.device)
 
         current_key = f"agent_{self.node_id}_current"
+        had_prior_response_anchor = bool(
+            state.anchor_dict.get(current_key, {}).get(message)
+        )
         anchor_bucket = state.anchors.setdefault(current_key, {})
         anchor_len_bucket = state.anchor_len_dict.setdefault(current_key, {})
         anchor_info_bucket = state.anchor_info_dict.setdefault(current_key, {})
@@ -1442,18 +1956,30 @@ class LLMChat(LLM):
 
         metadata: Dict[str, Any] = {
             "placeholder_ids": ph_id_list,
+            "anchor_prediction": bool(prob),
+            "anchor_pooled_tokens": (
+                int(response_tokens.numel()) if prob and not had_prior_response_anchor else 0
+            ),
         }
-        if preprocess_start is not None:
-            metadata["preprocess_latency"] = preprocess_latency
-            metadata["generation_ttft"] = generation_ttft
-            metadata["kvcomm_latency"] = preprocess_latency
-            metadata["first_token_decode"] = generation_ttft
-            metadata["others_ttft"] = max(
-                0.0,
-                ttft_value - preprocess_latency - generation_ttft,
+        if reuse_kv_segments:
+            joined_reuse = " | ".join(
+                segment["text"] for segment in reuse_kv_segments if segment.get("text")
             )
-            metadata["others_e2e"] = None
-            metadata["others_latency"] = metadata["others_ttft"]
+            compact_reuse = joined_reuse.replace("\n", " ").strip()
+            if len(compact_reuse) > 500:
+                compact_reuse = f"{compact_reuse[:497]}..."
+            metadata["reuse_kv_segments"] = reuse_kv_segments
+            metadata["reuse_kv_text"] = compact_reuse
+        metadata["preprocess_latency"] = preprocess_latency
+        metadata["generation_ttft"] = generation_ttft
+        metadata["kvcomm_latency"] = preprocess_latency
+        metadata["first_token_decode"] = generation_ttft
+        metadata["others_ttft"] = max(
+            0.0,
+            ttft_value - preprocess_latency - generation_ttft,
+        )
+        metadata["others_e2e"] = None
+        metadata["others_latency"] = metadata["others_ttft"]
         if request_uid:
             metadata["request_uid"] = request_uid
         if agent_id:
@@ -1467,8 +1993,8 @@ class LLMChat(LLM):
             "mode": mode,
             "ttft": float(ttft_value),
             "generation_ttft": float(generation_ttft),
-            "preprocess_latency": float(preprocess_latency) if preprocess_start is not None else None,
-            "kvcomm_latency": float(preprocess_latency) if preprocess_start is not None else 0.0,
+            "preprocess_latency": float(preprocess_latency),
+            "kvcomm_latency": float(preprocess_latency),
             "first_token_decode": float(generation_ttft),
             "others_ttft": float(max(0.0, ttft_value - preprocess_latency - generation_ttft)),
             "others_e2e": None,
@@ -1479,6 +2005,7 @@ class LLMChat(LLM):
             "agent_role": agent_role,
             "message": str(message) if message is not None else None,
             "placeholder_ids": ph_id_list,
+            "anchor_prediction": bool(prob),
         }
         _append_latency_record(output_dir, latency_record)
         return GenerationResult(
@@ -1572,6 +2099,25 @@ class LLMChat(LLM):
             cum_offset += delta_len
             ph_cum_len += real_len
             ph_id_list.append(ph_id)
+
+        reuse_kv_segments: List[Dict[str, Any]] = []
+        if mode == "kv_reuse":
+            for m in meta:
+                ph_cache_ids = m.get("ph_cache_ids")
+                real_len = int(m["ph_cache"]._seen_tokens - m["drop_num"])
+                seg_text = ""
+                if isinstance(ph_cache_ids, dict) and "input_ids" in ph_cache_ids:
+                    seg_text = self.tokenizer.decode(
+                        ph_cache_ids["input_ids"][0],
+                        skip_special_tokens=True,
+                    )
+                reuse_kv_segments.append(
+                    {
+                        "ph_id": m["ph_id"],
+                        "tokens": real_len,
+                        "text": seg_text[:500],
+                    }
+                )
 
         if mode == "dense_prefill":
             tasks = [(message, m) for m in meta]
@@ -1691,6 +2237,9 @@ class LLMChat(LLM):
         response_mask = torch.ones(seq.size(0), attn_len, device=self.model.device)
 
         current_key = f"agent_{self.node_id}_current"
+        had_prior_response_anchor = bool(
+            state.anchor_dict.get(current_key, {}).get(message)
+        )
         anchor_bucket = state.anchors.setdefault(current_key, {})
         anchor_len_bucket = state.anchor_len_dict.setdefault(current_key, {})
         anchor_info_bucket = state.anchor_info_dict.setdefault(current_key, {})

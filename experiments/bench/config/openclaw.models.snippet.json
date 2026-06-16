@@ -1,6 +1,6 @@
 {
   "_comment": "Merge into ~/.openclaw/openclaw.json under agents.defaults.models. Restart Gateway after edit.",
-  "vllm/Meta-Llama-3.1-8B-Instruct": {
+  "vllm/Qwen3-32B": {
     "params": {
       "extra_body": {
         "tool_choice": "none"

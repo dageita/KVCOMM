@@ -2,11 +2,11 @@
   "name": "@kvcomm/openclaw-bench-driver",
   "private": true,
   "type": "module",
-  "description": "OpenClaw subagent stack + TTFT benchmark driver (O0-pre spike)",
+  "description": "OpenClaw subagent stack + TTFT benchmark (implementation; use ../openclaw/cli.mjs)",
   "scripts": {
-    "run": "node drivers/run-o0-pre-chain.mjs",
-    "dry-run": "node drivers/run-o0-pre-chain.mjs --dry-run",
-    "verify-dataset": "node drivers/run-o0-pre-chain.mjs --dry-run --task-id micro-001"
+    "run": "node ../openclaw/cli.mjs bench run",
+    "dry-run": "node ../openclaw/cli.mjs bench run --dry-run --task-id micro-001",
+    "verify-dataset": "node ../openclaw/cli.mjs bench run --dry-run --task-id micro-001 --agent-count 3"
   },
   "dependencies": {
     "ws": "^8.18.3"

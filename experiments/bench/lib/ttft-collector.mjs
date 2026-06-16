@@ -75,19 +75,22 @@ async function collectFromDiagnosticsStability(client, { sinceMs, untilMs }) {
 }
 
 async function collectFromGatewayWs(client, { runId, sessionKey, startedAt, timeoutMs }) {
-  if (!client?.waitForFirstAssistantToken || !runId) {
+  if (!client?.waitForGatewayTtftMetrics || !runId) {
     return null;
   }
-  const hit = await client.waitForFirstAssistantToken(runId, {
+  const hit = await client.waitForGatewayTtftMetrics(runId, {
     startedAt,
     timeoutMs,
     sessionKey,
   });
-  if (!hit?.ttft_ms && hit?.ttft_ms !== 0) {
+  if (!hit?.ttft_gateway_assistant_ms && hit?.ttft_gateway_assistant_ms !== 0) {
     return null;
   }
   return {
-    ttft_ms: hit.ttft_ms,
+    ttft_ms: hit.ttft_gateway_assistant_ms,
+    ttft_gateway_assistant_ms: hit.ttft_gateway_assistant_ms,
+    ttft_gateway_thinking_ms: hit.ttft_gateway_thinking_ms ?? null,
+    ttft_thinking_to_assistant_ms: hit.ttft_thinking_to_assistant_ms ?? null,
     source: hit.source ?? "gateway.ws",
     path: `gateway.ws:${hit.event ?? "agent"}`,
     event_type: hit.event ?? "agent",

@@ -1,33 +1,32 @@
 #!/usr/bin/env node
 /**
- * O0-pre spike: OpenClaw subagent stack (Chain 3-agent) + TTFT collector.
- *
- * Prerequisites:
- *   - OpenClaw Gateway running with diagnostics.timeline enabled:
- *       OPENCLAW_DIAGNOSTICS=timeline openclaw gateway run
- *   - OPENCLAW_GATEWAY_TOKEN set if gateway requires auth
- *   - Orchestrator agent (default: main) with sessions_spawn available (coding/full profile)
- *
- * Usage:
- *   cd KVCOMM/experiments/bench && npm install
- *   npm run dry-run
- *   npm run run -- --runs 1 --task-id micro-001
+ * ClawBench capability lane: fixed Chain N-agent with shared workspace + tools + scoring.
  */
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 
 import { appendJsonl, initJsonlOutput, loadJson, loadJsonl } from "../lib/load-jsonl.mjs";
 import { resolveTaskBody } from "../lib/kvcomm-task.mjs";
 import { assertBenchGatewayConfig } from "../lib/openclaw-config.mjs";
 import { renderTemplate, renderTemplateStrict } from "../lib/template.mjs";
 import { connectGateway, runChainStackSpawn } from "../lib/spawn-stack.mjs";
-import { summarizeBenchRows } from "../lib/summarize-results.mjs";
+import { summarizeBenchRows, summarizeClawbenchCapability } from "../lib/summarize-results.mjs";
 import { writeBenchReport } from "../lib/bench-report.mjs";
 import {
+  buildChainTranscript,
+  collectSessionMessages,
+  scoreCapabilityRun,
+  slimCapabilityScore,
+  setupClawbenchWorkspace,
+  syncCapabilityWorkspaceArtifacts,
+} from "../lib/clawbench-chain.mjs";
+import {
   buildRunMetadata,
+  computeRunKvReuseStats,
   enrichAgentRecord,
   enrichRunSummary,
 } from "../../../openclaw/lib/bench-metadata.mjs";
@@ -40,7 +39,6 @@ import {
   ensureManagedSidecarForBench,
   teardownManagedSidecar,
 } from "../../../openclaw/lib/sidecar-lifecycle.mjs";
-import { spawnSync } from "node:child_process";
 import { isBenchDebugMode, resolveRunTimeoutSeconds } from "../lib/bench-timeout.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -49,18 +47,17 @@ const BENCH_ROOT = resolve(__dirname, "..");
 function parseArgs(argv) {
   const args = {
     scenario: join(BENCH_ROOT, "scenarios/3agent-chain.json"),
-    dataset: join(BENCH_ROOT, "datasets/tier0_copy.jsonl"),
-    rolePrompt: join(BENCH_ROOT, "prompts/copy_machine.role.txt"),
-    taskProfile: "copy",
+    dataset: join(BENCH_ROOT, "datasets/tier1_clawbench.jsonl"),
+    rolePrompt: join(BENCH_ROOT, "prompts/clawbench_chain.role.txt"),
     outputDir: join(BENCH_ROOT, "results"),
     output: process.env.BENCH_OUTPUT?.trim() || null,
-    experimentId: process.env.BENCH_EXPERIMENT_ID || "O0-pre-A",
+    experimentId: process.env.BENCH_EXPERIMENT_ID || "clawbench-chain",
     agentId: process.env.BENCH_AGENT_ID || "main",
     model: process.env.BENCH_MODEL || "",
     runs: 1,
     measureRuns: null,
     warmupRuns: 0,
-    agentCount: null,
+    agentCount: 3,
     inferenceMode: process.env.KVCOMM_MODE?.trim() || "dense_prefill",
     inferenceBackend: process.env.KVCOMM_INFERENCE_BACKEND?.trim() || null,
     taskId: null,
@@ -68,8 +65,9 @@ function parseArgs(argv) {
     debug: false,
     runTimeoutSecondsExplicit: null,
     runTimeoutSeconds: 600,
-    negativeControl: null,
     cleanSessions: false,
+    judgeModel: process.env.CLAWBENCH_JUDGE_MODEL?.trim() || "",
+    skipScore: false,
   };
 
   for (let i = 2; i < argv.length; i += 1) {
@@ -138,16 +136,16 @@ function parseArgs(argv) {
       args.taskId = argv[++i];
       continue;
     }
-    if (arg === "--task-profile" && argv[i + 1]) {
-      args.taskProfile = argv[++i];
-      continue;
-    }
     if (arg === "--role-prompt" && argv[i + 1]) {
       args.rolePrompt = resolve(argv[++i]);
       continue;
     }
-    if (arg === "--negative-control" && argv[i + 1]) {
-      args.negativeControl = argv[++i];
+    if (arg === "--judge-model" && argv[i + 1]) {
+      args.judgeModel = argv[++i];
+      continue;
+    }
+    if (arg === "--skip-score") {
+      args.skipScore = true;
       continue;
     }
     if (arg === "--debug") {
@@ -171,10 +169,6 @@ function parseArgs(argv) {
   return args;
 }
 
-/**
- * Resolve jsonl + summary paths. --output is a basename (no dir) under output-dir,
- * or a path ending in .jsonl (summary sits beside it).
- */
 function resolveOutputPaths({ outputDir, experimentId, output }) {
   if (!output) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -184,23 +178,17 @@ function resolveOutputPaths({ outputDir, experimentId, output }) {
       summary: join(outputDir, `${base}.summary.json`),
     };
   }
-
   let name = output;
   if (name.endsWith(".summary.json")) {
     name = name.slice(0, -".summary.json".length);
   } else if (name.endsWith(".jsonl")) {
     name = name.slice(0, -".jsonl".length);
   }
-
   const hasPathSep = /[\\/]/.test(name);
   if (hasPathSep) {
     const jsonl = resolve(`${name}.jsonl`);
-    return {
-      jsonl,
-      summary: jsonl.replace(/\.jsonl$/i, ".summary.json"),
-    };
+    return { jsonl, summary: jsonl.replace(/\.jsonl$/i, ".summary.json") };
   }
-
   return {
     jsonl: join(outputDir, `${name}.jsonl`),
     summary: join(outputDir, `${name}.summary.json`),
@@ -208,103 +196,68 @@ function resolveOutputPaths({ outputDir, experimentId, output }) {
 }
 
 function printHelp() {
-  console.log(`Usage: node drivers/run-o0-pre-chain.mjs [options]
+  console.log(`Usage: node drivers/run-clawbench-chain.mjs [options]
+
+ClawBench capability lane (shared workspace + tools + scoring).
 
 Options:
-  --dry-run                 Validate dataset/scenario rendering only (no Gateway)
-  --scenario <path>         Scenario JSON (default: scenarios/3agent-chain.json)
-  --dataset <path>          Task JSONL (default: datasets/tier0_copy.jsonl)
-  --output-dir <path>       Results directory (default: results/)
-  --output <name>           Result basename or path (default: <experiment-id>_<timestamp>)
-  --experiment-id <id>      Experiment label in jsonl rows (default: O0-pre-A)
-  --agent-id <id>           OpenClaw agent id (default: main)
-  --model <provider/model>  Model override for subagent spawns
-  --runs <n>                Measured repetitions per task (alias for --measure-runs)
-  --measure-runs <n>        Measured runs included in summary (default: --runs or 1)
-  --warmup-runs <n>         Warmup runs excluded from summary (kv_reuse anchor init)
-  --agent-count <n>         Override scenario agent_count (dynamic Chain templates)
-  --inference-mode <mode>   dense_prefill | kv_reuse
-  --inference-backend <be>  vllm_direct | kvcomm_sidecar
-  --clean-sessions          Purge main agent session store before run (Gateway should be stopped)
-  --task-id <id>            Run a single task from dataset
-  --task-profile <profile>  copy | clawbench (default: copy)
-  --role-prompt <path>      Role prompt template (default depends on task-profile)
-  --negative-control NC-1   Drop agent_0 output from agent_1 task (L3 negative control)
-  --debug                   Debug mode (agent/stream timeout 60s unless overridden)
-  --run-timeout-seconds <n> Per-agent OpenClaw run + stream wait timeout (default: 600, debug: 60)
+  --dry-run
+  --dataset <path>            default: datasets/tier1_clawbench.jsonl
+  --task-id <id>
+  --agent-count <n>           default: 3
+  --measure-runs <n>
+  --warmup-runs <n>
+  --model <provider/model>
+  --judge-model <provider/model>   Optional ClawBench judge model
+  --skip-score                     Skip Python capability scoring
+  --debug                          Debug mode (agent/stream timeout 60s unless overridden)
+  --run-timeout-seconds <n>        Per-agent OpenClaw run + stream wait timeout (default: 600, debug: 60)
+  --output, --output-dir, --experiment-id, --clean-sessions
 
 Environment:
-  OPENCLAW_GATEWAY_URL      ws://127.0.0.1:18789
-  OPENCLAW_GATEWAY_TOKEN      Gateway auth token
-  OPENCLAW_DIAGNOSTICS=timeline
-  BENCH_EXPERIMENT_ID, BENCH_AGENT_ID, BENCH_MODEL, BENCH_OUTPUT
-  KVCOMM_MODE, KVCOMM_INFERENCE_BACKEND, KVCOMM_SIDECAR_URL
   BENCH_DEBUG=1 | KVCOMM_BENCH_DEBUG=1 | LOGURU_LEVEL=DEBUG  → 60s timeout
   BENCH_RUN_TIMEOUT_SECONDS=<n>    Override timeout explicitly
 `);
 }
 
-async function buildRolePrompt(rolePromptPath, taskProfile) {
+async function buildRolePrompt(rolePromptPath) {
   const raw = await readFile(rolePromptPath, "utf8");
-  if (taskProfile === "clawbench") {
-    return raw.trim();
-  }
-  const prefixRepeats = Number(process.env.COPY_PREFIX_REPEATS || "64");
-  const outLength = Number(process.env.COPY_OUT_LENGTH || "128");
-  const prefix = " Ω".repeat(Math.max(0, prefixRepeats));
-  const roleBody = renderTemplateStrict(raw.trim(), { out_length: String(outLength) });
-  return `${prefix}\n${roleBody}`.trim();
+  return raw.trim();
 }
 
-async function prepareTasks(datasetPath, taskId, rolePrompt, agentCount, topology, taskProfile) {
+async function prepareTasks(datasetPath, taskId, rolePrompt, agentCount, topology) {
   const rows = await loadJsonl(datasetPath);
   const filtered = taskId ? rows.filter((row) => row.task_id === taskId) : rows;
   if (filtered.length === 0) {
     throw new Error(`No tasks found in ${datasetPath}${taskId ? ` for task-id ${taskId}` : ""}`);
   }
-
-  const templateVars =
-    taskProfile === "clawbench"
-      ? { role_prompt: rolePrompt }
-      : { copy_role: rolePrompt };
-
+  const templateVars = { role_prompt: rolePrompt };
   return filtered.map((row) => {
-    const extended =
-      agentCount != null ? extendTaskAgentTemplates(row, agentCount, topology) : row;
+    const extended = extendTaskAgentTemplates(row, agentCount, topology);
+    const renderMap = (templates) =>
+      Object.fromEntries(
+        Object.entries(templates).map(([key, template]) => [key, renderTemplate(template, templateVars)]),
+      );
     return {
       ...extended,
-      agent_tasks: Object.fromEntries(
-        Object.entries(extended.agent_tasks).map(([key, template]) => [
-          key,
-          renderTemplate(template, templateVars),
-        ]),
-      ),
+      agent_tasks: renderMap(extended.agent_tasks),
       ...(extended.capability_agent_tasks
-        ? {
-            capability_agent_tasks: Object.fromEntries(
-              Object.entries(extended.capability_agent_tasks).map(([key, template]) => [
-                key,
-                renderTemplate(template, templateVars),
-              ]),
-            ),
-          }
+        ? { capability_agent_tasks: renderMap(extended.capability_agent_tasks) }
         : {}),
     };
   });
 }
 
 async function dryRunValidate(scenario, tasks, runIndex = 0) {
-  console.log("[dry-run] scenario:", scenario.id, "topology:", scenario.topology);
+  console.log("[dry-run] clawbench capability scenario:", scenario.id);
   for (const task of tasks) {
     const taskBody = await resolveTaskBody(task, runIndex);
-    const outputs = { task_body: taskBody };
+    const templates = task.capability_agent_tasks ?? task.agent_tasks;
+    console.log(`[dry-run] ${task.task_id} asset_packs=${JSON.stringify(task.clawbench_ref?.asset_packs ?? [])}`);
     for (let i = 0; i < scenario.agent_count; i += 1) {
       const key = `agent_${i}`;
-      const text = renderTemplate(task.agent_tasks[key], outputs);
-      outputs[`agent_${i}_current`] = `<mock-output-${i}>`;
-      console.log(
-        `[dry-run] ${task.task_id} run=${runIndex} ${key} chars=${text.length} task_chars=${taskBody.length}`,
-      );
+      const text = renderTemplate(templates[key], { task_body: taskBody, agent_0_current: "<mock>" });
+      console.log(`[dry-run] ${task.task_id} ${key} chars=${text.length}`);
     }
   }
 }
@@ -316,7 +269,9 @@ async function summarizeResults(outputPath) {
     .split("\n")
     .filter(Boolean)
     .map((line) => JSON.parse(line));
-  return summarizeBenchRows(rows);
+  const bench = summarizeBenchRows(rows);
+  const clawbench = summarizeClawbenchCapability(rows);
+  return clawbench ? { ...bench, clawbench_capability: clawbench } : bench;
 }
 
 async function maybeCleanBenchSessions(enabled) {
@@ -324,7 +279,6 @@ async function maybeCleanBenchSessions(enabled) {
     return;
   }
   const script = join(OPENCLAW_MODULE_ROOT, "scripts/clean-bench-sessions.sh");
-  console.log("[bench] cleaning main agent sessions before run...");
   const result = spawnSync("bash", [script], { stdio: "inherit" });
   if (result.status !== 0) {
     throw new Error(`clean-bench-sessions.sh failed with exit ${result.status ?? "unknown"}`);
@@ -333,30 +287,21 @@ async function maybeCleanBenchSessions(enabled) {
 
 async function main() {
   const args = parseArgs(process.argv);
-  if (args.debug || isBenchDebugMode()) {
-    console.log(`[bench] debug mode: agent_run_timeout_seconds=${args.runTimeoutSeconds}`);
-  }
-  if (!["copy", "clawbench"].includes(args.taskProfile)) {
-    throw new Error(`Unknown task profile: ${args.taskProfile} (expected copy or clawbench)`);
-  }
-  if (args.taskProfile === "clawbench" && args.rolePrompt.endsWith("copy_machine.role.txt")) {
-    args.rolePrompt = join(BENCH_ROOT, "prompts/clawbench_chain.role.txt");
-  }
-
   const measureRuns = args.measureRuns ?? args.runs;
+  if (args.debug || isBenchDebugMode()) {
+    console.log(
+      `[clawbench-chain] debug mode: agent_run_timeout_seconds=${args.runTimeoutSeconds}`,
+    );
+  }
   const baseScenario = await loadJson(args.scenario);
-  const scenario =
-    args.agentCount != null
-      ? buildScenario(baseScenario, args.agentCount, baseScenario.topology ?? "chain")
-      : baseScenario;
-  const rolePrompt = await buildRolePrompt(args.rolePrompt, args.taskProfile);
+  const scenario = buildScenario(baseScenario, args.agentCount, baseScenario.topology ?? "chain");
+  const rolePrompt = await buildRolePrompt(args.rolePrompt);
   const tasks = await prepareTasks(
     args.dataset,
     args.taskId,
     rolePrompt,
     scenario.agent_count,
     scenario.topology ?? "chain",
-    args.taskProfile,
   );
 
   const runMetadataBase = buildRunMetadata({
@@ -365,21 +310,15 @@ async function main() {
     model: args.model,
     inferenceMode: args.inferenceMode,
     inferenceBackend: args.inferenceBackend,
-    taskProfile: args.taskProfile,
+    taskProfile: "clawbench",
+    spawnMode: "capability",
   });
 
   if (args.dryRun) {
     await dryRunValidate(scenario, tasks, 0);
-    console.log("[dry-run] OK (task_body from kvcomm_task fixture / task_body field)");
+    console.log("[dry-run] OK");
     console.log("[dry-run] metadata:", runMetadataBase);
     return;
-  }
-
-  if (args.model && (args.model.startsWith("/") || args.model.includes("\\"))) {
-    console.warn(
-      `[bench] --model looks like a filesystem path (${args.model}). ` +
-        "OpenClaw expects a configured provider ref, e.g. vllm/Qwen3-32B",
-    );
   }
 
   await mkdir(args.outputDir, { recursive: true });
@@ -395,16 +334,14 @@ async function main() {
   await assertBenchGatewayConfig();
 
   console.log(
-    `[bench] connecting gateway experiment=${args.experimentId} tasks=${tasks.length} ` +
-      `agents=${scenario.agent_count} mode=${runMetadataBase.inference_mode} ` +
-      `backend=${runMetadataBase.inference_backend} output=${outputPath}`,
+    `[clawbench-chain] connecting gateway tasks=${tasks.length} agents=${scenario.agent_count} output=${outputPath}`,
   );
   const client = await connectGateway();
   const sidecarHandle = await ensureManagedSidecarForBench({
     inferenceBackend: args.inferenceBackend ?? runMetadataBase.inference_backend,
   });
-
   const totalRuns = args.warmupRuns + measureRuns;
+  let measureIndex = 0;
 
   try {
     for (let runIndex = 0; runIndex < totalRuns; runIndex += 1) {
@@ -415,17 +352,28 @@ async function main() {
         model: args.model,
         inferenceMode: args.inferenceMode,
         inferenceBackend: args.inferenceBackend,
-        taskProfile: args.taskProfile,
+        taskProfile: "clawbench",
+        spawnMode: "capability",
         warmup: isWarmup,
       });
 
       for (const taskRow of tasks) {
         const runId = randomUUID();
         const runUid = runId.slice(0, 8);
+        const assetPacks = taskRow.clawbench_ref?.asset_packs ?? [];
+        if (assetPacks.length === 0) {
+          throw new Error(`Task ${taskRow.task_id} missing clawbench_ref.asset_packs`);
+        }
+
+        const workspaceDir = setupClawbenchWorkspace({
+          taskId: taskRow.task_id,
+          assetPacks,
+          runUid,
+        });
 
         const phase = isWarmup ? "warmup" : "measure";
         console.log(
-          `[bench] ${phase}=${runIndex + 1}/${totalRuns} task=${taskRow.task_id} run_uid=${runUid}`,
+          `[clawbench-chain] ${phase}=${runIndex + 1}/${totalRuns} task=${taskRow.task_id} workspace=${workspaceDir}`,
         );
 
         const taskBody = await resolveTaskBody(taskRow, runIndex);
@@ -437,38 +385,92 @@ async function main() {
           model: args.model || undefined,
           runTimeoutSeconds: args.runTimeoutSeconds,
           experimentId: args.experimentId,
-          negativeControl: args.negativeControl,
           runId,
+          spawnMode: "capability",
+          workspaceDir,
           inferenceMode: effectiveInferenceMode,
           inferenceBackend: args.inferenceBackend ?? runMetadata.inference_backend,
-          taskProfile: args.taskProfile,
+          taskProfile: "clawbench",
         });
 
-        for (const record of result.records) {
-          await appendJsonl(outputPath, enrichAgentRecord(record, runMetadata, runUid));
-        }
-        await appendJsonl(
-          outputPath,
-          enrichRunSummary(
-            {
-              type: "run_summary",
-              task_id: taskRow.task_id,
-              run_id: runId,
-              e2e_run_ms: result.e2e_run_ms,
-              orchestrator_session_keys: result.orchestrator_session_keys,
-              timestamp: new Date().toISOString(),
-            },
-            runMetadata,
-            runUid,
-          ),
-        );
-
         if (!isWarmup) {
-          console.log(
-            `[bench] done task=${taskRow.task_id} e2e_ms=${result.e2e_run_ms} probe_ttft=${result.records.find((r) => r.probe)?.ttft_ms ?? "n/a"}`,
+          measureIndex += 1;
+        }
+
+        if (isWarmup) {
+          for (const record of result.records) {
+            await appendJsonl(
+              outputPath,
+              enrichAgentRecord(
+                { ...record, workspace_dir: workspaceDir },
+                runMetadata,
+                runUid,
+              ),
+            );
+          }
+          await appendJsonl(
+            outputPath,
+            enrichRunSummary(
+              {
+                type: "run_summary",
+                task_id: taskRow.task_id,
+                run_id: runId,
+                e2e_run_ms: result.e2e_run_ms,
+                workspace_dir: workspaceDir,
+                capability_score: null,
+                orchestrator_session_keys: result.orchestrator_session_keys,
+                timestamp: new Date().toISOString(),
+                ...computeRunKvReuseStats(result.records),
+              },
+              runMetadata,
+              runUid,
+            ),
           );
         } else {
-          console.log(`[bench] warmup done task=${taskRow.task_id} e2e_ms=${result.e2e_run_ms}`);
+          const sessionMessages = await collectSessionMessages(client, result.records);
+          const transcript = buildChainTranscript(taskBody, result.records, sessionMessages);
+          await syncCapabilityWorkspaceArtifacts(workspaceDir, result.records);
+
+          let capabilityScore = null;
+          if (!args.skipScore) {
+            capabilityScore = slimCapabilityScore(
+              await scoreCapabilityRun({
+                taskId: taskRow.task_id,
+                workspaceDir,
+                transcript,
+                judgeModel: args.judgeModel,
+              }),
+            );
+          }
+
+          for (const record of result.records) {
+            await appendJsonl(
+              outputPath,
+              enrichAgentRecord(
+                { ...record, workspace_dir: workspaceDir },
+                runMetadata,
+                runUid,
+              ),
+            );
+          }
+          await appendJsonl(
+            outputPath,
+            enrichRunSummary(
+              {
+                type: "run_summary",
+                task_id: taskRow.task_id,
+                run_id: runId,
+                e2e_run_ms: result.e2e_run_ms,
+                workspace_dir: workspaceDir,
+                capability_score: capabilityScore,
+                orchestrator_session_keys: result.orchestrator_session_keys,
+                timestamp: new Date().toISOString(),
+                ...computeRunKvReuseStats(result.records),
+              },
+              runMetadata,
+              runUid,
+            ),
+          );
         }
       }
     }
@@ -478,7 +480,7 @@ async function main() {
   }
 
   if (measureRuns === 0) {
-    console.log("[bench] warmup-only run; no summary written");
+    console.log("[clawbench-chain] warmup-only; no summary written");
     return;
   }
 
@@ -493,13 +495,34 @@ async function main() {
       .map((line) => JSON.parse(line)),
     summary,
   });
-
-  console.log("[bench] results:", outputPath);
-  console.log("[bench] summary:", summaryPath, summary);
-  console.log("[bench] report:", reportPath);
+  console.log("[clawbench-chain] results:", outputPath);
+  console.log("[clawbench-chain] summary:", summaryPath);
+  console.log("[clawbench-chain] report:", reportPath);
+  if (summary.clawbench_capability) {
+    const cap = summary.clawbench_capability;
+    if (cap.by_measure?.length) {
+      console.log("[clawbench-chain] clawbench capability by measure:");
+      for (const row of cap.by_measure) {
+        const status = row.passed ? "PASS" : (row.run_score ?? 0) >= 0.4 ? "PARTIAL" : "FAIL";
+        console.log(
+          `  [${row.measure_index}] run_uid=${row.run_uid} ` +
+            `run=${row.run_score} C=${row.completion_score} ` +
+            `T=${row.trajectory_score} B=${row.behavior_score} (${status})`,
+        );
+      }
+      console.log(
+        `[clawbench-chain] clawbench capability aggregate (${cap.runs} measure(s)): ` +
+          `run=${cap.run_score_avg} C=${cap.completion_score_avg} ` +
+          `T=${cap.trajectory_score_avg} B=${cap.behavior_score_avg} ` +
+          `pass_rate=${Math.round((cap.pass_rate ?? 0) * 100)}%`,
+      );
+    } else if (cap.scoring_errors?.length) {
+      console.log(`[clawbench-chain] capability scoring errors: ${cap.scoring_errors.length}`);
+    }
+  }
 }
 
 main().catch((err) => {
-  console.error("[bench] fatal:", err);
+  console.error("[clawbench-chain] fatal:", err);
   process.exit(1);
 });

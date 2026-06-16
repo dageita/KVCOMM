@@ -1,0 +1,10 @@
+uvicorn>=0.27.0
+httpx>=0.25.2
+# Qwen3 requires transformers>=4.51.0 (see repo root requirements.txt)
+transformers>=4.51.0,<4.52
+# HF KVCOMM engine (install from repo root: pip install -r requirements.txt)
+class-registry==2.1.2
+loguru>=0.7.2
+tenacity>=8.2.0
+pydantic>=2.5.0
+python-dotenv>=1.0.0

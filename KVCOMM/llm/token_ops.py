@@ -83,6 +83,8 @@ def concat_(token_inputs, other):
         others = [other]
     else:
         others = other
+    if not others:
+        return token_inputs
     if token_inputs['input_ids'] is None or token_inputs['input_ids'].size(-1) == 0:
         token_inputs['input_ids'] = torch.cat([o['input_ids'] for o in others if o['input_ids'] is not None], dim=-1)
     elif others[0]['input_ids'] is not None and others[0]['input_ids'].size(-1) != 0:
@@ -110,6 +112,8 @@ def concat(token_inputs, other):
         others = [other]
     else:
         others = other
+    if not others:
+        return token_inputs
 
     if token_inputs['input_ids'] is None or token_inputs['input_ids'].size(-1) == 0:
         new_obj['input_ids'] = torch.cat([o['input_ids'] for o in others if o['input_ids'] is not None], dim=-1)

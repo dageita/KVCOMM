@@ -1,0 +1,20 @@
+{
+  "name": "@kvcomm/openclaw",
+  "private": true,
+  "type": "module",
+  "description": "KVCOMM OpenClaw integration: sidecar kvreuse proxy + multi-agent TTFT benchmark driver",
+  "bin": {
+    "kvcomm-openclaw": "cli.mjs"
+  },
+  "scripts": {
+    "bench": "node cli.mjs bench run",
+    "bench:dry-run": "node cli.mjs bench run --dry-run --task-id micro-001",
+    "sidecar": "node cli.mjs sidecar start",
+    "setup:dense": "node cli.mjs setup dense",
+    "setup:sidecar": "node cli.mjs setup sidecar",
+    "preflight": "node cli.mjs preflight"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

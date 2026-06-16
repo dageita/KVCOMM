@@ -1,6 +1,9 @@
-# OpenClaw Subagent + TTFT Bench Driver (O0-pre spike)
+# OpenClaw Subagent + TTFT Bench Driver
 
-基于计划 §9.2a.0d 的最小 harness：通过 Gateway `tools.invoke(sessions_spawn)` 栈驱动 3-agent Chain，并采集 per-agent TTFT。
+> **主入口已迁至 [`../../openclaw/README.md`](../../openclaw/README.md)**（KVCOMM OpenClaw 集成模块）。
+> 推荐使用：`cd ../../openclaw && node cli.mjs bench run ...`
+
+基于 §9.2a.0d 的最小 harness：通过 Gateway `tools.invoke(sessions_spawn)` 栈驱动 N-agent Chain，并采集 per-agent TTFT。
 
 ## 目录
 
@@ -83,10 +86,10 @@ openclaw gateway run
 --model custom-10-121-129-19-30001/MiniMax-M2.7
 
 # 错误 — 本地 HF 权重路径 OpenClaw 无法直接解析
---model /src/Meta-Llama-3.1-8B-Instruct
+--model vllm/Qwen3-32B
 ```
 
-若使用本地 Llama，需先在 OpenClaw 中配置 vLLM/OpenAI-compat provider，再传 `vllm/...` 或对应 alias。
+若使用本地 Qwen3-32B，需先在 OpenClaw 中配置 vLLM/OpenAI-compat provider，再传 `vllm/Qwen3-32B`。
 
 ### Gateway 配置（bench 必需）
 
@@ -105,27 +108,42 @@ openclaw gateway run
 2. **模型 allowlist**：在 `agents.defaults.models` 注册 vLLM 模型，例如：
 
 ```json
-"vllm/Meta-Llama-3.1-8B-Instruct": {
+"vllm/Qwen3-32B": {
   "params": { "extra_body": { "tool_choice": "none" } }
 }
 ```
 
 可合并片段：[`config/openclaw.models.snippet.json`](config/openclaw.models.snippet.json)（写入 `~/.openclaw/openclaw.json` 的 `agents.defaults.models`）。**修改后须冷重启 Gateway**。
 
-3. **Agent 工具 profile**：orchestrator 需要 `sessions_spawn`，必须用 **`coding`** 或 **`full`**。`minimal` 不含该工具，会报 `Tool not available: sessions_spawn`。
-
-4. **Subagent 工具对齐（L1 限制）**：OpenClaw leaf subagent 若通过 `deny` 禁用全部 action 工具，会与 `gateway.tools.allow` 传入的 inherited allowlist 冲突，报 `No callable tools remain`。当前可用配置：
+3. **Orchestrator 工具（main agent only）**：bench 通过 `tools.invoke(sessions_spawn)` 驱动，**不要**在全局 `tools.allow` 写 `sessions_spawn`（subagent 会继承并报错）。推荐：
 
 ```json
 "tools": {
-  "profile": "coding",
+  "profile": "minimal",
   "subagents": {
     "tools": { "allow": ["session_status"] }
   }
+},
+"agents": {
+  "list": [{
+    "id": "main",
+    "tools": {
+      "profile": "minimal",
+      "alsoAllow": ["sessions_spawn"]
+    }
+  }]
+},
+"gateway": {
+  "tools": { "allow": ["sessions_spawn"] }
 }
 ```
 
-`allow: ["session_status"]` 使 subagent 仅暴露一个无害工具（allow-only 过滤），禁用 web_search/update_plan 等 action 工具。模型仍可能输出 session_status JSON 文本；`tool_choice: none` + 纯 Copy task + 强化 `copy_role` 可降低概率。结果 JSONL 含 `tool_json_detected` / `copy_char_ratio` / `output_format_ok`。
+4. **Context overflow 防护**：
+   - Driver：每个 spawn 使用**全新 orchestrator session**（见 `spawn-stack.mjs`）
+   - 长期 bench 前：`KVCOMM/openclaw/scripts/clean-bench-sessions.sh` 或 `bench run --clean-sessions`（建议 Gateway 已停止）
+   - vLLM `--max-model-len 32768` + OpenClaw `contextWindow: 32768`
+
+5. **Subagent 工具对齐（L1 限制）**：OpenClaw leaf subagent 若通过 `deny` 禁用全部 action 工具，会与 `gateway.tools.allow` 传入的 inherited allowlist 冲突，报 `No callable tools remain`。当前可用配置见上节 `subagents.tools.allow`。
 
 修改 `openclaw.json` 后须 **冷重启 Gateway**（`openclaw gateway stop` → `openclaw gateway run`），热加载对 subagent 策略不可靠。
 
@@ -134,10 +152,11 @@ openclaw gateway run
 | 报错 | 原因 | 处理 |
 |------|------|------|
 | `sessions_spawn is blocked` | 未配置 `gateway.tools.allow` | 见上，重启 Gateway |
-| `Tool not available: sessions_spawn` | `tools.profile: minimal` 且无 `alsoAllow` | 改 `profile: coding`，冷重启 Gateway |
+| `Tool not available: sessions_spawn` | main agent 用了 `allow` 而非 `alsoAllow` | `agents.list[main].tools.alsoAllow: ["sessions_spawn"]`（minimal profile 不含 spawn） |
 | `model not allowed` | 未在 `agents.defaults.models` 注册 | 添加 `vllm/<model-id>` |
 | `tool choice requires --enable-auto-tool-choice` | vLLM 未开 tool calling | bench 用 `tool_choice: none`（已配） |
-| `No callable tools remain` | `subagents.tools.allow` 与 inherited allowlist 冲突 | 改用 `subagents.tools.deny` 禁用 action 工具，勿用 empty/minimal allow |
+| `No callable tools remain` | 全局 `tools.allow: [sessions_spawn]` 被 subagent 继承 | 仅 main agent + gateway.tools.allow 放行；subagent 用 `session_status` |
+| Context overflow on `agent:main:main` | orchestrator session 历史膨胀 | 每 spawn 新 session；bench 前 `--clean-sessions` |
 
 4. **Gateway 启动**（注意 Node 版本）：OpenClaw 需 Node ≥22.19；若 `node -v` 为 20.x，用 `/usr/bin/node`：
 
@@ -162,8 +181,8 @@ Context overflow: prompt too large for the model (precheck)
 **vLLM 必须 `--max-model-len 16384`**（8192 不够，`coding` profile 框架 prompt ~5816 tokens）：
 
 ```bash
-vllm serve /models/llama-3.1-8b-instruct \
-  --served-model-name Meta-Llama-3.1-8B-Instruct \
+vllm serve /models/Qwen3-32B \
+  --served-model-name Qwen3-32B \
   --dtype float16 \
   --max-model-len 16384 \
   --port 8001
@@ -192,7 +211,7 @@ OpenClaw 侧通过 `datasets/tier0_copy.jsonl` + `fixtures/kvcomm_tasks_seed42.j
 cd KVCOMM/experiments/bench
 export COPY_PREFIX_REPEATS=512 COPY_OUT_LENGTH=512
 npm run dry-run
-npm run run -- --runs 30 --task-id micro-001 --model vllm/Meta-Llama-3.1-8B-Instruct \
+npm run run -- --runs 30 --task-id micro-001 --model vllm/Qwen3-32B \
   --output chain_3_512_openclaw_aligned
 ```
 
@@ -259,3 +278,72 @@ COPY_PREFIX_REPEATS=512 COPY_OUT_LENGTH=512 \
 ## 迁入 ClawBench
 
 本 spike 逻辑对应计划 §9.2a.0c 中的 `kvcomm_runner.py` + `ttft_collector.py`；验证通过后可迁入 ClawBench `tasks-kvcomm/` lane。
+
+## ClawBench Chain 能力 lane（Phase 2）
+
+固定 **3-agent Chain** + ClawBench 原生任务（如 `t1-fs-quick-note`），在链末用 ClawBench `score_task_run` 做 **completion / trajectory / behavior** 打分（与 `clawbench run` 同一 scorer）。
+
+与 Phase 1（`bench run --task-profile clawbench`）的区别：Phase 1 为 **text-only** Chain，subagent 无 `edit`，无法通过 file verifier；Phase 2 为 **capability** lane，共享 workspace + subagent 工具。
+
+### 前置配置（顺序重要）
+
+```bash
+# ① ClawBench 原生：全局 tools.profile=coding
+bash /src/clawbench/scripts/setup_vllm_clawbench.sh
+
+# ② KVCOMM capability profile：main=minimal+sessions_spawn，subagent 有 read/edit/exec
+cd /src/KVCOMM/openclaw && ./scripts/setup-openclaw.sh clawbench-capability
+
+# ③ 冷重启 Gateway
+openclaw gateway stop || true
+openclaw gateway run
+```
+
+### 运行
+
+```bash
+cd /src/KVCOMM/openclaw
+
+node cli.mjs bench run-clawbench \
+  --agent-count 3 \
+  --measure-runs 3 \
+  --task-id t1-fs-quick-note \
+  --dataset /src/KVCOMM/experiments/bench/datasets/tier1_clawbench.jsonl \
+  --model vllm/Qwen3-32B \
+  --output clawbench_chain_quicknote
+```
+
+输出：
+
+- `results/<output>.jsonl` — 每 agent 的 TTFT / spawn 元数据（机器可读，每行一条 JSON）
+- `results/<output>.summary.json` — 聚合统计（TTFT、ClawBench 分数）
+- `results/<output>.formatted.txt` — **逐条记录格式化**（每个 key-value 独占一行，便于人工查看）
+- `results/<output>.report.txt` — **聚合报告**（表格：TTFT、sidecar 路由、C/T/B 分数）
+- run summary 行含 `capability_score`
+
+对已有 jsonl 重新生成报告：
+
+```bash
+node scripts/format-bench-report.mjs results/clawbench-quicknote-kvreuse-005.jsonl
+```
+
+Dry-run（无需 Gateway）：
+
+```bash
+node cli.mjs bench run-clawbench --dry-run --task-id t1-fs-quick-note --agent-count 3
+```
+
+### 从 ClawBench CLI 调用
+
+```bash
+cd /src/clawbench
+PYTHONPATH=/src/clawbench uv run clawbench kvcomm run-clawbench \
+  --task-id t1-fs-quick-note --agent-count 3 --measure-runs 3 \
+  --dataset /src/KVCOMM/experiments/bench/datasets/tier1_clawbench.jsonl \
+  --model vllm/Qwen3-32B \
+  --output clawbench_chain_quicknote
+```
+
+数据集 [`datasets/tier1_clawbench.jsonl`](datasets/tier1_clawbench.jsonl) 每行含 `capability_agent_tasks`（Chain 分工 prompt）与 `clawbench_ref.asset_packs`（workspace fixture）。
+
+**Capability lane 说明**：`tools.invoke(sessions_spawn)` 默认不向 subagent 继承 `read`/`edit`/`write`。driver 会在 spawn 后通过 `sessions.patch` + `sessions.reset` + `sessions.send` 重跑子 agent，并在打分前 `syncCapabilityWorkspaceArtifacts` 将笔记同步到 chain workspace。`agent_1` 模板使用 `{{workspace_dir}}` 绝对路径写文件。

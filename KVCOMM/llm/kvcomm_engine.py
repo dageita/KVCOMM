@@ -1227,6 +1227,16 @@ class KVCOMMEngine:
                 shared_memory["input_drop_num"][message][-1],
             )
 
+        if ph_id.startswith("turn_"):
+            node_memory = shared_memory.get(self.llm.node_id, {})
+            turn_bucket = node_memory.get("turn", {}).get(ph_id, {})
+            entry = turn_bucket.get(message)
+            if not entry:
+                raise RuntimeError(
+                    f"fetch_shared_cache: turn placeholder {ph_id} for message='{message}' not found."
+                )
+            return entry["kv"], entry["ids"], entry.get("drop_num", 0)
+
         type_str, node_id, *rest = ph_id.split("_")
         is_current = (rest and rest[0] == "current")
 

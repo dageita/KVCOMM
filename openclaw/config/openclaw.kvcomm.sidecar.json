@@ -1,0 +1,73 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/root/.openclaw/workspace",
+      "model": {
+        "primary": "kvcomm/Qwen3-32B"
+      },
+      "compaction": {
+        "reserveTokensFloor": 0,
+        "reserveTokens": 256
+      },
+      "models": {
+        "kvcomm/Qwen3-32B": {}
+      }
+    },
+    "list": [
+      {
+        "id": "main",
+        "tools": {
+          "profile": "minimal",
+          "alsoAllow": ["sessions_spawn"]
+        }
+      }
+    ]
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "CHANGE_ME_AFTER_SETUP"
+    },
+    "port": 18789,
+    "bind": "loopback",
+    "controlUi": {
+      "allowInsecureAuth": true
+    },
+    "tools": {
+      "allow": ["sessions_spawn"]
+    }
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "tools": {
+    "subagents": {
+      "tools": {
+        "allow": ["session_status"]
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "kvcomm": {
+        "baseUrl": "http://127.0.0.1:8100/v1",
+        "apiKey": "kvcomm-local",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "Qwen3-32B",
+            "name": "Qwen3 32B (KVCOMM sidecar)",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 32768,
+            "contextTokens": 32768,
+            "maxTokens": 512
+          }
+        ]
+      }
+    }
+  }
+}

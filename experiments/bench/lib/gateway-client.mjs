@@ -201,6 +201,27 @@ export class GatewayClient {
     return key;
   }
 
+  async resetSession(sessionKey, { reason = "kvcomm-bench" } = {}) {
+    return this.request("sessions.reset", {
+      key: sessionKey,
+      reason,
+    });
+  }
+
+  async patchSession(sessionKey, patch) {
+    return this.request("sessions.patch", {
+      key: sessionKey,
+      ...patch,
+    });
+  }
+
+  async abortSession(sessionKey, runId) {
+    return this.request("sessions.abort", {
+      key: sessionKey,
+      ...(runId ? { runId } : {}),
+    });
+  }
+
   async invokeTool(sessionKey, name, args = {}) {
     try {
       const payload = await this.request("tools.invoke", {
@@ -253,6 +274,153 @@ export class GatewayClient {
       await sleep(pollMs);
     }
     throw new Error(`Timeout waiting for terminal task on session ${sessionKey}`);
+  }
+
+  async sendSession(sessionKey, message, { timeoutMs = 120_000 } = {}) {
+    const idempotencyKey = randomUUID();
+    const startedAt = Date.now();
+    const payload = await this.request(
+      "sessions.send",
+      {
+        key: sessionKey,
+        message,
+        idempotencyKey,
+        timeoutMs: Math.max(1, timeoutMs),
+      },
+      { timeoutMs: timeoutMs + 15_000 },
+    );
+    const runId =
+      (typeof payload?.runId === "string" && payload.runId.trim()) || idempotencyKey;
+    return { runId, startedAt };
+  }
+
+  async sendAndWait(sessionKey, message, { timeoutMs = 120_000 } = {}) {
+    const sent = await this.sendSession(sessionKey, message, { timeoutMs });
+    await this.agentWait(sent.runId, timeoutMs);
+    return sent;
+  }
+
+  _matchGatewayStreamFrame(frame, runId, sessionKey, streamName) {
+    if (frame?.type !== "event") {
+      return false;
+    }
+    const payload = frame.payload;
+    if (!payload || typeof payload !== "object") {
+      return false;
+    }
+    const payloadRunId = payload.runId ?? payload.run_id;
+    if (runId && payloadRunId && payloadRunId !== runId) {
+      return false;
+    }
+    if (sessionKey && payload.sessionKey && payload.sessionKey !== sessionKey) {
+      return false;
+    }
+    if (frame.event === "agent" && payload.stream === streamName) {
+      return hasAssistantStreamContent(payload.data);
+    }
+    if (streamName === "assistant" && frame.event === "chat") {
+      if (payload.state === "delta" && hasAssistantStreamContent(payload.message?.content)) {
+        return true;
+      }
+      if (payload.state === "delta" && typeof payload.delta === "string" && payload.delta.trim()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _ttftHitFromFrame(frame, startedAt) {
+    return {
+      ttft_ms: Math.max(0, Date.now() - startedAt),
+      observed_at: Date.now(),
+      source: "gateway.ws",
+      event: frame.event,
+      stream: frame.payload?.stream ?? null,
+    };
+  }
+
+  /**
+   * Collect first thinking + assistant stream deltas for a subagent run.
+   */
+  waitForGatewayTtftMetrics(runId, { startedAt, timeoutMs = 120_000, sessionKey } = {}) {
+    if (!runId) {
+      return Promise.resolve(null);
+    }
+    const deadline = startedAt + timeoutMs;
+    const state = {
+      thinking: null,
+      assistant: null,
+    };
+
+    const scanExisting = () => {
+      for (const frame of this.events) {
+        if (!state.thinking && this._matchGatewayStreamFrame(frame, runId, sessionKey, "thinking")) {
+          state.thinking = this._ttftHitFromFrame(frame, startedAt);
+        }
+        if (!state.assistant && this._matchGatewayStreamFrame(frame, runId, sessionKey, "assistant")) {
+          state.assistant = this._ttftHitFromFrame(frame, startedAt);
+        }
+        if (state.thinking && state.assistant) {
+          break;
+        }
+      }
+    };
+
+    const buildResult = () => {
+      const thinkingMs = state.thinking?.ttft_ms ?? null;
+      const assistantMs = state.assistant?.ttft_ms ?? null;
+      const thinkingToAssistantMs =
+        thinkingMs != null && assistantMs != null ? Math.max(0, assistantMs - thinkingMs) : null;
+      return {
+        ttft_gateway_thinking_ms: thinkingMs,
+        ttft_gateway_assistant_ms: assistantMs,
+        ttft_thinking_to_assistant_ms: thinkingToAssistantMs,
+        ttft_ms: assistantMs,
+        source: state.assistant?.source ?? state.thinking?.source ?? null,
+        event: state.assistant?.event ?? state.thinking?.event ?? null,
+        fallback: false,
+      };
+    };
+
+    scanExisting();
+    if (state.assistant) {
+      return Promise.resolve(buildResult());
+    }
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        resolve(state.assistant || state.thinking ? buildResult() : null);
+      }, Math.max(0, deadline - Date.now()));
+
+      const predicate = (frame) => {
+        if (!state.thinking && this._matchGatewayStreamFrame(frame, runId, sessionKey, "thinking")) {
+          state.thinking = this._ttftHitFromFrame(frame, startedAt);
+        }
+        if (!state.assistant && this._matchGatewayStreamFrame(frame, runId, sessionKey, "assistant")) {
+          state.assistant = this._ttftHitFromFrame(frame, startedAt);
+          clearTimeout(timer);
+          resolve(buildResult());
+          return true;
+        }
+        return false;
+      };
+
+      for (const frame of this.events) {
+        if (predicate(frame)) {
+          return;
+        }
+      }
+
+      this.eventWaiters.push({
+        predicate: (frame) => {
+          if (!predicate(frame)) {
+            return false;
+          }
+          return true;
+        },
+        resolve: () => {},
+      });
+    });
   }
 
   /**
@@ -464,18 +632,25 @@ export function extractToolJson(payload) {
 
 export function extractAssistantText(messages) {
   const assistants = messages.filter((msg) => msg?.role === "assistant");
-  const last = assistants.at(-1);
-  if (!last) {
+  if (assistants.length === 0) {
     return "";
   }
-  if (typeof last.content === "string") {
-    return last.content.trim();
+  const parts = [];
+  for (const msg of assistants) {
+    if (typeof msg.content === "string" && msg.content.trim()) {
+      parts.push(msg.content.trim());
+      continue;
+    }
+    if (Array.isArray(msg.content)) {
+      const text = msg.content
+        .filter((block) => block && (block.type === "text" || block.type === "output_text") && typeof block.text === "string")
+        .map((block) => block.text)
+        .join("\n")
+        .trim();
+      if (text) {
+        parts.push(text);
+      }
+    }
   }
-  if (Array.isArray(last.content)) {
-    return last.content
-      .map((block) => (typeof block?.text === "string" ? block.text : ""))
-      .join("\n")
-      .trim();
-  }
-  return "";
+  return parts.join("\n\n").trim();
 }
