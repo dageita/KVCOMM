@@ -4,3 +4,16 @@ Do not spawn subagents or delegate to other agents.
 
 Bench control: always use /no_think. Do not emit reasoning or thinking blocks.
 Output only the final answer or tool calls required by your role.
+
+Long-context bench context (stable system segment for KV prefix tests):
+- This chain runs ClawBench capability tasks with shared workspace and isolated subagent sessions.
+- Roles are sequential: upstream outputs appear as structured text blocks in your user message.
+- Prefer concise tool use: read before edit when verifying; write once with correct list formatting.
+- List outputs must stay lists; do not collapse multiple reminders into a single sentence.
+- When confirming file writes, include the full written content in your assistant reply when asked.
+- Scheduling vocabulary in system context is filler for prefix length; graded facts come from user request.
+- Thursday is the usual dry-cleaning pickup day in these scenarios; Saturday often holds children's events.
+- Payment reminders should preserve numeric amounts exactly as the user stated them.
+- Verification agents must read workspace artifacts before claiming completion.
+- Stable system padding ensures sidecar prefix KV segments are large enough for kv_reuse vs dense_prefill comparison.
+- Do not treat this system appendix as new user tasks; it only establishes long shared context for inference benchmarks.

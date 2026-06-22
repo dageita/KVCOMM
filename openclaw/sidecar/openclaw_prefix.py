@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from sidecar.tool_bridge import sanitize_chat_template_leaks
+
 KVCOMM_META_RE = re.compile(r"<!--KVCOMM_META:(\{.*?\})-->", re.DOTALL)
 _TOOL_SCHEMA_BLOCK_RE = re.compile(
     r"(?:^|\n)(?:#+\s*)?(?:Available tools|Tool definitions|tools?\s*:\s*\[).*$",
@@ -19,7 +21,7 @@ _OPENCLAW_BOOTSTRAP_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-DEFAULT_PREFIX_MAX_TOKENS = 2048
+DEFAULT_PREFIX_MAX_TOKENS = 4096
 DEFAULT_TOOL_RESULT_MAX_CHARS = 2000
 
 
@@ -128,14 +130,14 @@ def _assistant_text(msg: dict[str, Any]) -> str:
                 args = json.dumps(args, ensure_ascii=False)
             call_summaries.append(f"[tool_call {name}: {str(args)[:200]}]")
         if text:
-            return f"{text}\n" + "\n".join(call_summaries)
-        return "\n".join(call_summaries)
-    return text
+            return sanitize_chat_template_leaks(f"{text}\n" + "\n".join(call_summaries))
+        return sanitize_chat_template_leaks("\n".join(call_summaries))
+    return sanitize_chat_template_leaks(text)
 
 
 def _tool_text(msg: dict[str, Any]) -> str:
     name = str(msg.get("name") or msg.get("tool_call_id") or "tool")
-    body = _message_content(msg).strip()
+    body = sanitize_chat_template_leaks(_message_content(msg).strip())
     max_chars = tool_result_max_chars()
     if len(body) > max_chars:
         body = body[:max_chars] + "\n...[truncated]"
@@ -212,6 +214,11 @@ def _collect_placeholders(user_template: str) -> list[str]:
 
 def _static_without_turn_placeholders(user_template: str) -> str:
     return re.sub(r"\{turn_\d+_(?:assistant|tool)\}", "", user_template).strip()
+
+
+def static_without_turn_placeholders(user_template: str) -> str:
+    """Public helper: user_template with turn_N placeholders removed (static segment A)."""
+    return _static_without_turn_placeholders(user_template)
 
 
 _RUN_WORKSPACE_PATH_RE = re.compile(

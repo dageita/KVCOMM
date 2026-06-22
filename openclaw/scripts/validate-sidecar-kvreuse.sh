@@ -12,7 +12,7 @@ export PYTHONPATH="${REPO_ROOT}:${MODULE_ROOT}:${PYTHONPATH:-}"
 
 echo "=== validate-sidecar-kvreuse ==="
 
-echo "[1/9] adapter parse"
+echo "[1/10] adapter parse"
 "${PYTHON}" - <<'PY'
 from sidecar.kvcomm_adapter import (
     parse_kvcomm_context,
@@ -43,7 +43,7 @@ consume_registered_context(meta_body, {})
 print("  ok", SIDECAR_VERSION)
 PY
 
-echo "[2/9] anchor pool per-node + path normalization"
+echo "[2/10] anchor pool per-node + path normalization"
 "${PYTHON}" - <<'PY'
 from sidecar.kvcomm_adapter import KvcommEngineAdapter, _anchor_pool_key
 from sidecar.openclaw_prefix import normalize_run_specific_paths, build_prefix_from_openclaw_messages
@@ -73,10 +73,72 @@ measure_agent2 = (
 )
 assert _prefix_missing_upstream_kv_placeholders(warmup_agent2, measure_agent2, 2) is True
 assert _prefix_missing_upstream_kv_placeholders(measure_agent2, measure_agent2, 2) is False
+
+from sidecar.kvcomm_adapter import KvcommContext, _apply_pooled_placeholder_anchor, _prefix_turn_kv_out_of_sync, _upstream_response_kv_available
+from sidecar.openclaw_prefix import PrefixBuildResult
+from KVCOMM.llm.kvcomm_engine import KVCOMMEngine
+from KVCOMM.llm.gpt_chat import LLMChat
+
+LLMChat._shared_kv_cache_memory["1"] = {
+    "placeholder_info": {"turn_1_assistant": (0, 1), "turn_1_tool": (1, 2)},
+    "turn_count": 0,
+}
+build = PrefixBuildResult(system_prompt="s", user_template="u", turn_count=0, turn_content={})
+assert _prefix_turn_kv_out_of_sync("1", "msg", build) is True
+LLMChat._shared_kv_cache_memory["1"]["turn"] = {
+    "turn_1_assistant": {"msg": {"kv": 1}},
+    "turn_1_tool": {"msg": {"kv": 1}},
+}
+build2 = PrefixBuildResult(
+    system_prompt="s",
+    user_template="u",
+    turn_count=1,
+    turn_content={"turn_1_assistant": "hi", "turn_1_tool": "ok"},
+)
+assert _prefix_turn_kv_out_of_sync("1", "msg", build2) is False
+LLMChat._shared_kv_cache_memory.pop("1", None)
+
+class _FakeEngine:
+    def resolve_request_state(self, request_uid):
+        return KVCOMMEngine._get_request_state(request_uid)
+
+class _FakeLLM:
+    kv_engine = _FakeEngine()
+    node_id = "1"
+
+adapter = KvcommEngineAdapter()
+snapshot = {
+    "anchors": {"agent_0_current": {"msg": {"1_ph_key_delta": {"v": 1}}}},
+    "anchor_dict": {"agent_0_current": {"msg": True}},
+    "anchor_len_dict": {},
+    "anchor_info_dict": {},
+    "global_anchor_info": {},
+}
+llm = _FakeLLM()
+assert _apply_pooled_placeholder_anchor(
+    llm, "run-seed", snapshot, ph_id="agent_0_current", message="msg", delta_key="1_ph_key_delta"
+)
+state = KVCOMMEngine._get_request_state("run-seed")
+assert "1_ph_key_delta" in state.anchors["agent_0_current"]["msg"]
+KVCOMMEngine._request_states.pop("run-seed", None)
+
+from KVCOMM.llm.gpt_chat import LLMChat
+LLMChat._shared_kv_cache_memory.setdefault("0", {}).setdefault("response", {}).setdefault("msg", [{"kv": 1}])
+assert _upstream_response_kv_available("0", "msg") is True
+
+from KVCOMM.llm.gpt_chat import LLMChat as Chat
+chat = object.__new__(Chat)
+chat.node_id = "1"
+KVCOMMEngine.anchor_dict.clear()
+KVCOMMEngine.anchors.clear()
+state = KVCOMMEngine._get_request_state("route-test")
+state.anchor_dict.setdefault("agent_0_current", {})["m"] = True
+assert chat.can_kv_reuse_with_soft_anchor_gaps("route-test", "m") is True
+KVCOMMEngine._request_states.pop("route-test", None)
 print("  ok")
 PY
 
-echo "[3/9] openclaw prefix parser (A+E)"
+echo "[3/10] openclaw prefix parser (A+E)"
 "${PYTHON}" - <<'PY'
 from sidecar.openclaw_prefix import (
     build_prefix_from_openclaw_messages,
@@ -127,7 +189,7 @@ finally:
 print("  ok")
 PY
 
-echo "[4/9] runtime configure + release shim"
+echo "[4/10] runtime configure + release shim"
 "${PYTHON}" - <<'PY'
 import os
 from sidecar.kvcomm_adapter import configure_hf_engine, release_adapter, engine_loaded, _engine_enabled
@@ -144,7 +206,64 @@ assert result["released"] is False
 print("  ok")
 PY
 
-echo "[5/9] openai SSE stream shim"
+echo "[5/10] tool_bridge parse + completion"
+"${PYTHON}" - <<'PY'
+from sidecar.tool_bridge import (
+    build_tool_injection_text,
+    extract_tool_request,
+    normalize_openai_tools,
+    openai_message_from_generation,
+    parse_qwen_tool_calls,
+    sse_tool_call_deltas,
+)
+from sidecar.kvcomm_adapter import _openai_completion
+
+tools = normalize_openai_tools(
+    [
+        {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "description": "Write a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"],
+                },
+            },
+        }
+    ]
+)
+assert tools and tools[0]["function"]["name"] == "write"
+injection = build_tool_injection_text(tools)
+assert "# Tools" in injection and "write" in injection
+
+raw = (
+    "I'll create the note.\n"
+    '<tool_call>\n{"name": "write", "arguments": {"path": "notes/quick_note.md", "content": "- a"}}\n</tool_call>'
+)
+content, parsed = parse_qwen_tool_calls(raw)
+assert "create the note" in content
+assert parsed[0]["function"]["name"] == "write"
+assert '"path"' in parsed[0]["function"]["arguments"]
+
+message = openai_message_from_generation(raw)
+payload = _openai_completion(message, "kvcomm/test", {})
+assert payload["choices"][0]["finish_reason"] == "tool_calls"
+assert payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "write"
+assert len(sse_tool_call_deltas(message["tool_calls"])) == 1
+
+body = {
+    "tools": tools,
+    "tool_choice": "auto",
+    "messages": [{"role": "user", "content": "hi"}],
+}
+assert extract_tool_request(body)[0][0]["function"]["name"] == "write"
+assert extract_tool_request({"tools": tools, "tool_choice": "none", "messages": []}) == (None, None)
+print("  ok")
+PY
+
+echo "[6/10] openai SSE stream shim"
 "${PYTHON}" - <<'PY'
 from sidecar.server import _completion_to_sse_body
 payload = {
@@ -162,7 +281,7 @@ assert sse.strip().endswith("data: [DONE]")
 print("  ok")
 PY
 
-echo "[6/9] template kv_reuse"
+echo "[7/10] template kv_reuse"
 node -e "
 import { renderTemplateKvReuse } from '${BENCH_ROOT}/lib/template.mjs';
 const out = renderTemplateKvReuse('{{task_body}} {{agent_0_current}}', { task_body: 'T', agent_0_current: 'X' });
@@ -170,7 +289,7 @@ if (!out.includes('{agent_0_current}') || out.includes('X')) process.exit(1);
 console.log('  ok');
 "
 
-echo "[7/9] profile clawbench-capability-sidecar"
+echo "[8/10] profile clawbench-capability-sidecar"
 test -f "${MODULE_ROOT}/config/openclaw.kvcomm.clawbench-capability-sidecar.json"
 "${PYTHON}" "${SCRIPT_DIR}/apply-openclaw-profile.py" \
   "${MODULE_ROOT}/config/openclaw.kvcomm.clawbench-capability-sidecar.json" \
@@ -183,14 +302,14 @@ assert d['agents']['defaults']['model']['primary']=='kvcomm/Qwen3-32B'
 print('  ok')
 "
 
-echo "[8/9] bench dry-run (tier0 copy + clawbench)"
+echo "[9/10] bench dry-run (tier0 copy + clawbench)"
 node "${BENCH_ROOT}/drivers/run-o0-pre-chain.mjs" --dry-run \
   --inference-mode kv_reuse --inference-backend kvcomm_sidecar --task-id micro-001 >/dev/null
 node "${BENCH_ROOT}/drivers/run-clawbench-chain.mjs" --dry-run \
   --inference-mode kv_reuse --inference-backend kvcomm_sidecar --task-id t1-fs-quick-note >/dev/null
 echo "  ok"
 
-echo "[9/9] sidecar health (optional)"
+echo "[10/10] sidecar health (optional)"
 SIDECAR_URL="${KVCOMM_SIDECAR_URL:-http://127.0.0.1:8100}"
 if curl -sf --max-time 3 "${SIDECAR_URL}/health" >/dev/null 2>&1; then
   health="$(curl -sf "${SIDECAR_URL}/health")"

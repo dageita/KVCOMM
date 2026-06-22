@@ -4,6 +4,18 @@
 
 const DEFAULT_SIDECAR_URL = process.env.KVCOMM_SIDECAR_URL?.trim() || "http://127.0.0.1:8100";
 
+function resolveRegisterTimeoutMs() {
+  const raw = process.env.KVCOMM_REGISTER_TIMEOUT_MS?.trim();
+  if (raw) {
+    const value = Number(raw);
+    if (Number.isFinite(value) && value > 0) {
+      return Math.round(value);
+    }
+  }
+  // Sidecar may block on long HF prefix prefill; default 2 min.
+  return 120_000;
+}
+
 export async function registerKvcommContext(
   payload,
   { sidecarUrl = DEFAULT_SIDECAR_URL } = {},
@@ -15,7 +27,7 @@ export async function registerKvcommContext(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(resolveRegisterTimeoutMs()),
     });
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");

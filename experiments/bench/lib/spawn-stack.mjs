@@ -67,8 +67,11 @@ function buildSpawnParams({ taskText, model, runTimeoutSeconds, spawnMode, works
   };
 }
 
-function renderAgentTask(template, variables, inferenceMode) {
-  if (inferenceMode === "kv_reuse") {
+function renderAgentTask(template, variables, inferenceMode, agentIndex = 0) {
+  const useKvReuseTemplate =
+    inferenceMode === "kv_reuse" ||
+    (inferenceMode === "dense_prefill" && agentIndex > 0);
+  if (useKvReuseTemplate) {
     return renderTemplateKvReuse(template, variables);
   }
   return renderTemplateStrict(template, variables);
@@ -151,7 +154,7 @@ export async function runChainStackSpawn(client, params) {
       ),
     };
 
-    let taskText = renderAgentTask(template, variables, inferenceMode);
+    let taskText = renderAgentTask(template, variables, inferenceMode, agentIndex);
     const messageKey = variables.user_question || variables.task_body || taskRow.task_id;
     const kvcommVars = {
       user_question: variables.user_question,

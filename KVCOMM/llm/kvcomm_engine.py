@@ -592,9 +592,12 @@ class _ScopedDict(MutableMapping):
 
     def get(self, key: str, default: Any = None) -> Any:
         try:
-            return self[key]
+            value = self[key]
         except KeyError:
             return default
+        if value is None:
+            return default
+        return value
 
     def setdefault(self, key: str, default: Any = None):
         if key in self._local:
@@ -606,6 +609,10 @@ class _ScopedDict(MutableMapping):
             return value
         if key in self._base:
             value = copy.deepcopy(self._base[key])
+            if value is None:
+                new_value = _clone_default(default)
+                self._local[key] = new_value
+                return new_value
             self._local[key] = value
             return value
         new_value = _clone_default(default)
@@ -959,9 +966,14 @@ class KVCOMMEngine:
         ).sum(0)
 
         new_placeholder_cache = type(base_placeholder_cache)()
-        updated_placeholder_key = (
-            real_key_embedding + layer_total_delta_key_for_placeholder.to(real_key_embedding.dtype)
-        )
+        ph_delta = layer_total_delta_key_for_placeholder.to(real_key_embedding.dtype)
+        if ph_delta.shape[-2] != real_key_embedding.shape[-2]:
+            self._log_warning(
+                f"Placeholder delta length mismatch for {ph_id} on node {self.llm.node_id}: "
+                f"delta={ph_delta.shape[-2]} base={real_key_embedding.shape[-2]}; skipping anchor blend."
+            )
+            return base_placeholder_cache.copy(), base_prefix_cache.copy()
+        updated_placeholder_key = real_key_embedding + ph_delta
         updated_placeholder_key[0] = real_key_embedding[0]
         new_placeholder_cache.key_cache = list(updated_placeholder_key)
 
@@ -975,7 +987,14 @@ class KVCOMMEngine:
         base_prefix_key, base_prefix_value = self._stack_cache_tensors(base_prefix_cache)
 
         new_prefix_cache = type(base_prefix_cache)()
-        updated_prefix_key = base_prefix_key + layer_total_delta_key_for_prefix.to(base_prefix_key.dtype)
+        pf_delta = layer_total_delta_key_for_prefix.to(base_prefix_key.dtype)
+        if pf_delta.shape[-2] != base_prefix_key.shape[-2]:
+            self._log_warning(
+                f"Prefix delta length mismatch for {ph_id} on node {self.llm.node_id}: "
+                f"delta={pf_delta.shape[-2]} base={base_prefix_key.shape[-2]}; skipping anchor blend."
+            )
+            return base_placeholder_cache.copy(), base_prefix_cache.copy()
+        updated_prefix_key = base_prefix_key + pf_delta
         updated_prefix_key[0] = base_prefix_key[0]
         new_prefix_cache.key_cache = list(updated_prefix_key)
 
@@ -1228,8 +1247,15 @@ class KVCOMMEngine:
             )
 
         if ph_id.startswith("turn_"):
-            node_memory = shared_memory.get(self.llm.node_id, {})
-            turn_bucket = node_memory.get("turn", {}).get(ph_id, {})
+            node_memory = shared_memory.get(self.llm.node_id) or {}
+            if not isinstance(node_memory, dict):
+                node_memory = {}
+            turn_root = node_memory.get("turn") or {}
+            if not isinstance(turn_root, dict):
+                turn_root = {}
+            turn_bucket = turn_root.get(ph_id) or {}
+            if not isinstance(turn_bucket, dict):
+                turn_bucket = {}
             entry = turn_bucket.get(message)
             if not entry:
                 raise RuntimeError(
@@ -1243,10 +1269,16 @@ class KVCOMMEngine:
         key_prefix = "condition" if type_str == "condition" else "response"
         slot_idx = -1 if is_current else -2
 
-        node_memory = shared_memory[node_id]
+        node_memory = shared_memory.get(node_id)
+        if not isinstance(node_memory, dict):
+            raise RuntimeError(
+                f"fetch_shared_cache: node memory for '{node_id}' missing for placeholder {ph_id}."
+            )
 
         def _get_slot(bucket_key: str):
-            bucket = node_memory.get(bucket_key, {})
+            bucket = node_memory.get(bucket_key) or {}
+            if not isinstance(bucket, dict):
+                return None
             values = bucket.get(message)
             if not values:
                 return None

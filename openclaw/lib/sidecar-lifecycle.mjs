@@ -168,6 +168,15 @@ function buildManagedSidecarEnv(sidecarUrl = DEFAULT_SIDECAR_URL) {
   if (!env.KVCOMM_BENCH_NO_THINK?.trim()) {
     env.KVCOMM_BENCH_NO_THINK = "1";
   }
+  if (!env.KVCOMM_PREFIX_MAX_TOKENS?.trim()) {
+    env.KVCOMM_PREFIX_MAX_TOKENS = "4096";
+  }
+  if (!env.KVCOMM_PREFIX_LENGTH_DRIFT?.trim()) {
+    env.KVCOMM_PREFIX_LENGTH_DRIFT = "16";
+  }
+  if (!env.KVCOMM_TOOL_RESULT_MAX_CHARS?.trim()) {
+    env.KVCOMM_TOOL_RESULT_MAX_CHARS = "6000";
+  }
   const denseViaHf = (process.env.KVCOMM_DENSE_VIA_HF ?? "").trim().toLowerCase();
   if (["1", "true", "yes", "on"].includes(denseViaHf)) {
     env.KVCOMM_DENSE_VIA_HF = "1";

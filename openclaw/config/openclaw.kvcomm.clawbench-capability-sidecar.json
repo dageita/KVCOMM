@@ -9,6 +9,7 @@
         "reserveTokensFloor": 0,
         "reserveTokens": 256
       },
+      "timeoutSeconds": 600,
       "models": {
         "kvcomm/Qwen3-32B": {
           "params": {
@@ -61,6 +62,7 @@
         "baseUrl": "http://127.0.0.1:8100/v1",
         "apiKey": "kvcomm-local",
         "api": "openai-completions",
+        "timeoutSeconds": 600,
         "models": [
           {
             "id": "Qwen3-32B",

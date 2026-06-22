@@ -14,9 +14,11 @@ Otherwise dense_prefill proxies to vLLM.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any
@@ -52,6 +54,7 @@ LISTEN_PORT = int(os.environ.get("KVCOMM_SIDECAR_PORT", "8100"))
 DEFAULT_MODE = os.environ.get("KVCOMM_MODE", "dense_prefill")
 
 app = FastAPI(title="KVCOMM OpenClaw Sidecar", version=SIDECAR_VERSION)
+_logger = logging.getLogger("kvcomm-sidecar")
 
 _metrics: dict[str, Any] = {
     "requests_total": 0,
@@ -166,10 +169,19 @@ def _hf_load_plan_label() -> str | None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    dense_via_hf = os.environ.get("KVCOMM_DENSE_VIA_HF", "").strip() in ("1", "true", "yes")
+    try:
+        from sidecar.openclaw_prefix import prefix_max_tokens
+
+        prefix_cap = prefix_max_tokens()
+    except Exception:
+        prefix_cap = None
     return {
         "status": "ok",
         "upstream": UPSTREAM_BASE,
         "default_mode": DEFAULT_MODE,
+        "dense_via_hf": dense_via_hf,
+        "prefix_max_tokens": prefix_cap,
         "sidecar": "kvcomm-openclaw",
         "sidecar_version": SIDECAR_VERSION,
         "kv_reuse_engine": _kv_reuse_engine_label(),
@@ -261,6 +273,7 @@ async def _handle_chat_completions(request: Request, body: dict[str, Any], mode:
             return proxy_resp
         except Exception as exc:
             detail = _format_engine_error(exc)
+            _logger.error("KVCOMM engine error: %s\n%s", detail, traceback.format_exc())
             if "out of memory" in detail.lower():
                 proxy_resp = await _proxy(
                     request,
