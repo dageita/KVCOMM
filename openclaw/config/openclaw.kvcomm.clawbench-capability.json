@@ -42,6 +42,12 @@
     "dmScope": "per-channel-peer"
   },
   "tools": {
+    "elevated": {
+      "enabled": true,
+      "allowFrom": {
+        "webchat": ["*"]
+      }
+    },
     "subagents": {
       "tools": {
         "allow": ["read", "write", "edit", "apply_patch", "exec", "process", "session_status"]

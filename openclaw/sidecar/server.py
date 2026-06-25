@@ -53,6 +53,43 @@ LISTEN_HOST = os.environ.get("KVCOMM_SIDECAR_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("KVCOMM_SIDECAR_PORT", "8100"))
 DEFAULT_MODE = os.environ.get("KVCOMM_MODE", "dense_prefill")
 
+
+def _env_truthy(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _dense_via_hf_enabled() -> bool:
+    """Route dense_prefill through HF when engine is configured (default: yes)."""
+    raw = os.environ.get("KVCOMM_DENSE_VIA_HF", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return _engine_enabled()
+
+
+def _vllm_fallback_allowed() -> bool:
+    """When HF engine is configured, do not silently proxy to vLLM unless explicitly allowed."""
+    if not _engine_enabled():
+        return True
+    return _env_truthy("KVCOMM_ALLOW_VLLM_FALLBACK")
+
+
+def _reject_vllm_proxy(message: str, *, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"message": message, "type": "invalid_request_error"}},
+        headers={"X-KVCOMM-Route": "hf", "X-KVCOMM-VLLM-Fallback": "denied"},
+    )
+
+
+def _sidecar_access_log_enabled() -> bool:
+    """Uvicorn per-request access lines (noisy during tool-call agent loops)."""
+    return _env_truthy("KVCOMM_SIDECAR_ACCESS_LOG", default=False)
+
 app = FastAPI(title="KVCOMM OpenClaw Sidecar", version=SIDECAR_VERSION)
 _logger = logging.getLogger("kvcomm-sidecar")
 
@@ -80,60 +117,9 @@ def _wants_stream_usage(body: dict[str, Any]) -> bool:
 
 def _completion_to_sse_body(payload: dict[str, Any], *, include_usage: bool) -> str:
     """Convert a non-streaming chat.completion into OpenAI SSE chunks for OpenClaw."""
-    choice = (payload.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    content = message.get("content") or ""
-    tool_calls = message.get("tool_calls")
-    chunk_id = payload.get("id") or f"chatcmpl-kvcomm-{uuid.uuid4().hex[:12]}"
-    model = payload.get("model") or "kvcomm"
-    created = payload.get("created") or int(time.time())
-    usage = payload.get("usage")
-    finish_reason = choice.get("finish_reason") or "stop"
+    from sidecar.tool_bridge import completion_payload_to_sse
 
-    def chunk_obj(delta: dict[str, Any], finish: str | None = None) -> dict[str, Any]:
-        return {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-        }
-
-    events: list[str] = []
-    events.append(f"data: {json.dumps(chunk_obj({'role': 'assistant'}), ensure_ascii=False)}\n\n")
-
-    if content:
-        events.append(f"data: {json.dumps(chunk_obj({'content': content}), ensure_ascii=False)}\n\n")
-
-    if isinstance(tool_calls, list):
-        for index, tool_call in enumerate(tool_calls):
-            if not isinstance(tool_call, dict):
-                continue
-            delta_tool = {
-                "index": index,
-                "id": tool_call.get("id"),
-                "type": tool_call.get("type") or "function",
-                "function": tool_call.get("function") or {},
-            }
-            events.append(
-                f"data: {json.dumps(chunk_obj({'tool_calls': [delta_tool]}), ensure_ascii=False)}\n\n"
-            )
-
-    events.append(f"data: {json.dumps(chunk_obj({}, finish_reason), ensure_ascii=False)}\n\n")
-
-    if include_usage and isinstance(usage, dict):
-        usage_chunk = {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [],
-            "usage": usage,
-        }
-        events.append(f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n")
-
-    events.append("data: [DONE]\n\n")
-    return "".join(events)
+    return completion_payload_to_sse(payload, include_usage=include_usage)
 
 
 def _format_engine_error(exc: Exception) -> str:
@@ -169,7 +155,7 @@ def _hf_load_plan_label() -> str | None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    dense_via_hf = os.environ.get("KVCOMM_DENSE_VIA_HF", "").strip() in ("1", "true", "yes")
+    dense_via_hf = _dense_via_hf_enabled()
     try:
         from sidecar.openclaw_prefix import prefix_max_tokens
 
@@ -213,12 +199,41 @@ async def diagnostics(run_id: str | None = None, agent_index: str | None = None)
     return base
 
 
+def _sync_metrics_from_adapter() -> None:
+    """Mirror adapter counters into top-level /diagnostics metrics."""
+    adapter = get_adapter()
+    _metrics["requests_total"] = adapter.requests_total
+    _metrics["requests_by_mode"] = dict(adapter.requests_by_mode)
+    if adapter.last_request_ms is not None:
+        _metrics["last_request_ms"] = adapter.last_request_ms
+
+
+async def _hf_sse_with_metrics(
+    body: dict[str, Any],
+    headers: dict[str, str],
+    mode: str,
+    *,
+    include_usage: bool,
+):
+    """Stream HF tokens once and sync /diagnostics counters when the stream finishes."""
+    try:
+        async for chunk in get_adapter().generate_stream_sse(
+            body,
+            headers,
+            mode,
+            include_usage=include_usage,
+        ):
+            yield chunk
+    finally:
+        _sync_metrics_from_adapter()
+
+
 async def _handle_chat_completions(request: Request, body: dict[str, Any], mode: str) -> Response:
     started = time.perf_counter()
     headers = {k: v for k, v in request.headers.items()}
     effective_mode = resolve_request_mode(body, headers, mode)
 
-    dense_via_hf = os.environ.get("KVCOMM_DENSE_VIA_HF", "").strip() in ("1", "true", "yes")
+    dense_via_hf = _dense_via_hf_enabled()
     use_hf = _engine_enabled() and (
         effective_mode == "kv_reuse" or (effective_mode == "dense_prefill" and dense_via_hf)
     )
@@ -226,31 +241,38 @@ async def _handle_chat_completions(request: Request, body: dict[str, Any], mode:
     _metrics["requests_by_route"][route] = _metrics["requests_by_route"].get(route, 0) + 1
     if use_hf:
         try:
-            payload, resp_headers = await get_adapter().generate(body, headers, mode)
-            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-            _metrics["requests_total"] += 1
-            _metrics["requests_by_mode"][mode] = _metrics["requests_by_mode"].get(mode, 0) + 1
-            _metrics["last_request_ms"] = elapsed_ms
-            resp_headers["X-KVCOMM-Proxy-Latency-Ms"] = str(elapsed_ms)
-            resp_headers["X-KVCOMM-Route"] = route
-            resp_headers["X-KVCOMM-Mode"] = effective_mode
             if body.get("stream"):
-                resp_headers["Content-Type"] = "text/event-stream; charset=utf-8"
-                resp_headers["Cache-Control"] = "no-cache"
-                resp_headers["Connection"] = "keep-alive"
+                await get_adapter().check_request(body, headers, mode)
+                stream_headers = {
+                    "Content-Type": "text/event-stream; charset=utf-8",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-KVCOMM-Route": route,
+                    "X-KVCOMM-Mode": effective_mode,
+                }
                 return StreamingResponse(
-                    get_adapter().generate_stream_sse(
+                    _hf_sse_with_metrics(
                         body,
                         headers,
                         mode,
                         include_usage=_wants_stream_usage(body),
                     ),
                     media_type="text/event-stream",
-                    headers=resp_headers,
+                    headers=stream_headers,
                 )
+            payload, resp_headers = await get_adapter().generate(body, headers, mode)
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+            _sync_metrics_from_adapter()
+            resp_headers["X-KVCOMM-Proxy-Latency-Ms"] = str(elapsed_ms)
+            resp_headers["X-KVCOMM-Route"] = route
+            resp_headers["X-KVCOMM-Mode"] = effective_mode
             return JSONResponse(content=payload, headers=resp_headers)
         except ValueError as exc:
             if "missing kvcomm context" in str(exc):
+                if not _vllm_fallback_allowed():
+                    return _reject_vllm_proxy(
+                        f"{exc} (HF-only sidecar; set KVCOMM_ALLOW_VLLM_FALLBACK=1 to permit vLLM upstream)",
+                    )
                 return await _proxy(
                     request,
                     "chat/completions",
@@ -260,6 +282,8 @@ async def _handle_chat_completions(request: Request, body: dict[str, Any], mode:
                 )
             return JSONResponse(status_code=400, content={"error": {"message": str(exc), "type": "invalid_request_error"}})
         except PrefixOverflowError as exc:
+            if not _vllm_fallback_allowed():
+                return _reject_vllm_proxy(f"prefix overflow: {exc}", status_code=507)
             proxy_resp = await _proxy(
                 request,
                 "chat/completions",
@@ -274,7 +298,7 @@ async def _handle_chat_completions(request: Request, body: dict[str, Any], mode:
         except Exception as exc:
             detail = _format_engine_error(exc)
             _logger.error("KVCOMM engine error: %s\n%s", detail, traceback.format_exc())
-            if "out of memory" in detail.lower():
+            if "out of memory" in detail.lower() and _vllm_fallback_allowed():
                 proxy_resp = await _proxy(
                     request,
                     "chat/completions",
@@ -290,6 +314,13 @@ async def _handle_chat_completions(request: Request, body: dict[str, Any], mode:
                 status_code=500,
                 content={"error": {"message": f"KVCOMM engine error: {detail}", "type": "server_error"}},
             )
+
+    if _engine_enabled() and not _vllm_fallback_allowed():
+        return _reject_vllm_proxy(
+            "HF engine is configured but this request would route to vLLM upstream "
+            "(set KVCOMM_DENSE_VIA_HF=0 only when intentionally using vLLM fallback)",
+            status_code=503,
+        )
 
     proxy_resp = await _proxy(
         request,
@@ -442,7 +473,13 @@ def main() -> None:
         f"[kvcomm-sidecar] upstream={UPSTREAM_BASE} listen={LISTEN_HOST}:{LISTEN_PORT} "
         f"mode={DEFAULT_MODE} engine={engine}"
     )
-    uvicorn.run(app, host=LISTEN_HOST, port=LISTEN_PORT, log_level="info")
+    uvicorn.run(
+        app,
+        host=LISTEN_HOST,
+        port=LISTEN_PORT,
+        log_level="info",
+        access_log=_sidecar_access_log_enabled(),
+    )
 
 
 if __name__ == "__main__":

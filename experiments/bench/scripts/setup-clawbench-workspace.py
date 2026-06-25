@@ -33,12 +33,38 @@ def copy_into_workspace(source: Path, workspace: Path) -> None:
         return
     for item in source.rglob("*"):
         relative = item.relative_to(source)
+        if any(part == "__pycache__" for part in relative.parts):
+            continue
+        if item.suffix == ".pyc":
+            continue
         target = workspace / relative
         if item.is_dir():
             target.mkdir(parents=True, exist_ok=True)
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, target)
+
+
+def _bench_pristine_root(state_dir: Path, asset_pack: str) -> Path:
+    return state_dir / "bench-pristine" / asset_pack
+
+
+def _snapshot_pristine_fixtures(workspace: Path, *, state_dir: Path, asset_packs: list[str]) -> None:
+    """Cache read-only fixtures outside the agent workspace (agents must not mutate this)."""
+    for pack in asset_packs:
+        pristine = _bench_pristine_root(state_dir, pack)
+        for name in ("cart.py",):
+            src = workspace / name
+            if src.is_file():
+                dst = pristine / name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        tests = workspace / "tests"
+        if tests.is_dir():
+            dst_tests = pristine / "tests"
+            if dst_tests.exists():
+                shutil.rmtree(dst_tests)
+            shutil.copytree(tests, dst_tests, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
 
 def setup_workspace(*, task_id: str, asset_packs: list[str], run_id: str | None, tasks_dir: Path) -> Path:
@@ -54,6 +80,7 @@ def setup_workspace(*, task_id: str, asset_packs: list[str], run_id: str | None,
             raise FileNotFoundError(f"Missing asset pack: {source}")
         copy_into_workspace(source, workspace)
 
+    _snapshot_pristine_fixtures(workspace, state_dir=state_dir, asset_packs=asset_packs)
     return workspace.resolve()
 
 

@@ -80,7 +80,14 @@ export async function waitForSidecarHealth(
 function buildBenchHfConfig() {
   const hfDevice = process.env.KVCOMM_HF_DEVICE?.trim() || "";
   const denseViaHf = (process.env.KVCOMM_DENSE_VIA_HF ?? "").trim().toLowerCase();
-  const denseViaHfEnabled = ["1", "true", "yes", "on"].includes(denseViaHf);
+  const hasHfModel = Boolean(
+    process.env.KVCOMM_HF_MODEL?.trim() || process.env.KVCOMM_HF_MODEL_PATH?.trim(),
+  );
+  const denseViaHfEnabled =
+    ["1", "true", "yes", "on"].includes(denseViaHf) ||
+    (hasHfModel && !["0", "false", "no", "off"].includes(denseViaHf));
+  const benchPadding = (process.env.KVCOMM_BENCH_PADDING ?? process.env.BENCH_PADDING ?? "").trim().toLowerCase();
+  const benchPaddingEnabled = ["1", "true", "yes", "on"].includes(benchPadding);
   return {
     hf_model: process.env.KVCOMM_HF_MODEL?.trim() || "",
     hf_model_path: process.env.KVCOMM_HF_MODEL_PATH?.trim() || "",
@@ -92,6 +99,8 @@ function buildBenchHfConfig() {
       "",
     dense_via_hf: denseViaHfEnabled,
     KVCOMM_DENSE_VIA_HF: denseViaHfEnabled ? "1" : "0",
+    bench_padding: benchPaddingEnabled,
+    KVCOMM_BENCH_PADDING: benchPaddingEnabled ? "1" : "0",
   };
 }
 
@@ -169,7 +178,7 @@ function buildManagedSidecarEnv(sidecarUrl = DEFAULT_SIDECAR_URL) {
     env.KVCOMM_BENCH_NO_THINK = "1";
   }
   if (!env.KVCOMM_PREFIX_MAX_TOKENS?.trim()) {
-    env.KVCOMM_PREFIX_MAX_TOKENS = "4096";
+    env.KVCOMM_PREFIX_MAX_TOKENS = "8192";
   }
   if (!env.KVCOMM_PREFIX_LENGTH_DRIFT?.trim()) {
     env.KVCOMM_PREFIX_LENGTH_DRIFT = "16";
@@ -214,9 +223,12 @@ export async function ensureManagedSidecarForBench({ inferenceBackend } = {}) {
     } else if (benchConfig.hf_device && benchConfig.hf_device !== health.hf_device) {
       await configureSidecarEngine(sidecarUrl, benchConfig);
       console.log(`[sidecar] updated HF device pool on ${sidecarUrl}: ${benchConfig.hf_device}`);
-    } else if (wantsDenseViaHf) {
+    } else if (wantsDenseViaHf || benchConfig.bench_padding !== undefined) {
       await configureSidecarEngine(sidecarUrl, benchConfig);
-      console.log(`[sidecar] applied dense_via_hf=${wantsDenseViaHf} on ${sidecarUrl}`);
+      console.log(
+        `[sidecar] applied bench config on ${sidecarUrl} ` +
+          `dense_via_hf=${wantsDenseViaHf} bench_padding=${benchConfig.bench_padding}`,
+      );
     } else {
       console.log(
         `[sidecar] reusing sidecar (${sidecarUrl}) engine_loaded=${health.engine_loaded ?? false}`,

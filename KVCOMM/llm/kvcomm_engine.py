@@ -881,12 +881,16 @@ class KVCOMMEngine:
         base_prefix_cache: DynamicCache,
         anchor_list: List[Dict],
         temperature: int = 1,
-    ) -> Tuple[DynamicCache, DynamicCache]:
-        """Blend base caches with anchor deltas weighted by similarity."""
+    ) -> Tuple[DynamicCache, DynamicCache, bool]:
+        """Blend base caches with anchor deltas weighted by similarity.
+
+        Returns:
+            Updated placeholder cache, updated prefix cache, and whether blend succeeded.
+        """
         placeholder_len = int(base_placeholder_cache._seen_tokens)
         if placeholder_len <= 0:
             self._log_warning("real_placeholder_kv_cache has no tokens, skip updating.")
-            return base_placeholder_cache, base_prefix_cache
+            return base_placeholder_cache, base_prefix_cache, False
 
         real_key_embedding, real_value_embedding = self._stack_cache_tensors(base_placeholder_cache)
 
@@ -906,7 +910,7 @@ class KVCOMMEngine:
                     self._log_warning(
                         f"No anchors cover placeholder {ph_id} for Agent {self.llm.node_id} ({self.llm.role})."
                     )
-                return base_placeholder_cache.copy(), base_prefix_cache.copy()
+                return base_placeholder_cache.copy(), base_prefix_cache.copy(), False
 
             cache_entry = self._compute_anchor_weight_entry(
                 anchor_list,
@@ -917,14 +921,14 @@ class KVCOMMEngine:
                 float(temperature),
             )
             if cache_entry is None:
-                return base_placeholder_cache.copy(), base_prefix_cache.copy()
+                return base_placeholder_cache.copy(), base_prefix_cache.copy(), False
             cache_entry["anchor_signature"] = anchor_signature
             cache_entry["placeholder_len"] = placeholder_len
             self._set_cached_anchor_weights(request_uid, ph_id, message, cache_entry)
         else:
             anchor_index = cache_entry["anchor_index"]
             if not anchor_index:
-                return base_placeholder_cache.copy(), base_prefix_cache.copy()
+                return base_placeholder_cache.copy(), base_prefix_cache.copy(), False
 
         weights_key_for_prefix = cache_entry["weights_key_for_prefix"]
         weights_value_for_prefix = cache_entry["weights_value_for_prefix"]
@@ -972,7 +976,7 @@ class KVCOMMEngine:
                 f"Placeholder delta length mismatch for {ph_id} on node {self.llm.node_id}: "
                 f"delta={ph_delta.shape[-2]} base={real_key_embedding.shape[-2]}; skipping anchor blend."
             )
-            return base_placeholder_cache.copy(), base_prefix_cache.copy()
+            return base_placeholder_cache.copy(), base_prefix_cache.copy(), False
         updated_placeholder_key = real_key_embedding + ph_delta
         updated_placeholder_key[0] = real_key_embedding[0]
         new_placeholder_cache.key_cache = list(updated_placeholder_key)
@@ -993,7 +997,7 @@ class KVCOMMEngine:
                 f"Prefix delta length mismatch for {ph_id} on node {self.llm.node_id}: "
                 f"delta={pf_delta.shape[-2]} base={base_prefix_key.shape[-2]}; skipping anchor blend."
             )
-            return base_placeholder_cache.copy(), base_prefix_cache.copy()
+            return base_placeholder_cache.copy(), base_prefix_cache.copy(), False
         updated_prefix_key = base_prefix_key + pf_delta
         updated_prefix_key[0] = base_prefix_key[0]
         new_prefix_cache.key_cache = list(updated_prefix_key)
@@ -1005,7 +1009,7 @@ class KVCOMMEngine:
         new_prefix_cache.value_cache = list(updated_prefix_value)
         new_prefix_cache._seen_tokens = base_prefix_cache._seen_tokens
 
-        return new_placeholder_cache, new_prefix_cache
+        return new_placeholder_cache, new_prefix_cache, True
 
     def predict_as_anchor(
         self,
@@ -1313,17 +1317,17 @@ class KVCOMMEngine:
         message: str,
         m: Dict[str, Any],
         anchors_for_ph: List[Dict],
-    ) -> Tuple[int, DynamicCache, Dict[str, torch.Tensor]]:
+    ) -> Tuple[int, DynamicCache, Dict[str, torch.Tensor], bool]:
         """Rotate and offset a single placeholder/prefix segment for kv_reuse mode."""
         new_ph, new_pf = self._rotate_segment_caches(m)
-        new_ph, new_pf = self.offset_kv_cache_pair(
+        new_ph, new_pf, blended = self.offset_kv_cache_pair(
             m["ph_id"], message, request_uid, new_ph, new_pf, anchors_for_ph, temperature=1
         )
 
         seg_cache = new_ph.concat_([new_pf])
         seg_token_ids = concat(self.trim_token_ids(m["ph_cache_ids"], m["drop_num"]), m["pf_ids"])
 
-        return m["idx"], seg_cache, seg_token_ids
+        return m["idx"], seg_cache, seg_token_ids, blended
 
     def process_anchor(
         self,

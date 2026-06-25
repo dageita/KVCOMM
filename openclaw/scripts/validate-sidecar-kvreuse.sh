@@ -98,6 +98,28 @@ build2 = PrefixBuildResult(
 assert _prefix_turn_kv_out_of_sync("1", "msg", build2) is False
 LLMChat._shared_kv_cache_memory.pop("1", None)
 
+from sidecar.kvcomm_adapter import _clear_turn_cache_only
+
+LLMChat._shared_kv_cache_memory["9"] = {
+    "user_template": "static{turn_1_assistant}{turn_1_tool}",
+    "system_prompt": "sys",
+    "placeholder_info": {"turn_1_assistant": (0, 1), "turn_1_tool": (1, 2)},
+    "prefix": ["seg"],
+    "token_ids": ["ids"],
+    "turn": {"turn_1_assistant": {"msg": {"kv": 1}}},
+    "turn_count": 1,
+}
+LLMChat._initialization["9"] = True
+_clear_turn_cache_only("9")
+bucket = LLMChat._shared_kv_cache_memory["9"]
+assert bucket.get("turn") is None
+assert bucket.get("turn_count") == 0
+assert "turn_1" not in bucket.get("user_template", "")
+assert bucket.get("placeholder_info") is not None
+assert bucket.get("prefix") is not None
+LLMChat._shared_kv_cache_memory.pop("9", None)
+LLMChat._initialization.pop("9", None)
+
 class _FakeEngine:
     def resolve_request_state(self, request_uid):
         return KVCOMMEngine._get_request_state(request_uid)
@@ -133,7 +155,7 @@ KVCOMMEngine.anchor_dict.clear()
 KVCOMMEngine.anchors.clear()
 state = KVCOMMEngine._get_request_state("route-test")
 state.anchor_dict.setdefault("agent_0_current", {})["m"] = True
-assert chat.can_kv_reuse_with_soft_anchor_gaps("route-test", "m") is True
+assert chat.can_kv_reuse_with_soft_anchor_gaps("route-test", "m") is False
 KVCOMMEngine._request_states.pop("route-test", None)
 print("  ok")
 PY
@@ -251,7 +273,14 @@ message = openai_message_from_generation(raw)
 payload = _openai_completion(message, "kvcomm/test", {})
 assert payload["choices"][0]["finish_reason"] == "tool_calls"
 assert payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "write"
+assert payload["choices"][0]["message"]["content"] is None
 assert len(sse_tool_call_deltas(message["tool_calls"])) == 1
+
+tool_only = openai_message_from_generation(
+    '<tool_call>\n{"name": "read", "arguments": {"path": "pricing.py"}}\n</tool_call>'
+)
+assert tool_only.get("content") is None
+assert tool_only["tool_calls"][0]["function"]["name"] == "read"
 
 body = {
     "tools": tools,
@@ -259,6 +288,8 @@ body = {
     "messages": [{"role": "user", "content": "hi"}],
 }
 assert extract_tool_request(body)[0][0]["function"]["name"] == "write"
+# Omitted tool_choice is OpenAI "auto" — must not disable the bridge on follow-up turns.
+assert extract_tool_request({"tools": tools, "messages": []})[0][0]["function"]["name"] == "write"
 assert extract_tool_request({"tools": tools, "tool_choice": "none", "messages": []}) == (None, None)
 print("  ok")
 PY

@@ -7,6 +7,7 @@ import {
 } from "./gateway-client.mjs";
 import { resolveCapabilitySubagentTools } from "./openclaw-config.mjs";
 import { fetchSidecarAgentMetrics, registerKvcommContext, shouldFetchSidecarMetrics } from "./sidecar-metrics.mjs";
+import { restoreImmutableCodingFiles, syncEditableCodingFiles } from "./clawbench-chain.mjs";
 import { buildKvcommMetaPrefix, renderTemplateKvReuse, renderTemplateStrict, sha256Short } from "./template.mjs";
 
 const TOOL_JSON_PATTERN =
@@ -135,6 +136,9 @@ export async function runChainStackSpawn(client, params) {
     spawnMode === "capability" ? await resolveCapabilitySubagentTools() : null;
 
   for (let agentIndex = 0; agentIndex < agentCount; agentIndex += 1) {
+    if (spawnMode === "capability" && workspaceDir) {
+      await restoreImmutableCodingFiles(workspaceDir, taskRow);
+    }
     const templateKey = `agent_${agentIndex}`;
     let template = agentTasks?.[templateKey];
     if (!template) {
@@ -207,6 +211,8 @@ export async function runChainStackSpawn(client, params) {
         vars: kvcommVars,
         task_profile: taskProfile,
         user_prompt: taskText.replace(/^<!--KVCOMM_META:\{.*?\}-->\s*/s, ""),
+        system_prompt: taskRow._bench_role_prompt ?? "",
+        bench_padding: Boolean(taskRow._bench_padding_enabled),
       });
     }
 
@@ -393,6 +399,11 @@ export async function runChainStackSpawn(client, params) {
     };
 
     records.push(record);
+
+    if (spawnMode === "capability" && workspaceDir) {
+      await syncEditableCodingFiles(workspaceDir, taskRow);
+      await restoreImmutableCodingFiles(workspaceDir, taskRow);
+    }
   }
 
   return {

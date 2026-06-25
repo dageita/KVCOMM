@@ -17,6 +17,16 @@ KVCOMM_PROFILES = frozenset(
 )
 CLAWBENCH_CAPABILITY_PROFILES = frozenset({"clawbench-capability", "clawbench-capability-sidecar"})
 
+DEFAULT_CAPABILITY_SUBAGENT_TOOLS = [
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "exec",
+    "process",
+    "session_status",
+]
+
 
 def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     out = deepcopy(base)
@@ -149,8 +159,45 @@ def preserve_clawbench_tools_profile(existing: dict[str, Any], merged: dict[str,
         )
 
 
+def ensure_capability_subagent_tools(
+    merged: dict[str, Any],
+    template: dict[str, Any],
+    profile: str,
+) -> None:
+    """Force full coding-tool allowlist for capability lane subagents (do not inherit stale allow)."""
+    if profile not in CLAWBENCH_CAPABILITY_PROFILES:
+        return
+    template_allow = (
+        (template.get("tools") or {}).get("subagents", {}).get("tools", {}).get("allow")
+    )
+    allow = [str(name).strip() for name in (template_allow or DEFAULT_CAPABILITY_SUBAGENT_TOOLS) if str(name).strip()]
+    merged.setdefault("tools", {}).setdefault("subagents", {}).setdefault("tools", {})["allow"] = allow
+    print(f"[apply-profile] set tools.subagents.tools.allow={allow}")
+
+
+def ensure_capability_elevated(merged: dict[str, Any], template: dict[str, Any], profile: str) -> None:
+    """Allow elevated exec for local bench subagents (model sometimes passes elevated: true)."""
+    if profile not in CLAWBENCH_CAPABILITY_PROFILES:
+        return
+    template_elevated = (template.get("tools") or {}).get("elevated")
+    if not template_elevated:
+        return
+    merged.setdefault("tools", {})["elevated"] = deepcopy(template_elevated)
+    print("[apply-profile] set tools.elevated for clawbench capability lane")
+
+
+def ensure_capability_primary_model(merged: dict[str, Any], template: dict[str, Any], profile: str) -> None:
+    """Capability lane: primary model follows profile template (vllm vs kvcomm)."""
+    if profile not in CLAWBENCH_CAPABILITY_PROFILES:
+        return
+    primary = ((template.get("agents") or {}).get("defaults") or {}).get("model", {}).get("primary")
+    if primary:
+        merged.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})["primary"] = primary
+        print(f"[apply-profile] set agents.defaults.model.primary={primary}")
+
+
 def apply_profile(template_path: Path, target_path: Path, profile: str) -> None:
-    template = strip_private_keys(json.loads(template_path.read_text(encoding="utf-8")))
+    template_raw = strip_private_keys(json.loads(template_path.read_text(encoding="utf-8")))
     existing: dict[str, Any] = {}
     if target_path.exists():
         existing = json.loads(target_path.read_text(encoding="utf-8"))
@@ -161,10 +208,11 @@ def apply_profile(template_path: Path, target_path: Path, profile: str) -> None:
         .get("token")
     )
     if token and token != "CHANGE_ME_AFTER_SETUP":
-        template.setdefault("gateway", {}).setdefault("auth", {})["token"] = token
+        template_raw.setdefault("gateway", {}).setdefault("auth", {})["token"] = token
 
+    template = template_raw
     if profile in KVCOMM_PROFILES:
-        template = strip_kvcomm_global_tools_profile(template)
+        template = strip_kvcomm_global_tools_profile(template_raw)
 
     merged = deep_merge(existing, template)
 
@@ -174,6 +222,9 @@ def apply_profile(template_path: Path, target_path: Path, profile: str) -> None:
     merge_gateway_tool_allow(existing, merged)
 
     if profile in KVCOMM_PROFILES:
+        ensure_capability_subagent_tools(merged, template_raw, profile)
+        ensure_capability_elevated(merged, template_raw, profile)
+        ensure_capability_primary_model(merged, template_raw, profile)
         ensure_main_agent_tools(merged, profile)
         preserve_clawbench_tools_profile(existing, merged)
 

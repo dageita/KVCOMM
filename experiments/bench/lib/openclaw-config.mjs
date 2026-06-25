@@ -93,6 +93,34 @@ export async function assertBenchGatewayConfig() {
   return { configPath, config };
 }
 
+export function assertKvcommSidecarGatewayModel(config, { configPath, model } = {}) {
+  const inferenceBackend = (process.env.KVCOMM_INFERENCE_BACKEND || "").trim();
+  if (inferenceBackend && inferenceBackend !== "kvcomm_sidecar") {
+    return;
+  }
+  const primary = config?.agents?.defaults?.model?.primary;
+  const providers = config?.models?.providers || {};
+  const kvcommUrl = providers.kvcomm?.baseUrl || "";
+  const wantsKvcommModel = !model || String(model).startsWith("kvcomm/");
+  if (!wantsKvcommModel) {
+    return;
+  }
+  if (primary && String(primary).startsWith("vllm/")) {
+    throw new Error(
+      `OpenClaw primary model is ${primary} but bench uses kvcomm_sidecar.\n` +
+        `Run: node cli.mjs setup clawbench-capability-sidecar\n` +
+        `Then restart gateway and use --model kvcomm/Qwen3-32B\n` +
+        `Config: ${configPath}`,
+    );
+  }
+  if (!kvcommUrl.includes("8100") && !process.env.KVCOMM_SIDECAR_URL?.trim()) {
+    console.warn(
+      `[clawbench-chain] warning: kvcomm provider baseUrl=${kvcommUrl || "(missing)"} ` +
+        `may not point at sidecar (expected http://127.0.0.1:8100/v1)`,
+    );
+  }
+}
+
 const DEFAULT_CAPABILITY_SUBAGENT_TOOLS = [
   "read",
   "write",
@@ -103,12 +131,45 @@ const DEFAULT_CAPABILITY_SUBAGENT_TOOLS = [
   "session_status",
 ];
 
+const CAPABILITY_ACTION_TOOLS = new Set(["read", "write", "edit", "apply_patch", "exec", "process"]);
+
 /** tools.subagents.tools.allow from openclaw.json (ClawBench capability lane). */
 export async function resolveCapabilitySubagentTools() {
-  const { config } = await readOpenClawConfig();
+  const { configPath, config } = await readOpenClawConfig();
   const allow = config?.tools?.subagents?.tools?.allow;
   if (!Array.isArray(allow) || allow.length === 0) {
     return DEFAULT_CAPABILITY_SUBAGENT_TOOLS;
   }
-  return allow.map((name) => String(name).trim()).filter(Boolean);
+  const normalized = allow.map((name) => String(name).trim()).filter(Boolean);
+  const hasActionTools = normalized.some((name) => CAPABILITY_ACTION_TOOLS.has(name));
+  if (!hasActionTools) {
+    console.warn(
+      `[clawbench-chain] tools.subagents.tools.allow=${JSON.stringify(normalized)} ` +
+        `in ${configPath} lacks action tools (read/edit/exec). ` +
+        `Using default capability set for sessions.patch inheritedToolAllow. ` +
+        `Run: node cli.mjs setup clawbench-capability-sidecar && restart gateway.`,
+    );
+    return DEFAULT_CAPABILITY_SUBAGENT_TOOLS;
+  }
+  return normalized;
+}
+
+export async function assertCapabilitySubagentTools() {
+  const { configPath, config } = await readOpenClawConfig();
+  const allow = config?.tools?.subagents?.tools?.allow;
+  const normalized = Array.isArray(allow)
+    ? allow.map((name) => String(name).trim()).filter(Boolean)
+    : [];
+  const hasActionTools = normalized.some((name) => CAPABILITY_ACTION_TOOLS.has(name));
+  if (hasActionTools) {
+    return { configPath, allow: normalized };
+  }
+  throw new Error(
+    "ClawBench capability lane requires subagent action tools (read/edit/exec).\n" +
+      `Current tools.subagents.tools.allow=${JSON.stringify(normalized)} in ${configPath}\n` +
+      "Fix:\n" +
+      "  cd /src/KVCOMM/openclaw && ./scripts/setup-openclaw.sh clawbench-capability-sidecar\n" +
+      "  openclaw gateway stop && openclaw gateway run\n" +
+      "Bench will still patch inheritedToolAllow with the default set, but gateway policy should match.",
+  );
 }

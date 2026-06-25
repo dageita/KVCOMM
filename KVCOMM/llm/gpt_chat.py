@@ -670,11 +670,11 @@ class LLMChat(LLM):
 
     def _ensure_agent_memory(self, agent_id: str) -> Dict[str, Any]:
         """Return the shared memory slot for a given agent id."""
-        return LLMChat._shared_kv_cache_memory.setdefault(agent_id, {})
+        return LLMChat._ensure_shared_kv_memory().setdefault(agent_id, {})
 
     def _ensure_global_input_buckets(self) -> Dict[str, Dict[str, Any]]:
         """Ensure the global input buckets exist and return the shared store."""
-        store = LLMChat._shared_kv_cache_memory
+        store = LLMChat._ensure_shared_kv_memory()
         store.setdefault("input", {})
         store.setdefault("input_ids", {})
         store.setdefault("input_drop_num", {})
@@ -684,16 +684,21 @@ class LLMChat(LLM):
         """Check if prefix KV has been initialized for an agent."""
         if not LLMChat._initialization.get(agent_id, False):
             return False
-        bucket = LLMChat._shared_kv_cache_memory.get(agent_id) or {}
+        bucket = LLMChat._ensure_shared_kv_memory().get(agent_id) or {}
         if not isinstance(bucket, dict):
             return False
-        return bool(bucket.get("placeholder_info") and bucket.get("prefix"))
+        prefix = bucket.get("prefix")
+        if not prefix:
+            return False
+        # Static-only templates (e.g. clawbench bugfix without bench padding) have no
+        # {agent_*}/{turn_*}/{user_question} slots — placeholder_info is {} but valid.
+        return bucket.get("placeholder_info") is not None
 
     def placeholders_missing_anchor_delta(self, request_uid: str, message: str) -> List[str]:
         """Placeholder ids that still need a dense anchor materialization pass."""
         state = self.get_request_state(request_uid)
         ph_ids = (
-            (LLMChat._shared_kv_cache_memory.get(self.node_id) or {}).get("placeholder_info") or {}
+            (LLMChat._ensure_shared_kv_memory().get(self.node_id) or {}).get("placeholder_info") or {}
         ).keys()
         missing: List[str] = []
         for ph_id in ph_ids:
@@ -719,14 +724,16 @@ class LLMChat(LLM):
         return all(_TURN_PLACEHOLDER_RE.match(ph_id) for ph_id in missing)
 
     def can_kv_reuse_with_soft_anchor_gaps(self, request_uid: str, message: str) -> bool:
-        """Allow kv_reuse when missing deltas are only turn_* or agent_N_current placeholders."""
+        """Allow kv_reuse when missing deltas are only ephemeral turn_* placeholders.
+
+        Cross-agent ``agent_N_current`` slots must be dense-materialised on the
+        consuming node; treating them as soft gaps causes silent blend skips when
+        pooled pf/ph deltas no longer match the current prefix topology.
+        """
         missing = self.placeholders_missing_anchor_delta(request_uid, message)
         if not missing:
             return True
-        return all(
-            _TURN_PLACEHOLDER_RE.match(ph_id) or _AGENT_CURRENT_PLACEHOLDER_RE.match(ph_id)
-            for ph_id in missing
-        )
+        return all(_TURN_PLACEHOLDER_RE.match(ph_id) for ph_id in missing)
 
     @staticmethod
     def _delta_seq_len(delta: Any) -> int | None:
@@ -734,29 +741,52 @@ class LLMChat(LLM):
             return None
         return int(delta.shape[-2])
 
+    def _merged_anchor_entry(self, request_uid: str, ph_id: str, message: str) -> Dict[str, Any] | None:
+        """Return request-scoped anchor entry, falling back to committed global store."""
+        state = self.get_request_state(request_uid)
+        entry = (state.anchors.get(ph_id) or {}).get(message)
+        if isinstance(entry, dict):
+            return entry
+        global_entry = (KVCOMMEngine.anchors.get(ph_id) or {}).get(message)
+        if isinstance(global_entry, dict):
+            return global_entry
+        return None
+
+    def _prefix_segment_len_for_placeholder(self, ph_id: str) -> int | None:
+        """Length of the prefix KV segment paired with ``ph_id`` in agen_kvcomm."""
+        prefix_store = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
+        if not isinstance(prefix_store, dict):
+            return None
+        placeholder_info = prefix_store.get("placeholder_info") or {}
+        prefix_kv_list = prefix_store.get("prefix") or []
+        if not isinstance(placeholder_info, dict) or not placeholder_info or not prefix_kv_list:
+            return None
+
+        placeholder_entries = list(placeholder_info.items())[::-1]
+        for idx, (pid, _bounds) in enumerate(placeholder_entries):
+            if pid != ph_id:
+                continue
+            seg_idx = idx + 1
+            if seg_idx < len(prefix_kv_list):
+                return int(prefix_kv_list[seg_idx]._seen_tokens)
+        return None
+
     def find_incompatible_anchor_deltas(self, request_uid: str, message: str) -> List[str]:
         """Return placeholder ids whose stored deltas no longer match current prefix segments."""
-        state = self.get_request_state(request_uid)
         prefix_store = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
         if not isinstance(prefix_store, dict):
             return []
 
         placeholder_info = prefix_store.get("placeholder_info") or {}
-        prefix_kv_list = prefix_store.get("prefix") or []
-        if not isinstance(placeholder_info, dict) or not placeholder_info or not prefix_kv_list:
+        if not isinstance(placeholder_info, dict) or not placeholder_info:
             return []
 
         delta_key_ph = f"{self.node_id}_ph_key_delta"
         delta_key_pf = f"{self.node_id}_pf_key_delta"
         incompatible: List[str] = []
-        placeholder_entries = list(placeholder_info.items())[::-1]
-        prefix_segments = prefix_kv_list[1:] if len(prefix_kv_list) > 1 else []
 
-        for idx, (ph_id, _bounds) in enumerate(placeholder_entries):
-            anchor_bucket = (state.anchors.get(ph_id) or {}) if isinstance(state.anchors, dict) else {}
-            if not isinstance(anchor_bucket, dict):
-                continue
-            entry = anchor_bucket.get(message)
+        for ph_id in placeholder_info:
+            entry = self._merged_anchor_entry(request_uid, str(ph_id), message)
             if not isinstance(entry, dict):
                 continue
             if delta_key_ph not in entry and delta_key_pf not in entry:
@@ -775,10 +805,10 @@ class LLMChat(LLM):
                 incompatible.append(str(ph_id))
                 continue
 
-            if idx < len(prefix_segments) and delta_key_pf in entry:
-                pf_len = int(prefix_segments[idx]._seen_tokens)
+            if delta_key_pf in entry:
+                pf_len = self._prefix_segment_len_for_placeholder(str(ph_id))
                 pf_delta_len = self._delta_seq_len(entry.get(delta_key_pf))
-                if pf_delta_len is not None and pf_delta_len != pf_len:
+                if pf_len is not None and pf_delta_len is not None and pf_delta_len != pf_len:
                     incompatible.append(str(ph_id))
         return incompatible
 
@@ -1210,15 +1240,22 @@ class LLMChat(LLM):
 
         def _prefill_prefix_kv():
             with torch.no_grad():
-                return self.model.generate(
-                    **token_ids,
-                    use_cache=True,
-                    max_length=token_ids["input_ids"].shape[-1] + 1,
-                    return_dict_in_generate=True,
-                    return_legacy_cache=False,
-                )
+                with LLMChat._model_lock:
+                    return self.model.generate(
+                        **token_ids,
+                        use_cache=True,
+                        max_length=token_ids["input_ids"].shape[-1] + 1,
+                        return_dict_in_generate=True,
+                        return_legacy_cache=False,
+                    )
 
+        logger.info(
+            "Building prefix KV for node {} ({} prompt chars; first HF prefill may take 1-3 min on 32B)",
+            node_id,
+            len(prompt_text),
+        )
         out = await asyncio.to_thread(_prefill_prefix_kv)
+        logger.info("Prefix KV ready for node {}", node_id)
         base_kv = out.past_key_values.slice_(start=0, end=token_ids['input_ids'].shape[-1])                                               
         segment_kv_list = []
         token_id_list = []
@@ -1273,42 +1310,55 @@ class LLMChat(LLM):
         mem = LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
         turn_root = mem.setdefault("turn", {})
         for ph_id, content in turn_content.items():
-            if not ph_id.startswith("turn_") or not str(content).strip():
+            if not ph_id.startswith("turn_"):
                 continue
+            content_str = str(content).strip() or " "
             bucket = turn_root.setdefault(ph_id, {})
-            if bucket.get(message_key):
-                continue
-            token_ids = self.tokenizer(
-                str(content),
-                add_special_tokens=False,
-                return_tensors="pt",
-            )
-            token_ids = {
-                key: value.to(self.model.device) if isinstance(value, torch.Tensor) else value
-                for key, value in token_ids.items()
-            }
-            token_ids["attention_mask"] = torch.ones_like(token_ids["input_ids"]).to(self.model.device)
-
-            def _materialize_turn_kv():
-                with torch.no_grad():
-                    return self.model.generate(
-                        **token_ids,
-                        use_cache=True,
-                        max_length=token_ids["input_ids"].shape[-1] + 1,
-                        return_dict_in_generate=True,
-                        return_legacy_cache=False,
-                    )
-
-            output = await asyncio.to_thread(_materialize_turn_kv)
-            kv_cache = output.past_key_values.slice_(
-                start=0,
-                end=token_ids["input_ids"].shape[-1],
-            )
+            existing = bucket.get(message_key)
+            if isinstance(existing, dict) and existing.get("ids") is not None:
+                try:
+                    prior = self.tokenizer.decode(
+                        existing["ids"]["input_ids"][0],
+                        skip_special_tokens=True,
+                    ).strip()
+                except Exception:
+                    prior = ""
+                if prior == content_str:
+                    continue
+            kv_cache, token_ids = await asyncio.to_thread(self._forward_text_to_kv_sync, content_str)
             bucket[message_key] = {
                 "kv": kv_cache,
                 "ids": token_ids,
                 "drop_num": 0,
             }
+
+    def _forward_text_to_kv_sync(self, text: str) -> Tuple[Any, Dict[str, torch.Tensor]]:
+        """Run a short HF prefill for arbitrary text (turn/upstream response KV)."""
+        content_str = str(text).strip() or " "
+        token_ids = self.tokenizer(
+            content_str,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )
+        token_ids = {
+            key: value.to(self.model.device) if isinstance(value, torch.Tensor) else value
+            for key, value in token_ids.items()
+        }
+        token_ids["attention_mask"] = torch.ones_like(token_ids["input_ids"]).to(self.model.device)
+        with torch.no_grad():
+            with LLMChat._model_lock:
+                output = self.model.generate(
+                    **token_ids,
+                    use_cache=True,
+                    max_length=token_ids["input_ids"].shape[-1] + 1,
+                    return_dict_in_generate=True,
+                    return_legacy_cache=False,
+                )
+        kv_cache = output.past_key_values.slice_(
+            start=0,
+            end=token_ids["input_ids"].shape[-1],
+        )
+        return kv_cache, token_ids
 
     @staticmethod
     def _pretrained_kwargs(model_name: str) -> dict[str, Any]:
@@ -1524,13 +1574,15 @@ class LLMChat(LLM):
         return []
 
     @classmethod
+    def _ensure_shared_kv_memory(cls) -> dict:
+        """Return shared KV store dict; never leave the class attribute as None."""
+        if cls._shared_kv_cache_memory is None:
+            cls._shared_kv_cache_memory = {}
+        return cls._shared_kv_cache_memory
+
+    @classmethod
     def _clear_shared_kv_memory(cls) -> None:
-        store = cls._shared_kv_cache_memory
-        if not isinstance(store, dict):
-            cls._shared_kv_cache_memory = None
-            return
-        store.clear()
-        cls._shared_kv_cache_memory = None
+        cls._ensure_shared_kv_memory().clear()
 
     @classmethod
     def _dispose_hf_model(cls, model: Any) -> None:
@@ -1658,8 +1710,7 @@ class LLMChat(LLM):
                     self.model_name,
                     self.describe_hf_load_plan(self.model_name),
                 )
-            if LLMChat._shared_kv_cache_memory is None:
-                LLMChat._shared_kv_cache_memory = {}
+            LLMChat._ensure_shared_kv_memory()
 
     def locate_placeholder(self, original_text, return_segments=False):
         """Locate placeholder token spans in a templated prompt.
@@ -1694,7 +1745,9 @@ class LLMChat(LLM):
                 encoding = {}
                 encoding['input_ids'] = torch.tensor(token_id).unsqueeze(0).to(self.model.device)
                 encoding['attention_mask'] = torch.ones_like(encoding['input_ids']).to(self.model.device)
-                if txt.strip():
+                # Keep whitespace-only spans (e.g. "\n\n" between turn placeholders);
+                # skipping them breaks prefix_kv_list[1:] vs placeholder zip in agen_kvcomm.
+                if txt:
                     segments.append(("text", txt, encoding, token_num, token_num + len(token_id)))
                     idx_count += 1
                 token_num += len(token_id)
@@ -1713,7 +1766,7 @@ class LLMChat(LLM):
         encoding = {}
         encoding['input_ids'] = torch.tensor(token_id).unsqueeze(0).to(self.model.device)
         encoding['attention_mask'] = torch.ones_like(encoding['input_ids']).to(self.model.device)
-        if txt.strip():
+        if txt:
             segments.append(("text", txt, encoding, token_num, token_num + len(token_id)))
             token_num += len(token_id)
 
@@ -2019,6 +2072,22 @@ class LLMChat(LLM):
                 for m in meta
             ]
             results = list(self._map_in_pool(self.kv_engine.update_kv_cache_segment, tasks, timeout=30))
+            blend_failed = [m["ph_id"] for m, result in zip(meta, results) if not result[3]]
+            if blend_failed:
+                self.purge_incompatible_anchor_deltas(request_uid, message, blend_failed)
+                logger.debug(
+                    "kv_reuse anchor blend failed node_id={} placeholders={} -> dense_prefill rematerialize",
+                    self.node_id,
+                    blend_failed,
+                )
+                mode = "dense_prefill"
+                results = list(
+                    self._map_in_pool(
+                        self.kv_engine.process_anchor,
+                        [(message, m) for m in meta],
+                        timeout=30,
+                    )
+                )
         else:
             raise ValueError(f"Unsupported mode '{mode}' for agen_kvcomm.")
 
@@ -2072,6 +2141,8 @@ class LLMChat(LLM):
             "return_legacy_cache": False,
             "return_dict_in_generate": True,
         }
+        if isinstance(tool_injection_text, str) and tool_injection_text.strip():
+            generation_kwargs["repetition_penalty"] = 1.08
 
         if mode == "kv_reuse":
             merged_prefix_kv = merged_prefix_kv.slice_(start=0, end=cached_prefix_token_length - 1)
@@ -2091,12 +2162,10 @@ class LLMChat(LLM):
         preprocess_latency = max(0.0, perf_counter() - preprocess_start)
 
         def _run_model_generate():
-            return self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
+            with LLMChat._model_lock:
+                return self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
 
-        if token_cb is not None:
-            outputs = await asyncio.to_thread(_run_model_generate)
-        else:
-            outputs = _run_model_generate()
+        outputs = await asyncio.to_thread(_run_model_generate)
         if ttft_tracer.ttft is None:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -2128,11 +2197,27 @@ class LLMChat(LLM):
                 window_length=window_length,
             )
 
-        response_kv_cache = full_kv_cache.slice_(start=generation_prompt_length)
-        response_kv_cache = self.kv_engine.apply_rotary_pos_emb(
-            response_kv_cache,
-            offset=-generation_prompt_length,
+        seq = outputs.sequences
+        generated_ids = _trim_token_ids_at_eos(
+            self.tokenizer,
+            seq[0, generation_prompt_length:].unsqueeze(0),
+        )[0]
+        raw_response_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        try:
+            from sidecar.tool_bridge import sanitize_generation_text
+        except ImportError:
+            sanitize_generation_text = _sanitize_chat_template_leaks  # type: ignore[assignment]
+        stored_text = sanitize_generation_text(raw_response_text)
+        if not stored_text and raw_response_text.strip():
+            stored_text = _sanitize_chat_template_leaks(raw_response_text)
+
+        response_kv_cache, token_dict = await asyncio.to_thread(
+            self._forward_text_to_kv_sync,
+            stored_text or " ",
         )
+        response_tokens = token_dict["input_ids"]
+        attn_len = response_tokens.size(1)
+        response_mask = torch.ones(response_tokens.size(0), attn_len, device=self.model.device)
 
         mem = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
         if not isinstance(mem, dict):
@@ -2142,15 +2227,6 @@ class LLMChat(LLM):
         resp = mem.setdefault("response", {})
         resp_ids = mem.setdefault("response_ids", {})
         resp_drop = mem.setdefault("response_drop_num", {})
-
-        seq = outputs.sequences
-        generated_ids = _trim_token_ids_at_eos(
-            self.tokenizer,
-            seq[0, generation_prompt_length:].unsqueeze(0),
-        )[0]
-        response_tokens = generated_ids.unsqueeze(0)
-        attn_len = response_tokens.size(1)
-        response_mask = torch.ones(seq.size(0), attn_len, device=self.model.device)
 
         current_key = f"agent_{self.node_id}_current"
         current_bucket = state.anchor_dict.get(current_key) or {}
@@ -2205,12 +2281,7 @@ class LLMChat(LLM):
                 bucket_entry = global_bucket.setdefault(msg_key, [0, 0])
                 bucket_entry[0] = anchor_active_list[idx]
 
-        response_message = _sanitize_chat_template_leaks(
-            self.tokenizer.decode(
-                generated_ids,
-                skip_special_tokens=True,
-            ).strip()
-        )
+        response_message = (stored_text or raw_response_text).strip()
         prompt_preview = self.tokenizer.decode(
             merged_prefix_token_ids["input_ids"][0]
         )
@@ -2422,6 +2493,22 @@ class LLMChat(LLM):
                 for m in meta
             ]
             results = list(self._map_in_pool(self.kv_engine.update_kv_cache_segment, tasks, timeout=30))
+            blend_failed = [m["ph_id"] for m, result in zip(meta, results) if not result[3]]
+            if blend_failed:
+                self.purge_incompatible_anchor_deltas(request_uid, message, blend_failed)
+                logger.debug(
+                    "kv_reuse anchor blend failed node_id={} placeholders={} -> dense_prefill rematerialize",
+                    self.node_id,
+                    blend_failed,
+                )
+                mode = "dense_prefill"
+                results = list(
+                    self._map_in_pool(
+                        self.kv_engine.process_anchor,
+                        [(message, m) for m in meta],
+                        timeout=30,
+                    )
+                )
         else:
             raise ValueError(f"Unsupported mode '{mode}' for agen_kvcomm.")
 
