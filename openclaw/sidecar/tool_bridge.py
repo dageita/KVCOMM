@@ -10,6 +10,8 @@ import time
 import uuid
 from typing import Any
 
+from sidecar.bench_prompt_compose import BUGFIX_DISCOUNT_TASK_ID
+
 _CHAT_TEMPLATE_LEAK_RE = re.compile(
     r"<\|im_start\|>\s*|<\|im_end\|>\s*|<\|redacted_im_end\|>\s*",
     re.IGNORECASE,
@@ -197,6 +199,11 @@ _TOOL_PREAMBLE_LEAK_RE = re.compile(
     r"^(?:If multiple actions are needed.*?\n)?(?:Never call a function.*?\n){3,}",
     re.DOTALL | re.IGNORECASE,
 )
+_TOOL_GUIDELINE_PREAMBLE_RE = re.compile(
+    r"^(?:If multiple actions are needed[^\n]*\n)"
+    r"(?:[A-Z][^\n]{0,120}\n){5,}",
+    re.MULTILINE,
+)
 
 
 def _collapse_never_call_spam(text: str, *, min_lines: int = 3) -> str:
@@ -223,6 +230,7 @@ def sanitize_generation_text(text: str) -> str:
     cleaned = _THINKING_OPEN_RE.sub("", cleaned)
     cleaned = _collapse_never_call_spam(cleaned)
     cleaned = _TOOL_PREAMBLE_LEAK_RE.sub("", cleaned)
+    cleaned = _TOOL_GUIDELINE_PREAMBLE_RE.sub("", cleaned)
     cleaned = _collapse_line_repetition(cleaned)
     cleaned = _collapse_never_call_spam(cleaned)
     if _NEVER_CALL_LINE_RE.match(cleaned.strip()):
@@ -276,6 +284,7 @@ def _normalize_tool_arguments(
     arguments: Any,
     *,
     task_profile: str = "",
+    task_id: str = "",
 ) -> Any:
     if not isinstance(arguments, dict):
         return arguments
@@ -293,7 +302,7 @@ def _normalize_tool_arguments(
         if workdir in (".", "", "./"):
             updated["workdir"] = clawbench_tool_workspace()
         command = str(updated.get("command") or "").strip()
-        if command:
+        if command and str(task_id or "").strip() == BUGFIX_DISCOUNT_TASK_ID:
             normalized_cmd = _normalize_clawbench_pytest_command(command)
             if normalized_cmd != command:
                 updated["command"] = normalized_cmd
@@ -305,23 +314,22 @@ def _required_tools_for_agent(
     *,
     agent_index: str | int | None = None,
     agent_role: str = "",
+    task_id: str = "",
 ) -> frozenset[str] | None:
     role = (agent_role or "").strip().lower()
     try:
         idx = int(agent_index) if agent_index is not None else -1
     except (TypeError, ValueError):
         idx = -1
-    if idx in _CLAWBENCH_REQUIRED_BY_INDEX:
+    if str(task_id or "").strip() == BUGFIX_DISCOUNT_TASK_ID and idx in _CLAWBENCH_REQUIRED_BY_INDEX:
         return _CLAWBENCH_REQUIRED_BY_INDEX[idx]
     if any(tag in role for tag in ("extractor", "analyzer")):
         return _ANALYZER_TOOLS
-    if any(tag in role for tag in ("formatter", "patcher", "writer")):
+    if any(tag in role for tag in ("patcher",)):
         return _PATCHER_TOOLS
-    if any(tag in role for tag in ("reviewer", "verifier")):
-        return _VERIFIER_TOOLS
-    if "writer" in role:
+    if any(tag in role for tag in ("formatter", "writer")):
         return _WRITER_TOOL_NAMES
-    if "verifier" in role:
+    if any(tag in role for tag in ("reviewer", "verifier")):
         return _VERIFIER_TOOL_NAMES
     return None
 
@@ -332,11 +340,16 @@ def ensure_clawbench_agent_tools(
     agent_index: str | int | None = None,
     agent_role: str = "",
     task_profile: str = "",
+    task_id: str = "",
 ) -> list[dict[str, Any]]:
     """Merge role-required tool schemas when OpenClaw sends an incomplete tools array."""
     if (task_profile or "").strip().lower() != "clawbench":
         return tools
-    required = _required_tools_for_agent(agent_index=agent_index, agent_role=agent_role)
+    required = _required_tools_for_agent(
+        agent_index=agent_index,
+        agent_role=agent_role,
+        task_id=task_id,
+    )
     if not required:
         return tools
     by_name: dict[str, dict[str, Any]] = {}
@@ -357,11 +370,16 @@ def filter_tools_for_agent(
     agent_index: str | int | None = None,
     agent_role: str = "",
     task_profile: str = "",
+    task_id: str = "",
 ) -> list[dict[str, Any]]:
     """Keep only role-relevant tools to shrink generation-boundary injection."""
     if os.environ.get("KVCOMM_TOOL_BRIDGE_MINIMAL", "1").strip().lower() in ("0", "false", "no", "off"):
         return tools
-    allowed = _required_tools_for_agent(agent_index=agent_index, agent_role=agent_role)
+    allowed = _required_tools_for_agent(
+        agent_index=agent_index,
+        agent_role=agent_role,
+        task_id=task_id,
+    )
     if not allowed:
         return tools
     filtered: list[dict[str, Any]] = []
@@ -478,6 +496,8 @@ def _manual_qwen_tools_text(tools: list[dict[str, Any]]) -> str:
         "</tool_call>\n"
         "Use the exact function names from the schema above (e.g. `read`, not `read_file`). "
         "One tool call per <tool_call> block.\n"
+        "Do not output instructions, guidelines, or commentary. "
+        "Start your response immediately with <tool_call> if a tool call is needed.\n"
     )
     return "".join(parts)
 
@@ -527,11 +547,17 @@ def _append_tool_call(
     payload: dict[str, Any],
     *,
     task_profile: str = "",
+    task_id: str = "",
 ) -> None:
     name = canonical_tool_name(str(payload.get("name") or payload.get("function") or "").strip())
     if not name:
         return
-    arguments = _normalize_tool_arguments(name, payload.get("arguments"), task_profile=task_profile)
+    arguments = _normalize_tool_arguments(
+        name,
+        payload.get("arguments"),
+        task_profile=task_profile,
+        task_id=task_id,
+    )
     tool_calls.append(
         {
             "id": f"call_{uuid.uuid4().hex[:24]}",
@@ -544,7 +570,12 @@ def _append_tool_call(
     )
 
 
-def parse_qwen_tool_calls(text: str, *, task_profile: str = "") -> tuple[str, list[dict[str, Any]]]:
+def parse_qwen_tool_calls(
+    text: str,
+    *,
+    task_profile: str = "",
+    task_id: str = "",
+) -> tuple[str, list[dict[str, Any]]]:
     """Parse Qwen `<tool_call>` blocks into OpenAI `tool_calls` payloads."""
     if not text:
         return "", []
@@ -568,7 +599,7 @@ def parse_qwen_tool_calls(text: str, *, task_profile: str = "") -> tuple[str, li
             except json.JSONDecodeError:
                 continue
             if isinstance(payload, dict):
-                _append_tool_call(tool_calls, payload, task_profile=task_profile)
+                _append_tool_call(tool_calls, payload, task_profile=task_profile, task_id=task_id)
 
     if not tool_calls:
         for match in _LOOSE_TOOL_JSON_RE.finditer(text):
@@ -579,7 +610,7 @@ def parse_qwen_tool_calls(text: str, *, task_profile: str = "") -> tuple[str, li
                 }
             except json.JSONDecodeError:
                 continue
-            _append_tool_call(tool_calls, payload, task_profile=task_profile)
+            _append_tool_call(tool_calls, payload, task_profile=task_profile, task_id=task_id)
 
     content_parts.append(text[last_end:])
     content = _TOOL_CALL_RE.sub("", "".join(content_parts)).strip()
@@ -588,11 +619,17 @@ def parse_qwen_tool_calls(text: str, *, task_profile: str = "") -> tuple[str, li
     return content or "", tool_calls
 
 
-def openai_message_from_generation(raw: str, *, task_profile: str = "") -> dict[str, Any]:
+def openai_message_from_generation(
+    raw: str,
+    *,
+    task_profile: str = "",
+    task_id: str = "",
+) -> dict[str, Any]:
     """Convert raw HF assistant text into an OpenAI chat completion message."""
     content, tool_calls = parse_qwen_tool_calls(
         sanitize_generation_text(raw or ""),
         task_profile=task_profile,
+        task_id=task_id,
     )
     message: dict[str, Any] = {"role": "assistant"}
     if tool_calls:

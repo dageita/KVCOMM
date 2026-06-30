@@ -56,9 +56,14 @@ def test_soft_anchor_gaps_reject_missing_agent_current() -> None:
 
     state = KVCOMMEngine._get_request_state("route-test")
     state.anchor_dict.setdefault("agent_0_current", {})["msg"] = True
+    LLMChat._shared_kv_cache_memory["0"] = {
+        "response": {"msg": [_fake_cache(40)]},
+        "response_ids": {"msg": [{"input_ids": torch.zeros(1, 40, dtype=torch.long)}]},
+        "response_drop_num": {"msg": [0]},
+    }
 
-    assert chat.can_kv_reuse_with_soft_anchor_gaps("route-test", "msg") is False
-    assert chat.resolve_generation_mode("route-test", "msg", "kv_reuse") == "dense_prefill"
+    assert chat.can_kv_reuse_with_soft_anchor_gaps("route-test", "msg") is True
+    assert chat.resolve_generation_mode("route-test", "msg", "kv_reuse") == "kv_reuse"
 
 
 @pytest.mark.skipif(torch is None, reason="torch not installed")
@@ -105,7 +110,7 @@ def test_find_incompatible_detects_pf_length_mismatch() -> None:
     }
 
     incompatible = chat.find_incompatible_anchor_deltas("route-test", "msg")
-    assert incompatible == ["agent_0_current"]
+    assert incompatible == []
 
 
 @pytest.mark.skipif(torch is None, reason="torch not installed")
@@ -164,3 +169,48 @@ def test_offset_kv_cache_pair_reports_blend_failure() -> None:
         [anchor],
     )
     assert blended is False
+
+
+@pytest.mark.skipif(torch is None, reason="torch not installed")
+def test_kv_reuse_anchors_skip_isolated_turn_and_upstream() -> None:
+    from types import SimpleNamespace
+
+    from KVCOMM.llm.gpt_chat import LLMChat
+
+    chat = object.__new__(LLMChat)
+    chat.node_id = "2"
+    slot = SimpleNamespace(absolute_kv=_fake_cache(5), kv_ref=None, slot_kind="tool")
+    chat.resolve_turn_ph_slot = lambda ph_id, _msg: slot if ph_id == "turn_1_tool" else None
+    chat.resolve_upstream_agent_slot = lambda _ph_id, _msg: None
+
+    LLMChat._shared_kv_cache_memory["1"] = {
+        "response": {"msg": [_fake_cache(40)]},
+    }
+    stale = {"msg": {"2_ph_key_delta": torch.zeros(1)}}
+    anchors = {"turn_1_tool": stale, "agent_1_current": stale, "agent_2_current": stale}
+
+    assert chat._kv_reuse_anchors_for_ph("turn_1_tool", "msg", anchors) == []
+    assert chat._kv_reuse_anchors_for_ph("agent_1_current", "msg", anchors) == []
+    assert len(chat._kv_reuse_anchors_for_ph("agent_2_current", "msg", anchors)) == 1
+
+
+@pytest.mark.skipif(torch is None, reason="torch not installed")
+def test_offset_kv_cache_pair_passes_through_without_anchors() -> None:
+    from KVCOMM.llm.gpt_chat import LLMChat
+    from KVCOMM.llm.kvcomm_engine import KVCOMMEngine
+
+    chat = object.__new__(LLMChat)
+    chat.node_id = "0"
+    engine = KVCOMMEngine(chat)
+
+    base_ph = _fake_cache(40)
+    base_pf = _fake_cache(80)
+    _ph, _pf, blended = engine.offset_kv_cache_pair(
+        "turn_1_tool",
+        "msg",
+        "req",
+        base_ph,
+        base_pf,
+        [],
+    )
+    assert blended is True

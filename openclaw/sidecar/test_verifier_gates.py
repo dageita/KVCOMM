@@ -6,6 +6,7 @@ from sidecar.openclaw_prefix import (
     patcher_read_satisfied,
     verifier_exec_pytest_done,
     verifier_pytest_passed,
+    verifier_read_satisfied,
     verifier_should_force_edit,
     verifier_should_force_exec,
     verifier_should_force_read,
@@ -80,3 +81,30 @@ def test_verifier_should_force_edit_after_failed_pytest_and_read() -> None:
     assert verifier_should_force_read(messages) is False
     assert verifier_should_force_edit(messages) is True
     assert verifier_should_force_exec(messages) is False
+
+
+def _quick_note_read_turn() -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_n",
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"path":"notes/quick_note.md"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_n",
+            "content": "- Pick up dry cleaning Thursday\n- Sam's recital Saturday at 4\n",
+        },
+    ]
+
+
+def test_verifier_read_satisfied_after_quick_note_read() -> None:
+    messages = [{"role": "user", "content": "task"}, *_quick_note_read_turn()]
+    assert verifier_read_satisfied(messages) is True

@@ -340,7 +340,7 @@ async function main() {
     throw new Error(`Unknown task profile: ${args.taskProfile} (expected copy or clawbench)`);
   }
   if (args.taskProfile === "clawbench" && args.rolePrompt.endsWith("copy_machine.role.txt")) {
-    args.rolePrompt = join(BENCH_ROOT, "prompts/clawbench_chain.role.txt");
+    args.rolePrompt = join(BENCH_ROOT, "prompts/clawbench_chain.role.minimal.txt");
   }
 
   const measureRuns = args.measureRuns ?? args.runs;

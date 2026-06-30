@@ -41,12 +41,6 @@ import {
   teardownManagedSidecar,
 } from "../../../openclaw/lib/sidecar-lifecycle.mjs";
 import { isBenchDebugMode, resolveRunTimeoutSeconds } from "../lib/bench-timeout.mjs";
-import {
-  resolveBenchPaddingBlock,
-  resolveBenchPaddingEnabled,
-  resolveRolePromptPath,
-  resolveTaskBodyForBench,
-} from "../lib/bench-padding.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BENCH_ROOT = resolve(__dirname, "..");
@@ -75,8 +69,6 @@ function parseArgs(argv) {
     cleanSessions: false,
     judgeModel: process.env.CLAWBENCH_JUDGE_MODEL?.trim() || "",
     skipScore: false,
-    benchPadding: resolveBenchPaddingEnabled(process.env.BENCH_PADDING),
-    benchPaddingExplicit: process.env.BENCH_PADDING != null && process.env.BENCH_PADDING !== "",
   };
 
   for (let i = 2; i < argv.length; i += 1) {
@@ -157,16 +149,6 @@ function parseArgs(argv) {
       args.skipScore = true;
       continue;
     }
-    if (arg === "--bench-padding" && argv[i + 1]) {
-      args.benchPadding = resolveBenchPaddingEnabled(argv[++i]);
-      args.benchPaddingExplicit = true;
-      continue;
-    }
-    if (arg === "--no-bench-padding") {
-      args.benchPadding = false;
-      args.benchPaddingExplicit = true;
-      continue;
-    }
     if (arg === "--debug") {
       args.debug = true;
       continue;
@@ -185,13 +167,6 @@ function parseArgs(argv) {
     explicitSeconds: args.runTimeoutSecondsExplicit,
     debugFlag: args.debug,
   });
-  if (!args.benchPaddingExplicit) {
-    args.rolePrompt = resolveRolePromptPath(args.benchPadding);
-  } else if (!args.benchPadding) {
-    args.rolePrompt = resolveRolePromptPath(false);
-  } else {
-    args.rolePrompt = resolveRolePromptPath(true);
-  }
   return args;
 }
 
@@ -236,8 +211,6 @@ Options:
   --model <provider/model>
   --judge-model <provider/model>   Optional ClawBench judge model
   --skip-score                     Skip Python capability scoring
-  --bench-padding on|off           Inject long stable KV padding into role + task prompts (default: off)
-  --no-bench-padding               Same as --bench-padding off
   --debug                          Debug mode (agent/stream timeout 60s unless overridden)
   --run-timeout-seconds <n>        Per-agent OpenClaw run + stream wait timeout (default: 600, debug: 60)
   --output, --output-dir, --experiment-id, --clean-sessions
@@ -245,7 +218,6 @@ Options:
 Environment:
   BENCH_DEBUG=1 | KVCOMM_BENCH_DEBUG=1 | LOGURU_LEVEL=DEBUG  → 60s timeout
   BENCH_RUN_TIMEOUT_SECONDS=<n>    Override timeout explicitly
-  BENCH_PADDING=on|off             Same as --bench-padding (default: off)
 `);
 }
 
@@ -254,7 +226,7 @@ async function buildRolePrompt(rolePromptPath) {
   return raw.trim();
 }
 
-async function prepareTasks(datasetPath, taskId, rolePrompt, agentCount, topology, benchPadding) {
+async function prepareTasks(datasetPath, taskId, rolePrompt, agentCount, topology) {
   const rows = await loadJsonl(datasetPath);
   const filtered = taskId ? rows.filter((row) => row.task_id === taskId) : rows;
   if (filtered.length === 0) {
@@ -263,12 +235,10 @@ async function prepareTasks(datasetPath, taskId, rolePrompt, agentCount, topolog
   const templateVars = { role_prompt: rolePrompt };
   const prepared = [];
   for (const row of filtered) {
-    const benchPaddingBlock = await resolveBenchPaddingBlock(row, benchPadding);
-    const vars = { ...templateVars, bench_padding: benchPaddingBlock };
     const extended = extendTaskAgentTemplates(row, agentCount, topology);
     const renderMap = (templates) =>
       Object.fromEntries(
-        Object.entries(templates).map(([key, template]) => [key, renderTemplate(template, vars)]),
+        Object.entries(templates).map(([key, template]) => [key, renderTemplate(template, templateVars)]),
       );
     prepared.push({
       ...extended,
@@ -276,7 +246,6 @@ async function prepareTasks(datasetPath, taskId, rolePrompt, agentCount, topolog
       ...(extended.capability_agent_tasks
         ? { capability_agent_tasks: renderMap(extended.capability_agent_tasks) }
         : {}),
-      _bench_padding_enabled: benchPadding,
       _bench_role_prompt: rolePrompt,
     });
   }
@@ -322,8 +291,6 @@ async function maybeCleanBenchSessions(enabled) {
 
 async function main() {
   const args = parseArgs(process.argv);
-  process.env.KVCOMM_BENCH_PADDING = args.benchPadding ? "1" : "0";
-  process.env.BENCH_PADDING = args.benchPadding ? "on" : "off";
   const measureRuns = args.measureRuns ?? args.runs;
   if (args.debug || isBenchDebugMode()) {
     console.log(
@@ -339,12 +306,9 @@ async function main() {
     rolePrompt,
     scenario.agent_count,
     scenario.topology ?? "chain",
-    args.benchPadding,
   );
 
-  console.log(
-    `[clawbench-chain] bench_padding=${args.benchPadding ? "on" : "off"} role=${args.rolePrompt}`,
-  );
+  console.log(`[clawbench-chain] role=${args.rolePrompt}`);
 
   const runMetadataBase = buildRunMetadata({
     experimentId: args.experimentId,
@@ -424,8 +388,7 @@ async function main() {
 
         await stageCapabilityWorkspaceForAgents(workspaceDir, taskRow);
 
-        const taskBodyRaw = await resolveTaskBody(taskRow, runIndex);
-        const taskBody = resolveTaskBodyForBench(taskBodyRaw, taskRow, args.benchPadding);
+        const taskBody = await resolveTaskBody(taskRow, runIndex);
         const effectiveInferenceMode = isWarmup ? "dense_prefill" : args.inferenceMode;
         const result = await runChainStackSpawn(client, {
           agentId: args.agentId,

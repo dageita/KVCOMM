@@ -34,6 +34,9 @@ function analyzeOutputFormat(outputText, taskRow) {
 }
 
 function resolveAgentTasks(taskRow, spawnMode) {
+  if (spawnMode === "capability" && taskRow.agent_tasks && taskRow.tool_constraints) {
+    return taskRow.agent_tasks;
+  }
   if (spawnMode === "capability" && taskRow.capability_agent_tasks) {
     return taskRow.capability_agent_tasks;
   }
@@ -160,10 +163,16 @@ export async function runChainStackSpawn(client, params) {
 
     let taskText = renderAgentTask(template, variables, inferenceMode, agentIndex);
     const messageKey = variables.user_question || variables.task_body || taskRow.task_id;
+    const agentKey = `agent_${agentIndex}`;
+    const toolConstraints =
+      taskRow.tool_constraints?.[agentKey] ??
+      taskRow.tool_constraints?.[String(agentIndex)] ??
+      "";
     const kvcommVars = {
       user_question: variables.user_question,
       task_body: variables.task_body,
       workspace_dir: variables.workspace_dir,
+      tool_constraints: toolConstraints,
       ...(Array.isArray(taskRow.agent_roles)
         ? {
             agent_roles: JSON.stringify(taskRow.agent_roles),
@@ -187,6 +196,8 @@ export async function runChainStackSpawn(client, params) {
             mode: inferenceMode,
             message_key: messageKey,
             task_profile: taskProfile,
+            task_id: taskRow.task_id,
+            clawbench_family: taskRow.clawbench_ref?.family ?? "",
             vars: kvcommVars,
           },
         }
@@ -210,9 +221,10 @@ export async function runChainStackSpawn(client, params) {
         message_key: messageKey,
         vars: kvcommVars,
         task_profile: taskProfile,
+        task_id: taskRow.task_id,
+        clawbench_family: taskRow.clawbench_ref?.family ?? "",
         user_prompt: taskText.replace(/^<!--KVCOMM_META:\{.*?\}-->\s*/s, ""),
         system_prompt: taskRow._bench_role_prompt ?? "",
-        bench_padding: Boolean(taskRow._bench_padding_enabled),
       });
     }
 
@@ -387,6 +399,10 @@ export async function runChainStackSpawn(client, params) {
       kvcomm_latency_ms: sidecarMetrics?.kvcomm_latency_ms ?? null,
       reuse_rate: sidecarMetrics?.reuse_rate ?? null,
       sidecar_mode: sidecarMetrics?.sidecar_mode ?? null,
+      sidecar_request_count: sidecarMetrics?.sidecar_request_count ?? null,
+      kv_reuse_request_count: sidecarMetrics?.kv_reuse_request_count ?? null,
+      dense_request_count: sidecarMetrics?.dense_request_count ?? null,
+      blend_fallback_count: sidecarMetrics?.blend_fallback_count ?? null,
       anchor_prediction: sidecarMetrics?.anchor_prediction ?? null,
       anchor_pooled_tokens: sidecarMetrics?.anchor_pooled_tokens ?? null,
       input_anchor_pooled_tokens: sidecarMetrics?.input_anchor_pooled_tokens ?? null,

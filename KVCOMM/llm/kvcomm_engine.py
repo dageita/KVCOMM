@@ -910,7 +910,8 @@ class KVCOMMEngine:
                     self._log_warning(
                         f"No anchors cover placeholder {ph_id} for Agent {self.llm.node_id} ({self.llm.role})."
                     )
-                return base_placeholder_cache.copy(), base_prefix_cache.copy(), False
+                    return base_placeholder_cache.copy(), base_prefix_cache.copy(), False
+                return base_placeholder_cache.copy(), base_prefix_cache.copy(), True
 
             cache_entry = self._compute_anchor_weight_entry(
                 anchor_list,
@@ -1251,7 +1252,22 @@ class KVCOMMEngine:
             )
 
         if ph_id.startswith("turn_"):
-            node_memory = shared_memory.get(self.llm.node_id) or {}
+            node_id = str(self.llm.node_id)
+            slot = self.llm.resolve_turn_ph_slot(ph_id, message)
+            if slot is not None:
+                if slot.slot_kind == "tool" and slot.kv_ref:
+                    try:
+                        from sidecar.stores.registry import get_store_registry
+
+                        tool_entry = get_store_registry().tool_kv.get(slot.kv_ref)
+                        if tool_entry is not None:
+                            return tool_entry.absolute_kv, tool_entry.token_ids, slot.drop_num
+                    except ImportError:
+                        pass
+                if slot.absolute_kv is not None and slot.token_ids is not None:
+                    return slot.absolute_kv, slot.token_ids, slot.drop_num
+
+            node_memory = shared_memory.get(node_id) or {}
             if not isinstance(node_memory, dict):
                 node_memory = {}
             turn_root = node_memory.get("turn") or {}
@@ -1269,6 +1285,11 @@ class KVCOMMEngine:
 
         type_str, node_id, *rest = ph_id.split("_")
         is_current = (rest and rest[0] == "current")
+        if type_str in ("agent", "condition") and is_current:
+            upstream_slot = self.llm.resolve_upstream_agent_slot(ph_id, message)
+            if upstream_slot is not None and upstream_slot.absolute_kv is not None:
+                token_ids = upstream_slot.token_ids if isinstance(upstream_slot.token_ids, dict) else {}
+                return upstream_slot.absolute_kv, token_ids, int(upstream_slot.drop_num)
 
         key_prefix = "condition" if type_str == "condition" else "response"
         slot_idx = -1 if is_current else -2

@@ -35,8 +35,6 @@ Bench options (passed to experiments/bench driver):
   --runs <n>                  Alias for --measure-runs
   --debug                     Debug mode (agent/stream timeout 60s unless overridden)
   --run-timeout-seconds <n>   Per-agent OpenClaw run + stream wait timeout
-  --bench-padding on|off      Long stable KV padding (default: off; env BENCH_PADDING)
-  --no-bench-padding          Disable long stable KV padding
   --dry-run, --scenario, --dataset, --model, --task-id, --task-profile, --output, ...
 
 Debug timeout (60s): BENCH_DEBUG=1, KVCOMM_BENCH_DEBUG=1, LOGURU_LEVEL=DEBUG, or --debug
@@ -124,12 +122,6 @@ function runSidecar() {
     ...process.env,
     PYTHONPATH: [repoRoot, OPENCLAW_MODULE_ROOT, process.env.PYTHONPATH].filter(Boolean).join(":"),
   };
-  if (!env.KVCOMM_BENCH_PADDING?.trim()) {
-    env.KVCOMM_BENCH_PADDING = "0";
-  }
-  if (!env.BENCH_PADDING?.trim()) {
-    env.BENCH_PADDING = "off";
-  }
   if (hfDevice && !process.env.CUDA_VISIBLE_DEVICES?.trim()) {
     const parts = hfDevice.split(",").map((part) => part.trim()).filter(Boolean);
     env.CUDA_VISIBLE_DEVICES = parts.join(",");

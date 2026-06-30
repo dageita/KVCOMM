@@ -86,8 +86,6 @@ function buildBenchHfConfig() {
   const denseViaHfEnabled =
     ["1", "true", "yes", "on"].includes(denseViaHf) ||
     (hasHfModel && !["0", "false", "no", "off"].includes(denseViaHf));
-  const benchPadding = (process.env.KVCOMM_BENCH_PADDING ?? process.env.BENCH_PADDING ?? "").trim().toLowerCase();
-  const benchPaddingEnabled = ["1", "true", "yes", "on"].includes(benchPadding);
   return {
     hf_model: process.env.KVCOMM_HF_MODEL?.trim() || "",
     hf_model_path: process.env.KVCOMM_HF_MODEL_PATH?.trim() || "",
@@ -99,8 +97,6 @@ function buildBenchHfConfig() {
       "",
     dense_via_hf: denseViaHfEnabled,
     KVCOMM_DENSE_VIA_HF: denseViaHfEnabled ? "1" : "0",
-    bench_padding: benchPaddingEnabled,
-    KVCOMM_BENCH_PADDING: benchPaddingEnabled ? "1" : "0",
   };
 }
 
@@ -223,11 +219,10 @@ export async function ensureManagedSidecarForBench({ inferenceBackend } = {}) {
     } else if (benchConfig.hf_device && benchConfig.hf_device !== health.hf_device) {
       await configureSidecarEngine(sidecarUrl, benchConfig);
       console.log(`[sidecar] updated HF device pool on ${sidecarUrl}: ${benchConfig.hf_device}`);
-    } else if (wantsDenseViaHf || benchConfig.bench_padding !== undefined) {
+    } else if (wantsDenseViaHf) {
       await configureSidecarEngine(sidecarUrl, benchConfig);
       console.log(
-        `[sidecar] applied bench config on ${sidecarUrl} ` +
-          `dense_via_hf=${wantsDenseViaHf} bench_padding=${benchConfig.bench_padding}`,
+        `[sidecar] applied bench config on ${sidecarUrl} dense_via_hf=${wantsDenseViaHf}`,
       );
     } else {
       console.log(

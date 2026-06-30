@@ -85,16 +85,23 @@ function sidecarRoutingTable(agentRows) {
   for (const row of agentRows) {
     const key = String(row.agent_index);
     if (!byAgent.has(key)) {
-      byAgent.set(key, { kv: 0, dense: 0, reuse: [] });
+      byAgent.set(key, { kv: 0, dense: 0, reuse: [], blendFallbacks: 0 });
     }
     const bucket = byAgent.get(key);
-    if (row.sidecar_mode === "kv_reuse") {
-      bucket.kv += 1;
-    } else if (row.sidecar_mode === "dense_prefill") {
-      bucket.dense += 1;
-    }
+    const totalReq = row.sidecar_request_count ?? 1;
+    const kvReq =
+      row.kv_reuse_request_count ??
+      (row.sidecar_mode === "kv_reuse" ? totalReq : 0);
+    const denseReq =
+      row.dense_request_count ??
+      (row.sidecar_mode === "dense_prefill" ? totalReq : totalReq - kvReq);
+    bucket.kv += kvReq;
+    bucket.dense += denseReq;
     if (typeof row.reuse_rate === "number") {
       bucket.reuse.push(row.reuse_rate);
+    }
+    if (typeof row.blend_fallback_count === "number") {
+      bucket.blendFallbacks += row.blend_fallback_count;
     }
   }
 
@@ -108,8 +115,10 @@ function sidecarRoutingTable(agentRows) {
       bucket.reuse.length === 0
         ? "n/a"
         : fmtNum(bucket.reuse.reduce((s, v) => s + v, 0) / bucket.reuse.length, 2);
+    const blendNote =
+      bucket.blendFallbacks > 0 ? ` (${bucket.blendFallbacks} blend fallbacks)` : "";
     lines.push(
-      `${pad(agentIndex, 7)} │ ${pad(`${bucket.kv}/${total}`, 10)} │ ${pad(`${bucket.dense}/${total}`, 10)} │ ${pad(reuseAvg, 11)}`,
+      `${pad(agentIndex, 7)} │ ${pad(`${bucket.kv}/${total}`, 10)} │ ${pad(`${bucket.dense}/${total}`, 10)} │ ${pad(reuseAvg, 11)}${blendNote}`,
     );
   }
   return lines.join("\n");

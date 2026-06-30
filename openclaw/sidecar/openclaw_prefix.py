@@ -290,6 +290,16 @@ def patcher_read_satisfied(
     return required.issubset(done)
 
 
+def verifier_read_satisfied(
+    messages: list[dict[str, Any]],
+    *,
+    required: frozenset[str] = frozenset({"quick_note.md"}),
+) -> bool:
+    """True when verifier has non-empty read results for required files (basename match)."""
+    done = completed_read_paths(messages)
+    return required.issubset(done)
+
+
 def _parse_exec_command_from_call(call: dict[str, Any]) -> str:
     fn = call.get("function") if isinstance(call.get("function"), dict) else {}
     if str(fn.get("name") or "").strip() != "exec":
@@ -418,6 +428,79 @@ def pricing_discount_fix_applied(content: str) -> bool:
     return bool(_PRICING_DISCOUNT_FIX_RE.search(content))
 
 
+_PRICING_RETURN_LINE_RE = re.compile(r"^\s*return\s+subtotal_cents\b", re.IGNORECASE)
+_PRICING_EDIT_RETURN_BODY = "return subtotal_cents * (100 - discount_percent) // 100"
+
+
+def pricing_apply_discount_return_line(content: str) -> str:
+    """Return the exact apply_discount return line (indent preserved) from pricing.py text."""
+    if not content:
+        return ""
+    for line in content.splitlines():
+        if _PRICING_RETURN_LINE_RE.match(line):
+            return line
+    return ""
+
+
+def latest_pricing_py_content(messages: list[dict[str, Any]]) -> str:
+    """Latest pricing.py body from read results or edit failure snapshots."""
+    latest = ""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            i += 1
+            continue
+        pending: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            for tool_name in ("edit", "read"):
+                path = _parse_tool_path_from_call(call, tool_name)
+                if path == "pricing.py":
+                    pending.append(tool_name)
+                    break
+        j = i + 1
+        result_idx = 0
+        while j < len(messages) and result_idx < len(pending):
+            nxt = messages[j]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            tool_name = pending[result_idx]
+            body = _message_content(nxt)
+            if tool_name == "read" and body.strip():
+                latest = body
+            elif tool_name == "edit":
+                current_match = _EDIT_CURRENT_FILE_RE.search(body)
+                if current_match:
+                    latest = current_match.group(1)
+            result_idx += 1
+            j += 1
+        i = j if j > i + 1 else i + 1
+    return latest
+
+
+def build_pricing_edit_hint(messages: list[dict[str, Any]]) -> str:
+    """Tool-bridge hint with exact edit oldText/newText from pricing.py context."""
+    content = latest_pricing_py_content(messages)
+    old_line = pricing_apply_discount_return_line(content)
+    if not old_line:
+        old_line = "    return subtotal_cents - discount_percent"
+    indent = old_line[: len(old_line) - len(old_line.lstrip())]
+    new_line = indent + _PRICING_EDIT_RETURN_BODY
+    return (
+        "\npricing.py is already in context above. "
+        "Call edit on pricing.py with ONE edit. "
+        f"oldText must match read output exactly: {old_line!r}. "
+        f"newText: {new_line!r}. "
+        "Do not read again. One edit call only.\n"
+    )
+
+
 def _parse_tool_path_from_call(call: dict[str, Any], tool_name: str) -> str:
     fn = call.get("function") if isinstance(call.get("function"), dict) else {}
     if str(fn.get("name") or "").strip() != tool_name:
@@ -524,6 +607,50 @@ def static_without_turn_placeholders(user_template: str) -> str:
     return _static_without_turn_placeholders(user_template)
 
 
+def turn_segment_template(turn_index: int) -> str:
+    """Single-turn suffix appended to static user_template (matches openclaw parse)."""
+    return f"\n\n{{turn_{turn_index}_assistant}}\n\n{{turn_{turn_index}_tool}}\n"
+
+
+def build_user_template_with_turns(static_user: str, turn_count: int) -> str:
+    """Canonical cumulative user_template for *turn_count* assistant/tool turns."""
+    static = str(static_user or "").rstrip()
+    suffix = ""
+    for idx in range(1, max(0, int(turn_count)) + 1):
+        suffix += turn_segment_template(idx)
+    return f"{static}{suffix}".strip()
+
+
+def merge_turn_segment_into_user_template(
+    stored_user: str,
+    segment_template: str,
+    *,
+    expected_user_template: str | None = None,
+) -> str:
+    """Extend committed user_template with one turn segment (openclaw-compatible merge)."""
+    stored = str(stored_user or "").strip()
+    segment = str(segment_template or "")
+    seg_core = segment.rstrip()
+    if not seg_core:
+        if expected_user_template is not None:
+            return str(expected_user_template).strip()
+        return stored
+    if stored and stored.rstrip().endswith(seg_core):
+        return stored
+    base = stored.rstrip()
+    # Prior commits strip trailing whitespace, dropping the newline that separates
+    # turn blocks. Restore it before appending turn 2+ (segment already starts with \n\n).
+    if stored and re.search(r"\{turn_\d+_(?:assistant|tool)\}", base):
+        merged = f"{base}\n{segment}".strip()
+    elif stored:
+        merged = f"{base}{segment}".strip()
+    else:
+        merged = seg_core
+    if expected_user_template is not None and not stored:
+        return str(expected_user_template).strip()
+    return merged
+
+
 _RUN_WORKSPACE_PATH_RE = re.compile(
     r"(?:at\s+)?/[\S]*/run-[a-f0-9]{6,}/notes/quick_note\.md",
     re.IGNORECASE,
@@ -600,7 +727,7 @@ def build_prefix_from_openclaw_messages(
         turn_suffix = ""
         turn_content = {}
         for idx, turn in enumerate(turns, start=1):
-            turn_suffix += f"\n\n{{turn_{idx}_assistant}}\n\n{{turn_{idx}_tool}}\n"
+            turn_suffix += turn_segment_template(idx)
             turn_content[f"turn_{idx}_assistant"] = turn["assistant"].strip() or " "
             turn_content[f"turn_{idx}_tool"] = turn["tool"].strip() or " "
 

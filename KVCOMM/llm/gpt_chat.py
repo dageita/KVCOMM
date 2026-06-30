@@ -38,6 +38,31 @@ from KVCOMM.llm.kvcomm_engine import KVCOMMEngine, _RequestState
 from KVCOMM.utils.metrics import GenerationResult
 from KVCOMM.utils.log import logger
 
+
+def _short_message_key(message: str, *, limit: int = 72) -> str:
+    text = str(message or "").strip().replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3]}..."
+
+
+def _log_input_anchor_routing(
+    *,
+    node_id: str,
+    message_key: str,
+    placeholder_id: str,
+    reuse_kind: str,
+    routing_mode: str,
+) -> None:
+    logger.debug(
+        "[kvcomm-reuse] node={} message_key={} placeholder={} reuse_kind={} input_routing={}",
+        node_id,
+        _short_message_key(message_key),
+        placeholder_id,
+        reuse_kind,
+        routing_mode,
+    )
+
 MINE_API_KEYS = os.getenv('API_KEY')
 
 
@@ -178,7 +203,7 @@ def _bench_no_think_enabled() -> bool:
 
 _MAX_PREFIX_LENGTH_DRIFT = int(os.environ.get("KVCOMM_PREFIX_LENGTH_DRIFT", "16") or "16")
 _TURN_PLACEHOLDER_RE = re.compile(r"^turn_\d+_(assistant|tool)$")
-_AGENT_CURRENT_PLACEHOLDER_RE = re.compile(r"^agent_\d+_current$")
+_AGENT_CURRENT_PLACEHOLDER_RE = re.compile(r"^agent_(\d+)_current$")
 
 
 def _reconcile_prefix_kv_and_tokens(
@@ -694,6 +719,93 @@ class LLMChat(LLM):
         # {agent_*}/{turn_*}/{user_question} slots — placeholder_info is {} but valid.
         return bucket.get("placeholder_info") is not None
 
+    @staticmethod
+    def _upstream_agent_index(ph_id: str) -> int | None:
+        match = _AGENT_CURRENT_PLACEHOLDER_RE.match(str(ph_id))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def _upstream_response_kv_available(self, upstream_node: str, message_key: str) -> bool:
+        bucket = LLMChat._shared_kv_cache_memory.get(str(upstream_node)) or {}
+        if not isinstance(bucket, dict):
+            return False
+        resp = bucket.get("response") or {}
+        if not isinstance(resp, dict):
+            return False
+        return bool(resp.get(message_key))
+
+    def _kv_reuse_anchors_for_ph(
+        self,
+        ph_id: str,
+        message: str,
+        anchors_for_node: dict,
+    ) -> list:
+        """Return anchor list for kv_reuse blend; empty list = pass-through rotate only."""
+        ph_id = str(ph_id)
+        if _TURN_PLACEHOLDER_RE.match(ph_id):
+            slot = self.resolve_turn_ph_slot(ph_id, message)
+            if slot is not None and (slot.absolute_kv is not None or slot.kv_ref):
+                return []
+        upstream_idx = self._upstream_agent_index(ph_id)
+        if upstream_idx is not None:
+            try:
+                node_idx = int(self.node_id)
+            except (TypeError, ValueError):
+                node_idx = -1
+            slot = self.resolve_upstream_agent_slot(ph_id, message)
+            if slot is not None and slot.materialization in ("consumer_contextual", "producer_contextual"):
+                return []
+            if upstream_idx < node_idx and self._upstream_response_kv_available(str(upstream_idx), message):
+                return []
+        bucket = anchors_for_node.get(ph_id)
+        if not isinstance(bucket, dict):
+            bucket = {}
+
+        prefix_store = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
+        from sidecar.stores.prefix_spans import normalize_placeholder_info
+        from sidecar.stores.topology_anchor import (
+            delta_key_from_ph_rec,
+            serialize_anchor_key,
+        )
+
+        ph_info = normalize_placeholder_info(prefix_store.get("placeholder_info"))
+        ph_rec = ph_info.get(ph_id)
+        if isinstance(ph_rec, dict):
+            static_hash = str(prefix_store.get("static_template_hash") or "")
+            topo = str(prefix_store.get("topology_id") or "")
+            content_hash = self._upstream_agent_content_hash(ph_id, message) or ""
+            delta_key = delta_key_from_ph_rec(
+                ph_id=ph_id,
+                ph_rec=ph_rec,
+                static_template_hash=static_hash,
+                topology_id=topo,
+                content_hash=content_hash,
+            )
+            pool_entry = self._get_store_registry().agent_anchors.get_by_topology_key(
+                node_id=str(self.node_id),
+                message_key=str(message),
+                delta_key=delta_key,
+            )
+            if pool_entry is not None and pool_entry.ph_delta is not None:
+                topo_blob = serialize_anchor_key(delta_key)
+                return [
+                    {
+                        f"{self.node_id}_ph_key_delta": pool_entry.ph_delta,
+                        f"{self.node_id}_ph_value_delta": pool_entry.ph_value_delta,
+                        f"{self.node_id}_pf_key_delta": pool_entry.pf_delta,
+                        f"{self.node_id}_pf_value_delta": pool_entry.pf_value_delta,
+                        "anchor_topology_key": topo_blob,
+                    }
+                ]
+
+        if not bucket:
+            return []
+        return list(bucket.values())
+
     def placeholders_missing_anchor_delta(self, request_uid: str, message: str) -> List[str]:
         """Placeholder ids that still need a dense anchor materialization pass."""
         state = self.get_request_state(request_uid)
@@ -701,7 +813,21 @@ class LLMChat(LLM):
             (LLMChat._ensure_shared_kv_memory().get(self.node_id) or {}).get("placeholder_info") or {}
         ).keys()
         missing: List[str] = []
+        try:
+            node_idx = int(self.node_id)
+        except (TypeError, ValueError):
+            node_idx = -1
         for ph_id in ph_ids:
+            upstream_idx = self._upstream_agent_index(str(ph_id))
+            slot = self.resolve_upstream_agent_slot(str(ph_id), message)
+            if slot is not None and slot.materialization == "consumer_contextual":
+                continue
+            if (
+                upstream_idx is not None
+                and upstream_idx < node_idx
+                and self._upstream_response_kv_available(str(upstream_idx), message)
+            ):
+                continue
             bucket = state.anchor_dict.setdefault(ph_id, {})
             if not isinstance(bucket, dict):
                 continue
@@ -753,26 +879,79 @@ class LLMChat(LLM):
         return None
 
     def _prefix_segment_len_for_placeholder(self, ph_id: str) -> int | None:
-        """Length of the prefix KV segment paired with ``ph_id`` in agen_kvcomm."""
+        """Length of the prefix KV segment paired with ``ph_id`` via pf_span_id."""
+        from sidecar.stores.prefix_spans import (
+            legacy_forward_pf_kv_index,
+            normalize_placeholder_info,
+            resolve_pf_kv_index,
+        )
+
         prefix_store = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
         if not isinstance(prefix_store, dict):
             return None
         placeholder_info = prefix_store.get("placeholder_info") or {}
+        span_registry = prefix_store.get("span_registry") or {}
         prefix_kv_list = prefix_store.get("prefix") or []
         if not isinstance(placeholder_info, dict) or not placeholder_info or not prefix_kv_list:
             return None
 
-        placeholder_entries = list(placeholder_info.items())[::-1]
-        for idx, (pid, _bounds) in enumerate(placeholder_entries):
-            if pid != ph_id:
-                continue
-            seg_idx = idx + 1
-            if seg_idx < len(prefix_kv_list):
-                return int(prefix_kv_list[seg_idx]._seen_tokens)
-        return None
+        kv_idx = resolve_pf_kv_index(
+            ph_id=str(ph_id),
+            placeholder_info=placeholder_info,
+            span_registry=span_registry,
+        )
+        if kv_idx is None:
+            kv_idx = legacy_forward_pf_kv_index(placeholder_info, str(ph_id))
+        if kv_idx is None or kv_idx >= len(prefix_kv_list):
+            return None
+        return int(prefix_kv_list[kv_idx]._seen_tokens)
+
+    def _resolve_pf_for_ph(
+        self,
+        node_id: str,
+        ph_id: str,
+        *,
+        prefix_store: dict | None = None,
+        prefix_kv_list: list | None = None,
+        prefix_token_ids: list | None = None,
+    ) -> Tuple[Any, Dict[str, torch.Tensor]]:
+        """Resolve pf KV/token ids for a placeholder via span registry or SegmentCache."""
+        from sidecar.stores.prefix_spans import legacy_forward_pf_kv_index, resolve_pf_kv_index
+
+        store = prefix_store if isinstance(prefix_store, dict) else (LLMChat._shared_kv_cache_memory.get(node_id) or {})
+        kv_list = prefix_kv_list if prefix_kv_list is not None else (store.get("prefix") or [])
+        tok_list = prefix_token_ids if prefix_token_ids is not None else (store.get("token_ids") or [])
+        ph_info = store.get("placeholder_info") or {}
+        span_registry = store.get("span_registry") or {}
+
+        kv_idx = resolve_pf_kv_index(
+            ph_id=str(ph_id),
+            placeholder_info=ph_info,
+            span_registry=span_registry,
+        )
+        if kv_idx is not None and 0 <= kv_idx < len(kv_list):
+            tok = tok_list[kv_idx] if kv_idx < len(tok_list) else {}
+            return kv_list[kv_idx], tok
+
+        seg_cache = self._get_store_registry().segment_cache.for_node(str(node_id))
+        resolved = seg_cache.resolve_pf(str(ph_id))
+        if resolved is not None:
+            return resolved
+
+        legacy_idx = legacy_forward_pf_kv_index(ph_info, str(ph_id))
+        if legacy_idx is not None and 0 <= legacy_idx < len(kv_list):
+            tok = tok_list[legacy_idx] if legacy_idx < len(tok_list) else {}
+            return kv_list[legacy_idx], tok
+
+        raise RuntimeError(
+            f"No pf segment resolved for placeholder '{ph_id}' on node '{node_id}' "
+            f"(span_registry keys={list(span_registry.keys())})."
+        )
 
     def find_incompatible_anchor_deltas(self, request_uid: str, message: str) -> List[str]:
         """Return placeholder ids whose stored deltas no longer match current prefix segments."""
+        from sidecar.stores.topology_anchor import coordinate_shifted, current_topology_keys
+
         prefix_store = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
         if not isinstance(prefix_store, dict):
             return []
@@ -781,35 +960,65 @@ class LLMChat(LLM):
         if not isinstance(placeholder_info, dict) or not placeholder_info:
             return []
 
+        current_keys = current_topology_keys(prefix_store)
         delta_key_ph = f"{self.node_id}_ph_key_delta"
         delta_key_pf = f"{self.node_id}_pf_key_delta"
+        delta_key_pf_val = f"{self.node_id}_pf_value_delta"
         incompatible: List[str] = []
 
+        try:
+            node_idx = int(self.node_id)
+        except (TypeError, ValueError):
+            node_idx = -1
+
         for ph_id in placeholder_info:
-            entry = self._merged_anchor_entry(request_uid, str(ph_id), message)
+            ph_id_str = str(ph_id)
+            upstream_idx = self._upstream_agent_index(ph_id_str)
+            if (
+                upstream_idx is not None
+                and upstream_idx < node_idx
+                and self._upstream_response_kv_available(str(upstream_idx), message)
+            ):
+                continue
+
+            entry = self._merged_anchor_entry(request_uid, ph_id_str, message)
             if not isinstance(entry, dict):
                 continue
             if delta_key_ph not in entry and delta_key_pf not in entry:
                 continue
 
+            current_topo = current_keys.get(ph_id_str)
+            stored_topo = entry.get("anchor_topology_key")
+            if current_topo is not None and coordinate_shifted(stored_topo, current_topo):
+                incompatible.append(ph_id_str)
+                continue
+
             try:
-                ph_cache, _, drop_num = self.kv_engine.fetch_shared_cache(ph_id, message)
+                ph_cache, _, drop_num = self.kv_engine.fetch_shared_cache(ph_id_str, message)
             except RuntimeError:
-                incompatible.append(str(ph_id))
+                incompatible.append(ph_id_str)
                 continue
 
             placeholder_len = int(ph_cache._seen_tokens - drop_num)
             ph_delta = entry.get(delta_key_ph)
             ph_delta_len = self._delta_seq_len(ph_delta)
             if ph_delta_len is not None and ph_delta_len != placeholder_len:
-                incompatible.append(str(ph_id))
+                incompatible.append(ph_id_str)
                 continue
 
             if delta_key_pf in entry:
-                pf_len = self._prefix_segment_len_for_placeholder(str(ph_id))
+                pf_len = self._prefix_segment_len_for_placeholder(ph_id_str)
                 pf_delta_len = self._delta_seq_len(entry.get(delta_key_pf))
                 if pf_len is not None and pf_delta_len is not None and pf_delta_len != pf_len:
-                    incompatible.append(str(ph_id))
+                    if ph_delta_len is not None and ph_delta_len == placeholder_len:
+                        entry.pop(delta_key_pf, None)
+                        entry.pop(delta_key_pf_val, None)
+                        global_entry = (KVCOMMEngine.anchors.get(ph_id_str) or {}).get(message)
+                        if isinstance(global_entry, dict):
+                            global_entry.pop(delta_key_pf, None)
+                            global_entry.pop(delta_key_pf_val, None)
+                        continue
+                    incompatible.append(ph_id_str)
         return incompatible
 
     def purge_incompatible_anchor_deltas(
@@ -1016,26 +1225,44 @@ class LLMChat(LLM):
                     f"<yellow>No placeholder info found for agent '{agent_id}' while reusing input cache; "
                     f"prefix will be rebuilt on next prepare.</yellow>"
                 )
+                _log_input_anchor_routing(
+                    node_id=str(self.node_id),
+                    message_key=message,
+                    placeholder_id="*",
+                    reuse_kind="input_cache_no_ph_info",
+                    routing_mode="kv_reuse",
+                )
                 return _record_input_anchor_metrics("kv_reuse")
             placeholder_entries = list(placeholder_info.items())[::-1]
             for ph_id, _ in placeholder_entries:
-                safe_ph_id = _escape_loguru_markup(ph_id)
                 bucket = state.anchor_dict.setdefault(ph_id, {})
                 if bucket.get(message):
                     anchor_entry = state.anchors.get(ph_id) or {}
                     if not isinstance(anchor_entry, dict):
                         anchor_entry = {}
                     if f"{self.node_id}_ph_key_delta" in anchor_entry.get(message, {}):
-                        logger.opt(colors=True).debug(
-                            f"<green>The message has repeatedly received for message '{safe_message}' at placeholder '{safe_ph_id}'. So we will reuse the KV cache.</green>"
+                        _log_input_anchor_routing(
+                            node_id=str(self.node_id),
+                            message_key=message,
+                            placeholder_id=str(ph_id),
+                            reuse_kind="anchor_delta",
+                            routing_mode="kv_reuse",
                         )
                         return _record_input_anchor_metrics("kv_reuse")
-                    logger.opt(colors=True).debug(
-                        f"<yellow>Existing Anchor for message '{safe_message}' at placeholder '{safe_ph_id}'.</yellow>"
+                    _log_input_anchor_routing(
+                        node_id=str(self.node_id),
+                        message_key=message,
+                        placeholder_id=str(ph_id),
+                        reuse_kind="anchor_flag_without_delta",
+                        routing_mode="dense_prefill",
                     )
                     return _record_input_anchor_metrics("dense_prefill")
-            logger.opt(colors=True).debug(
-                f"<green>Reusing KV caches for message '{safe_message}' in all placeholders</green>."
+            _log_input_anchor_routing(
+                node_id=str(self.node_id),
+                message_key=message,
+                placeholder_id="*",
+                reuse_kind="input_cache",
+                routing_mode="kv_reuse",
             )
             return _record_input_anchor_metrics("kv_reuse")
 
@@ -1167,13 +1394,15 @@ class LLMChat(LLM):
         missing_delta = self.placeholders_missing_anchor_delta(request_uid, message)
         mode = self.resolve_generation_mode(request_uid, message, preferred_mode)
         logger.debug(
-            "generate_for_agent routing: preferred_mode={} active_anchor={} missing_delta={} chosen_mode={} request_uid={} node_id={}",
+            "generate_for_agent routing: preferred_mode={} active_anchor={} missing_delta={} "
+            "chosen_mode={} request_uid={} node_id={} message_key={}",
             preferred_mode,
             self.has_active_anchor(request_uid, message),
             missing_delta,
             mode,
             request_uid,
             self.node_id,
+            _short_message_key(message),
         )
 
         stream_kwargs = {**kwargs, "on_token": on_token} if on_token is not None else kwargs
@@ -1234,9 +1463,14 @@ class LLMChat(LLM):
         cache of each text segment. These are stored in shared memory keyed by
         `node_id` for reuse during subsequent generations.
         """
+        from sidecar.stores.prefix_spans import build_layout_from_segments
+
         messages = self._render_base_messages(prefix, user_prompt)
         _, prompt_text, _ = self._build_chat_inputs(messages, add_generation_prompt=True)
-        placeholder_info, token_ids, segments = self.locate_placeholder(prompt_text, return_segments=True)
+        _, token_ids, segments = self.locate_placeholder(prompt_text, return_segments=True)
+        layout = build_layout_from_segments(segments)
+
+        LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
 
         def _prefill_prefix_kv():
             with torch.no_grad():
@@ -1256,20 +1490,31 @@ class LLMChat(LLM):
         )
         out = await asyncio.to_thread(_prefill_prefix_kv)
         logger.info("Prefix KV ready for node {}", node_id)
-        base_kv = out.past_key_values.slice_(start=0, end=token_ids['input_ids'].shape[-1])                                               
-        segment_kv_list = []
-        token_id_list = []
-        for type_, _, token_id, s, e in segments:
+        prompt_len = int(token_ids["input_ids"].shape[-1])
+        base_kv = out.past_key_values.slice_(start=0, end=prompt_len)
 
-            if type_ == "text":
-                seg_kv = base_kv.slice(start=s, end=e)
-                segment_kv_list.append(seg_kv)
-                token_id_list.append(token_id)
-        self._shared_kv_cache_memory[node_id]["prefix"] = LLMChat._shared_kv_cache_memory[node_id]["prefix"] = segment_kv_list          
-        self._shared_kv_cache_memory[node_id]["placeholder_info"] = LLMChat._shared_kv_cache_memory[node_id]["placeholder_info"] = placeholder_info
-        self._shared_kv_cache_memory[node_id]["token_ids"] = LLMChat._shared_kv_cache_memory[node_id]["token_ids"] = token_id_list            
-        self._shared_kv_cache_memory[node_id]["system_prompt"] = prefix
-        self._shared_kv_cache_memory[node_id]["user_template"] = user_prompt
+        segment_kv_list, token_id_list, ph_info, span_registry, span_order = self._materialize_prefix_segments(
+            layout,
+            base_kv,
+            segments,
+        )
+        turn_count = self._infer_turn_count_from_placeholders(ph_info)
+        self._commit_prefix_bucket(
+            node_id,
+            segment_kv_list=segment_kv_list,
+            token_id_list=token_id_list,
+            placeholder_info=ph_info,
+            span_registry=span_registry,
+            prefix_span_order=span_order,
+            prompt_token_len=prompt_len,
+            prompt_input_ids=token_ids["input_ids"],
+            base_kv_full=base_kv,
+            system_prompt=prefix,
+            user_template=user_prompt,
+            turn_count=turn_count,
+            segments=segments,
+            prompt_text=prompt_text,
+        )
 
         self._initialization[node_id] = LLMChat._initialization[node_id] = True
 
@@ -1284,19 +1529,753 @@ class LLMChat(LLM):
         bucket = LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
         bucket["turn_count"] = int(turn_count)
 
+    @staticmethod
+    def _infer_turn_count_from_placeholders(placeholder_info: dict) -> int:
+        turn_indices: set[int] = set()
+        for ph_id in placeholder_info or {}:
+            if not str(ph_id).startswith("turn_"):
+                continue
+            parts = str(ph_id).split("_")
+            if len(parts) >= 2 and parts[1].isdigit():
+                turn_indices.add(int(parts[1]))
+        return max(turn_indices) if turn_indices else 0
+
+    @staticmethod
+    def _get_store_registry():
+        from sidecar.stores.registry import get_store_registry
+
+        return get_store_registry()
+
+    def _sync_prefix_stores(
+        self,
+        node_id: str,
+        *,
+        prefix_kv_list: list,
+        prefix_token_ids: list,
+        placeholder_info: dict,
+        user_template: str,
+        turn_count: int,
+        span_registry: dict | None = None,
+        prefix_span_order: list[str] | None = None,
+    ) -> None:
+        from sidecar.stores.hashing import static_template_hash, topology_id
+        from sidecar.stores.prefix_topology import write_topology
+
+        bucket = LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
+        static_hash = static_template_hash(user_template)
+        topo = topology_id(static_hash=static_hash, turn_count=int(turn_count))
+        write_topology(bucket, user_template=user_template, turn_count=int(turn_count))
+
+        stores = self._get_store_registry()
+        stores.segment_cache.for_node(node_id).put_prefix_blob(
+            prefix_kv_list=prefix_kv_list,
+            prefix_token_ids=prefix_token_ids,
+            placeholder_info=placeholder_info,
+            static_template_hash=static_hash,
+            topology_id=topo,
+            turn_count=int(turn_count),
+            span_registry=span_registry or bucket.get("span_registry") or {},
+            prefix_span_order=prefix_span_order or bucket.get("prefix_span_order") or [],
+        )
+
+    @staticmethod
+    def _text_encodings_in_order(segments: list[tuple]) -> list[dict[str, torch.Tensor]]:
+        return [seg[2] for seg in segments if seg[0] == "text"]
+
+    def _materialize_prefix_segments(
+        self,
+        layout,
+        base_kv,
+        segments: list[tuple],
+        *,
+        old_bucket: dict | None = None,
+        frozen_count: int = 0,
+        extend_placeholders_only: bool = False,
+    ) -> tuple[list, list, dict, dict, list]:
+        """Build prefix KV lists from layout; reuse frozen left segments when requested."""
+        from sidecar.stores.prefix_spans import normalize_placeholder_info
+
+        old_bucket = old_bucket or {}
+        old_prefix = list(old_bucket.get("prefix") or [])
+        old_token_ids = list(old_bucket.get("token_ids") or [])
+        old_registry = dict(old_bucket.get("span_registry") or {})
+        text_encodings = self._text_encodings_in_order(segments)
+
+        segment_kv_list: list = []
+        token_id_list: list = []
+        span_registry: dict = {}
+
+        for i, span in enumerate(layout.text_spans):
+            span_id = span.span_id
+            old_entry = old_registry.get(span_id)
+            reuse = (
+                bool(old_prefix)
+                and old_entry is not None
+                and i < frozen_count
+                and old_entry.get("text_hash") == span.text_hash
+                and int(old_entry.get("token_start", -1)) == span.token_start
+                and int(old_entry.get("token_end", -1)) == span.token_end
+            )
+            if reuse:
+                kv_idx = int(old_entry.get("kv_index", i))
+                segment_kv_list.append(old_prefix[kv_idx])
+                token_id_list.append(old_token_ids[kv_idx] if kv_idx < len(old_token_ids) else text_encodings[i])
+            else:
+                segment_kv_list.append(base_kv.slice(start=span.token_start, end=span.token_end))
+                token_id_list.append(text_encodings[i] if i < len(text_encodings) else {})
+            kv_index = len(segment_kv_list) - 1
+            span_registry[span_id] = {
+                "span_id": span_id,
+                "text_hash": span.text_hash,
+                "token_start": span.token_start,
+                "token_end": span.token_end,
+                "kv_index": kv_index,
+            }
+
+        if extend_placeholders_only:
+            ph_info = dict(normalize_placeholder_info(old_bucket.get("placeholder_info")))
+            for ph_id, rec in layout.placeholder_info.items():
+                if ph_id not in ph_info:
+                    ph_info[ph_id] = dict(rec)
+        else:
+            ph_info = dict(layout.placeholder_info)
+
+        return (
+            segment_kv_list,
+            token_id_list,
+            ph_info,
+            span_registry,
+            list(layout.prefix_span_order),
+        )
+
+    def _populate_template_ph_bases(
+        self,
+        node_id: str,
+        *,
+        base_kv_full,
+        placeholder_info: dict,
+        segments: list | None = None,
+    ) -> None:
+        """Slice pure template ph KV from base_kv_full and store by topology coordinates."""
+        from sidecar.stores.hashing import static_template_hash, topology_id
+        from sidecar.stores.prefix_spans import normalize_placeholder_info
+        from sidecar.stores.template_ph_base import TemplatePhBaseRecord
+
+        bucket = LLMChat._shared_kv_cache_memory.get(node_id) or {}
+        static_hash = str(bucket.get("static_template_hash") or "")
+        topo = str(bucket.get("topology_id") or "")
+        if not static_hash:
+            user_template = str(bucket.get("user_template") or "")
+            turn_count = int(bucket.get("turn_count") or 0)
+            static_hash = static_template_hash(user_template)
+            topo = topology_id(static_hash=static_hash, turn_count=turn_count)
+
+        ph_info = normalize_placeholder_info(placeholder_info)
+        seg_by_ph: dict[str, dict] = {}
+        if segments:
+            for seg in segments:
+                if seg[0] == "placeholder":
+                    seg_by_ph[str(seg[1])] = seg[2]
+
+        records: dict[str, TemplatePhBaseRecord] = {}
+        for ph_id, rec in ph_info.items():
+            start = int(rec.get("start", 0))
+            end = int(rec.get("end", 0))
+            if start >= end or base_kv_full is None:
+                continue
+            records[str(ph_id)] = TemplatePhBaseRecord(
+                ph_id=str(ph_id),
+                static_template_hash=static_hash,
+                topology_id=topo,
+                ph_token_start=start,
+                ph_token_end=end,
+                pf_span_id=rec.get("pf_span_id"),
+                absolute_kv=base_kv_full.slice(start=start, end=end),
+                token_ids=seg_by_ph.get(str(ph_id)) or {},
+            )
+        self._get_store_registry().template_ph_base.replace_node(str(node_id), records)
+
+    def _commit_prefix_bucket(
+        self,
+        node_id: str,
+        *,
+        segment_kv_list: list,
+        token_id_list: list,
+        placeholder_info: dict,
+        span_registry: dict,
+        prefix_span_order: list[str],
+        prompt_token_len: int,
+        prompt_input_ids: torch.Tensor,
+        base_kv_full,
+        system_prompt: str,
+        user_template: str,
+        turn_count: int,
+        segments: list | None = None,
+        prompt_text: str | None = None,
+    ) -> None:
+        bucket = LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
+        prev_ph_info = dict(bucket.get("placeholder_info") or {})
+        bucket["prefix"] = segment_kv_list
+        bucket["token_ids"] = token_id_list
+        bucket["placeholder_info"] = placeholder_info
+        bucket["span_registry"] = span_registry
+        bucket["prefix_span_order"] = prefix_span_order
+        bucket["prompt_token_len"] = int(prompt_token_len)
+        bucket["prompt_input_ids"] = prompt_input_ids.detach().clone()
+        bucket["base_kv_full"] = base_kv_full
+        bucket["system_prompt"] = system_prompt
+        bucket["user_template"] = user_template
+        bucket.pop("turn", None)
+        bucket["turn_count"] = int(turn_count)
+        bucket["_prev_placeholder_info"] = prev_ph_info
+        if prompt_text is not None:
+            bucket["prompt_text"] = str(prompt_text)
+        self._sync_prefix_stores(
+            node_id,
+            prefix_kv_list=segment_kv_list,
+            prefix_token_ids=token_id_list,
+            placeholder_info=placeholder_info,
+            user_template=user_template,
+            turn_count=turn_count,
+            span_registry=span_registry,
+            prefix_span_order=prefix_span_order,
+        )
+        self._populate_template_ph_bases(
+            node_id,
+            base_kv_full=base_kv_full,
+            placeholder_info=placeholder_info,
+            segments=segments,
+        )
+
+    def _prefill_suffix_on_past_sync(
+        self,
+        past_kv,
+        token_ids: dict[str, torch.Tensor],
+        past_len: int,
+    ):
+        """Forward only the suffix tokens on an existing prefix KV cache."""
+        suffix_ids = token_ids["input_ids"][:, past_len:]
+        if suffix_ids.shape[-1] <= 0:
+            return past_kv
+        attn = token_ids.get("attention_mask")
+        if attn is None:
+            attn = torch.ones_like(token_ids["input_ids"])
+        with torch.no_grad():
+            with LLMChat._model_lock:
+                output = self.model(
+                    input_ids=suffix_ids,
+                    attention_mask=attn,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    return_dict=True,
+                )
+        return output.past_key_values
+
+    async def append_prefix_segment_incremental(
+        self,
+        node_id: str,
+        segment_template: str,
+        *,
+        system_prompt: str | None = None,
+        expected_user_template: str | None = None,
+    ) -> None:
+        """Append a turn segment reusing frozen left prefix KV; forward suffix only."""
+        from sidecar.stores.prefix_spans import (
+            build_layout_from_segments,
+            frozen_span_count,
+            shared_prefix_token_len,
+        )
+
+        from sidecar.openclaw_prefix import merge_turn_segment_into_user_template
+
+        bucket = LLMChat._shared_kv_cache_memory.get(node_id) or {}
+        stored_user = str(bucket.get("user_template") or "").strip()
+        stored_system = str(
+            bucket.get("system_prompt") or system_prompt or ""
+        ).strip()
+        segment = str(segment_template or "")
+
+        # Always extend the committed template in-bucket; openclaw re-parse may
+        # reshape whitespace/static text and break prefix token identity.
+        merged_user = merge_turn_segment_into_user_template(
+            stored_user,
+            segment,
+            expected_user_template=expected_user_template,
+        )
+
+        messages = self._render_base_messages(stored_system, merged_user)
+        _, prompt_text, _ = self._build_chat_inputs(messages, add_generation_prompt=True)
+        _, token_ids, segments = self.locate_placeholder(prompt_text, return_segments=True)
+        layout = build_layout_from_segments(segments)
+
+        old_registry = dict(bucket.get("span_registry") or {})
+        old_span_order = list(bucket.get("prefix_span_order") or [])
+        old_token_len = int(bucket.get("prompt_token_len") or 0)
+        old_input_ids = bucket.get("prompt_input_ids")
+        base_kv_full = bucket.get("base_kv_full")
+        old_prefix = bucket.get("prefix") or []
+
+        frozen = frozen_span_count(old_registry, old_span_order, layout)
+        new_prompt_len = int(token_ids["input_ids"].shape[-1])
+        prefix_reuse_len = 0
+        if isinstance(old_input_ids, torch.Tensor) and old_token_len > 0:
+            device = token_ids["input_ids"].device
+            prefix_reuse_len = shared_prefix_token_len(
+                old_input_ids.to(device),
+                token_ids["input_ids"],
+            )
+
+        min_reuse_len = max(32, int(old_token_len * 0.5))
+        blockers: list[str] = []
+        if not old_prefix:
+            blockers.append("missing_old_prefix")
+        if base_kv_full is None:
+            blockers.append("missing_base_kv_full")
+        if old_token_len <= 0:
+            blockers.append("missing_old_token_len")
+        if new_prompt_len <= prefix_reuse_len:
+            blockers.append("suffix_not_longer")
+        if prefix_reuse_len < min_reuse_len:
+            blockers.append(
+                f"shared_prefix_too_short={prefix_reuse_len}_min={min_reuse_len}"
+            )
+        if len(old_span_order) <= 0:
+            blockers.append("empty_old_span_order")
+
+        can_incremental = not blockers
+
+        if not can_incremental:
+            logger.debug(
+                "[kvcomm-prefix] incremental append fallback node={} blockers={} "
+                "old_tokens={} new_tokens={} shared_prefix={} stored_user_chars={} merged_user_chars={}",
+                node_id,
+                blockers,
+                old_token_len,
+                new_prompt_len,
+                prefix_reuse_len,
+                len(stored_user),
+                len(merged_user),
+            )
+            await self.prepare_prefix_kv_segments(node_id, stored_system, merged_user)
+            return
+
+        suffix_tokens = new_prompt_len - prefix_reuse_len
+        logger.info(
+            "Incremental prefix append node {} (shared_prefix={}/{} frozen_spans={}/{} suffix_tokens={})",
+            node_id,
+            prefix_reuse_len,
+            old_token_len,
+            frozen,
+            len(old_span_order),
+            suffix_tokens,
+        )
+
+        past_kv = base_kv_full.slice(start=0, end=prefix_reuse_len)
+
+        def _forward_suffix():
+            return self._prefill_suffix_on_past_sync(past_kv, token_ids, prefix_reuse_len)
+
+        new_base_kv = await asyncio.to_thread(_forward_suffix)
+        new_base_kv = new_base_kv.slice_(start=0, end=new_prompt_len)
+
+        segment_kv_list, token_id_list, ph_info, span_registry, span_order = self._materialize_prefix_segments(
+            layout,
+            new_base_kv,
+            segments,
+            old_bucket=bucket,
+            frozen_count=frozen,
+            extend_placeholders_only=True,
+        )
+        turn_count = self._infer_turn_count_from_placeholders(ph_info)
+        self._commit_prefix_bucket(
+            node_id,
+            segment_kv_list=segment_kv_list,
+            token_id_list=token_id_list,
+            placeholder_info=ph_info,
+            span_registry=span_registry,
+            prefix_span_order=span_order,
+            prompt_token_len=new_prompt_len,
+            prompt_input_ids=token_ids["input_ids"],
+            base_kv_full=new_base_kv,
+            system_prompt=stored_system,
+            user_template=merged_user,
+            turn_count=turn_count,
+            segments=segments,
+            prompt_text=prompt_text,
+        )
+        self._initialization[node_id] = LLMChat._initialization[node_id] = True
+
+    def resolve_turn_ph_slot(self, ph_id: str, message_key: str):
+        return self._get_store_registry().turn_slots.get(
+            str(self.node_id),
+            str(message_key),
+            str(ph_id),
+        )
+
+    def resolve_upstream_agent_slot(self, ph_id: str, message_key: str):
+        """Resolve consumer- or producer-contextual slot for ``agent_*_current``."""
+        from sidecar.stores.hashing import sha256_text
+
+        stores = self._get_store_registry()
+        ph_id = str(ph_id)
+        message_key = str(message_key)
+
+        content_hash = self._upstream_agent_content_hash(ph_id, message_key)
+        if content_hash:
+            consumer = stores.upstream_agent_slots.get_consumer(
+                str(self.node_id),
+                message_key,
+                ph_id,
+                content_hash,
+            )
+            if consumer is not None:
+                return consumer
+
+        upstream_idx = self._upstream_agent_index(ph_id)
+        if upstream_idx is not None and content_hash:
+            producer = stores.upstream_agent_slots.get_producer(
+                str(upstream_idx),
+                message_key,
+                ph_id,
+                content_hash,
+            )
+            if producer is not None:
+                return producer
+        return None
+
+    def _upstream_agent_content_hash(self, ph_id: str, message_key: str) -> str | None:
+        """Content hash for upstream agent output referenced by ``ph_id``."""
+        from sidecar.stores.hashing import sha256_text
+
+        upstream_idx = self._upstream_agent_index(str(ph_id))
+        if upstream_idx is None:
+            return None
+        bucket = LLMChat._shared_kv_cache_memory.get(str(upstream_idx)) or {}
+        if not isinstance(bucket, dict):
+            return None
+        ids_bucket = bucket.get("response_ids") or {}
+        if not isinstance(ids_bucket, dict):
+            return None
+        values = ids_bucket.get(message_key)
+        if not values:
+            return None
+        try:
+            entry = values[-1]
+        except (TypeError, IndexError):
+            return None
+        if not isinstance(entry, dict) or entry.get("input_ids") is None:
+            return None
+        text = self.tokenizer.decode(entry["input_ids"][0], skip_special_tokens=True)
+        text = str(text).strip() or " "
+        return sha256_text(text)
+
+    def _export_producer_contextual_response_kv(
+        self,
+        *,
+        full_kv_cache,
+        prefix_token_len: int,
+        response_token_ids: torch.Tensor,
+        message: str,
+        stored_text: str,
+    ) -> Tuple[Any, Dict[str, torch.Tensor]]:
+        """Slice response KV from full generation cache (producer-contextual)."""
+        from sidecar.stores.hashing import sha256_text
+
+        resp_len = int(response_token_ids.shape[-1])
+        if resp_len <= 0:
+            return self._forward_text_to_kv_sync(stored_text or " ")
+
+        end = int(prefix_token_len) + resp_len
+        response_kv_cache = full_kv_cache.slice_(start=int(prefix_token_len), end=end)
+        response_kv_cache = self.kv_engine.apply_rotary_pos_emb(
+            response_kv_cache,
+            offset=-int(prefix_token_len),
+            drop_num=0,
+        )
+        response_tokens = response_token_ids.unsqueeze(0) if response_token_ids.dim() == 1 else response_token_ids
+        token_dict: Dict[str, torch.Tensor] = {
+            "input_ids": response_tokens.to(self.model.device),
+            "attention_mask": torch.ones_like(response_tokens).to(self.model.device),
+        }
+        content_hash = sha256_text(str(stored_text).strip() or " ")
+        ph_id = f"agent_{self.node_id}_current"
+        self._get_store_registry().upstream_agent_slots.put_producer(
+            producer_node_id=str(self.node_id),
+            message_key=str(message),
+            ph_id=ph_id,
+            content_hash=content_hash,
+            absolute_kv=response_kv_cache,
+            token_ids=token_dict,
+            prefix_token_len=int(prefix_token_len),
+        )
+        return response_kv_cache, token_dict
+
+    def _materialize_consumer_upstream_slot_sync(
+        self,
+        *,
+        consumer_node_id: str,
+        message_key: str,
+        ph_id: str,
+        slot_token_start: int,
+        ph_token_ids: Dict[str, torch.Tensor],
+        content_hash: str,
+        upstream_node_id: str,
+        drop_num: int = 0,
+    ) -> bool:
+        """Forward upstream payload on consumer frozen prefix left of the placeholder."""
+        bucket = LLMChat._shared_kv_cache_memory.get(str(consumer_node_id)) or {}
+        base_kv_full = bucket.get("base_kv_full")
+        if base_kv_full is None:
+            return False
+
+        input_ids = ph_token_ids.get("input_ids")
+        if input_ids is None or int(input_ids.shape[-1]) <= 0:
+            return False
+
+        slot_start = int(slot_token_start)
+        real_ids = input_ids[:, drop_num:] if drop_num else input_ids
+        real_len = int(real_ids.shape[-1])
+        if real_len <= 0:
+            return False
+
+        attn_len = slot_start + real_len
+        attention_mask = torch.ones(1, attn_len, dtype=torch.long, device=self.model.device)
+
+        with torch.no_grad():
+            with LLMChat._model_lock:
+                past_kv = base_kv_full.slice(start=0, end=slot_start)
+                output = self.model(
+                    input_ids=real_ids.to(self.model.device),
+                    attention_mask=attention_mask,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    return_dict=True,
+                )
+        full_kv = output.past_key_values
+        ctx_slice = full_kv.slice(start=slot_start, end=slot_start + real_len)
+        ctx_relative = self.kv_engine.apply_rotary_pos_emb(
+            ctx_slice,
+            offset=-slot_start,
+            drop_num=0,
+        )
+        token_dict = {
+            "input_ids": real_ids.to(self.model.device),
+            "attention_mask": torch.ones_like(real_ids).to(self.model.device),
+        }
+        self._get_store_registry().upstream_agent_slots.put_consumer(
+            consumer_node_id=str(consumer_node_id),
+            message_key=str(message_key),
+            ph_id=str(ph_id),
+            content_hash=str(content_hash),
+            absolute_kv=ctx_relative,
+            token_ids=token_dict,
+            upstream_node_id=str(upstream_node_id),
+            slot_token_start=slot_start,
+            drop_num=0,
+        )
+        return True
+
+    def _resolve_base_caches_for_dense_anchor(
+        self,
+        ph_id_list: List[str],
+        merged_prefix_kv,
+        placeholder_indices: Dict[str, Tuple[int, int]],
+    ) -> Tuple[List[Any], List[Any]]:
+        """Build base ph/pf lists for dense set_anchor.
+
+        ph base must match real ph length (materialized merged prefix), not the short
+        template slot slice. Template ph KV lives in ``template_ph_base`` for topology
+        coordinates only. pf base comes from frozen text segments via ``pf_span_id``.
+        """
+        prefix_store = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
+        prefix_kv_list = prefix_store.get("prefix") or []
+
+        base_ph_list, _split_pf_list = merged_prefix_kv.split_cache_by_placeholders(
+            placeholder_indices
+        )
+        base_pf_list: List[Any] = []
+        for ph_id in ph_id_list:
+            pf_kv, _ = self._resolve_pf_for_ph(
+                self.node_id,
+                ph_id,
+                prefix_store=prefix_store,
+                prefix_kv_list=prefix_kv_list,
+            )
+            base_pf_list.append(pf_kv)
+        return list(base_ph_list), base_pf_list
+
+    def _sync_dense_anchor_to_pool(
+        self,
+        *,
+        request_uid: str,
+        message: str,
+        ph_id_list: List[str],
+    ) -> None:
+        """Persist dense materialised deltas under topology-anchored keys."""
+        from sidecar.stores.prefix_spans import normalize_placeholder_info
+        from sidecar.stores.topology_anchor import delta_key_from_ph_rec, serialize_anchor_key
+
+        state = self.get_request_state(request_uid)
+        prefix_store = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
+        ph_info = normalize_placeholder_info(prefix_store.get("placeholder_info"))
+        static_hash = str(prefix_store.get("static_template_hash") or "")
+        topo = str(prefix_store.get("topology_id") or "")
+        stores = self._get_store_registry()
+        delta_ph = f"{self.node_id}_ph_key_delta"
+        delta_pf = f"{self.node_id}_pf_key_delta"
+
+        for ph_id in ph_id_list:
+            ph_rec = ph_info.get(str(ph_id))
+            if not isinstance(ph_rec, dict):
+                continue
+            entry = (state.anchors.get(ph_id) or {}).get(message)
+            if not isinstance(entry, dict) or delta_ph not in entry:
+                continue
+            content_hash = self._upstream_agent_content_hash(str(ph_id), message) or ""
+            delta_key = delta_key_from_ph_rec(
+                ph_id=str(ph_id),
+                ph_rec=ph_rec,
+                static_template_hash=static_hash,
+                topology_id=topo,
+                content_hash=content_hash,
+            )
+            pf_len = self._prefix_segment_len_for_placeholder(str(ph_id))
+            stores.agent_anchors.put(
+                node_id=str(self.node_id),
+                message_key=str(message),
+                ph_id=str(ph_id),
+                static_template_hash=static_hash,
+                upstream_hash=str(message),
+                ph_delta=entry.get(delta_ph),
+                ph_value_delta=entry.get(f"{self.node_id}_ph_value_delta"),
+                pf_delta=entry.get(delta_pf),
+                pf_value_delta=entry.get(f"{self.node_id}_pf_value_delta"),
+                pf_segment_len=pf_len,
+                delta_key=delta_key,
+            )
+            entry["anchor_topology_key"] = serialize_anchor_key(delta_key)
+            global_entry = (KVCOMMEngine.anchors.get(str(ph_id)) or {}).get(message)
+            if isinstance(global_entry, dict):
+                global_entry["anchor_topology_key"] = serialize_anchor_key(delta_key)
+
+    async def _ensure_consumer_upstream_agent_slots(
+        self,
+        message: str,
+        meta: List[Dict[str, Any]],
+        *,
+        tail_only_ph_ids: set[str] | None = None,
+    ) -> None:
+        """Materialize consumer-contextual KV for upstream agent placeholders."""
+        from sidecar.stores.hashing import sha256_text
+
+        stores = self._get_store_registry()
+        bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        materialized = bucket.setdefault("_upstream_materialized", {}).setdefault(str(message), set())
+        tasks: list[tuple] = []
+
+        for m in meta:
+            ph_id = str(m["ph_id"])
+            if tail_only_ph_ids is not None and ph_id not in tail_only_ph_ids and ph_id in materialized:
+                continue
+            upstream_idx = self._upstream_agent_index(ph_id)
+            if upstream_idx is None:
+                continue
+            try:
+                node_idx = int(self.node_id)
+            except (TypeError, ValueError):
+                continue
+            if upstream_idx >= node_idx:
+                continue
+
+            ph_cache_ids = m.get("ph_cache_ids")
+            if not isinstance(ph_cache_ids, dict) or ph_cache_ids.get("input_ids") is None:
+                continue
+            text = self.tokenizer.decode(ph_cache_ids["input_ids"][0], skip_special_tokens=True)
+            content_hash = sha256_text(str(text).strip() or " ")
+            existing = stores.upstream_agent_slots.get_consumer(
+                str(self.node_id),
+                str(message),
+                ph_id,
+                content_hash,
+            )
+            if existing is not None:
+                continue
+
+            drop_num = int(m.get("drop_num") or 0)
+            tasks.append(
+                (
+                    str(self.node_id),
+                    str(message),
+                    ph_id,
+                    int(m["start"]),
+                    ph_cache_ids,
+                    content_hash,
+                    str(upstream_idx),
+                    drop_num,
+                )
+            )
+
+        if not tasks:
+            return
+
+        def _run_batch():
+            for args in tasks:
+                ok = self._materialize_consumer_upstream_slot_sync(
+                    consumer_node_id=args[0],
+                    message_key=args[1],
+                    ph_id=args[2],
+                    slot_token_start=args[3],
+                    ph_token_ids=args[4],
+                    content_hash=args[5],
+                    upstream_node_id=args[6],
+                    drop_num=args[7],
+                )
+                if ok:
+                    materialized.add(args[2])
+
+        await asyncio.to_thread(_run_batch)
+
+    def _refresh_meta_from_upstream_slots(
+        self,
+        message: str,
+        meta: List[Dict[str, Any]],
+    ) -> None:
+        """Prefer consumer-contextual KV in merge meta when materialized."""
+        cum_offset = 0
+        ph_cum_len = 0
+        for m in meta:
+            slot = self.resolve_upstream_agent_slot(str(m["ph_id"]), message)
+            if slot is not None and slot.materialization == "consumer_contextual":
+                m["ph_cache"] = slot.absolute_kv
+                m["ph_cache_ids"] = slot.token_ids
+                m["drop_num"] = int(slot.drop_num)
+            ph_cache = m["ph_cache"]
+            drop_num = int(m.get("drop_num") or 0)
+            real_len = int(ph_cache._seen_tokens - drop_num)
+            templ_len = int(m["end"]) - int(m["start"])
+            delta_len = real_len - templ_len
+            m["delta"] = delta_len
+            m["offset_before"] = cum_offset
+            m["offset_after"] = cum_offset + delta_len
+            m["cum_len"] = ph_cum_len
+            cum_offset += delta_len
+            ph_cum_len += real_len
+
     async def append_prefix_segment(
         self,
         node_id: str,
         segment_template: str,
         *,
         system_prompt: str | None = None,
+        expected_user_template: str | None = None,
     ) -> None:
         """Append a templated segment (with turn placeholders) to an existing prefix."""
-        bucket = LLMChat._shared_kv_cache_memory.get(node_id, {})
-        stored_user = str(bucket.get("user_template") or "").strip()
-        stored_system = str(system_prompt or bucket.get("system_prompt") or "").strip()
-        merged_user = f"{stored_user}\n{segment_template.strip()}\n".strip()
-        await self.prepare_prefix_kv_segments(node_id, stored_system, merged_user)
+        await self.append_prefix_segment_incremental(
+            node_id,
+            segment_template,
+            system_prompt=system_prompt,
+            expected_user_template=expected_user_template,
+        )
 
     async def materialize_turn_placeholders(
         self,
@@ -1307,30 +2286,73 @@ class LLMChat(LLM):
         """Materialize KV caches for completed assistant/tool turn placeholders."""
         if not turn_content:
             return
+
+        from sidecar.stores.hashing import sha256_text
+        from sidecar.stores.turn_slot_registry import TurnPhSlot
+
+        stores = self._get_store_registry()
         mem = LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
-        turn_root = mem.setdefault("turn", {})
+
         for ph_id, content in turn_content.items():
             if not ph_id.startswith("turn_"):
                 continue
             content_str = str(content).strip() or " "
-            bucket = turn_root.setdefault(ph_id, {})
-            existing = bucket.get(message_key)
-            if isinstance(existing, dict) and existing.get("ids") is not None:
-                try:
-                    prior = self.tokenizer.decode(
-                        existing["ids"]["input_ids"][0],
-                        skip_special_tokens=True,
-                    ).strip()
-                except Exception:
-                    prior = ""
-                if prior == content_str:
-                    continue
+            content_hash = sha256_text(content_str)
+            turn_index = 0
+            parts = ph_id.split("_")
+            if len(parts) >= 2 and parts[1].isdigit():
+                turn_index = int(parts[1])
+
+            existing_slot = stores.turn_slots.get(node_id, message_key, ph_id)
+            if existing_slot is not None and existing_slot.content_hash == content_hash:
+                continue
+
+            is_tool = ph_id.endswith("_tool")
+            if is_tool:
+                lookup = stores.tool_semantic.lookup(content_str, content_hash=content_hash)
+                if lookup.hit and lookup.kv_ref:
+                    tool_entry = stores.tool_kv.get(lookup.kv_ref)
+                else:
+                    tool_entry = stores.tool_kv.get_or_create(
+                        content_str,
+                        self._forward_text_to_kv_sync,
+                    )
+                    stores.tool_semantic.upsert(
+                        query=content_str,
+                        kv_ref=tool_entry.kv_ref,
+                        content_hash=tool_entry.content_hash,
+                        ph_id_hint=ph_id,
+                        token_len=tool_entry.token_len,
+                    )
+                stores.turn_slots.put(
+                    TurnPhSlot(
+                        node_id=str(node_id),
+                        message_key=str(message_key),
+                        ph_id=str(ph_id),
+                        slot_kind="tool",
+                        content_hash=content_hash,
+                        kv_ref=tool_entry.kv_ref,
+                        token_ids=tool_entry.token_ids,
+                        drop_num=0,
+                        turn_index=turn_index,
+                    )
+                )
+                continue
+
             kv_cache, token_ids = await asyncio.to_thread(self._forward_text_to_kv_sync, content_str)
-            bucket[message_key] = {
-                "kv": kv_cache,
-                "ids": token_ids,
-                "drop_num": 0,
-            }
+            stores.turn_slots.put(
+                TurnPhSlot(
+                    node_id=str(node_id),
+                    message_key=str(message_key),
+                    ph_id=str(ph_id),
+                    slot_kind="assistant",
+                    content_hash=content_hash,
+                    absolute_kv=kv_cache,
+                    token_ids=token_ids,
+                    drop_num=0,
+                    turn_index=turn_index,
+                )
+            )
 
     def _forward_text_to_kv_sync(self, text: str) -> Tuple[Any, Dict[str, torch.Tensor]]:
         """Run a short HF prefill for arbitrary text (turn/upstream response KV)."""
@@ -1746,7 +2768,7 @@ class LLMChat(LLM):
                 encoding['input_ids'] = torch.tensor(token_id).unsqueeze(0).to(self.model.device)
                 encoding['attention_mask'] = torch.ones_like(encoding['input_ids']).to(self.model.device)
                 # Keep whitespace-only spans (e.g. "\n\n" between turn placeholders);
-                # skipping them breaks prefix_kv_list[1:] vs placeholder zip in agen_kvcomm.
+                # they are explicit pf text spans linked via pf_span_id in placeholder_info.
                 if txt:
                     segments.append(("text", txt, encoding, token_num, token_num + len(token_id)))
                     idx_count += 1
@@ -1999,18 +3021,27 @@ class LLMChat(LLM):
         if placeholder_info_map is None:
             raise RuntimeError("placeholder_info missing in shared KV cache memory.")
 
+        from sidecar.stores.prefix_spans import normalize_placeholder_info, ordered_placeholders
+
         merged_prefix_kv = prefix_kv_list[0].copy()
         merged_prefix_token_ids = prefix_token_ids[0].copy()
 
-        placeholder_entries = list(placeholder_info_map.items())[::-1]
+        placeholder_info_norm = normalize_placeholder_info(placeholder_info_map)
 
         meta: List[Dict[str, Any]] = []
         ph_id_list: List[str] = []
         cum_offset = 0
         ph_cum_len = 0
-        for idx, ((ph_id, (start, end)), pf_kv, pf_token_id) in enumerate(
-            zip(placeholder_entries, prefix_kv_list[1:], prefix_token_ids[1:])
-        ):
+        for idx, (ph_id, ph_rec) in enumerate(ordered_placeholders(placeholder_info_norm)):
+            start = int(ph_rec["start"])
+            end = int(ph_rec["end"])
+            pf_kv, pf_token_id = self._resolve_pf_for_ph(
+                self.node_id,
+                ph_id,
+                prefix_store=prefix_store,
+                prefix_kv_list=prefix_kv_list,
+                prefix_token_ids=prefix_token_ids,
+            )
             ph_cache, ph_cache_ids, drop_num = self.kv_engine.fetch_shared_cache(ph_id, message)
             real_len = ph_cache._seen_tokens - drop_num
             templ_len = end - start
@@ -2036,6 +3067,18 @@ class LLMChat(LLM):
             ph_cum_len += real_len
             ph_id_list.append(ph_id)
 
+        if mode == "kv_reuse":
+            from sidecar.stores.topology_anchor import new_tail_placeholder_ids
+
+            prev_ph = (prefix_store.get("_prev_placeholder_info") or {}) if isinstance(prefix_store, dict) else {}
+            tail_ph_ids = new_tail_placeholder_ids(prev_ph, placeholder_info_norm)
+            await self._ensure_consumer_upstream_agent_slots(
+                message,
+                meta,
+                tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
+            )
+            self._refresh_meta_from_upstream_slots(message, meta)
+
         reuse_kv_segments: List[Dict[str, Any]] = []
         if mode == "kv_reuse":
             for m in meta:
@@ -2055,6 +3098,8 @@ class LLMChat(LLM):
                     }
                 )
 
+        initial_mode = mode
+        blend_fallback = False
         if mode == "dense_prefill":
             tasks = [(message, m) for m in meta]
             results = list(
@@ -2067,13 +3112,14 @@ class LLMChat(LLM):
                     request_uid,
                     message,
                     m,
-                    list(anchors_for_node.get(m["ph_id"], {}).values()),
+                    self._kv_reuse_anchors_for_ph(m["ph_id"], message, anchors_for_node),
                 )
                 for m in meta
             ]
             results = list(self._map_in_pool(self.kv_engine.update_kv_cache_segment, tasks, timeout=30))
             blend_failed = [m["ph_id"] for m, result in zip(meta, results) if not result[3]]
             if blend_failed:
+                blend_fallback = True
                 self.purge_incompatible_anchor_deltas(request_uid, message, blend_failed)
                 logger.debug(
                     "kv_reuse anchor blend failed node_id={} placeholders={} -> dense_prefill rematerialize",
@@ -2182,8 +3228,10 @@ class LLMChat(LLM):
             real_placeholder_cache, real_prefix_cache = real_cache.split_cache_by_placeholders(
                 placeholder_indices
             )
-            base_placeholder_cache, base_prefix_cache = base_cache.split_cache_by_placeholders(
-                placeholder_indices
+            base_placeholder_cache, base_prefix_cache = self._resolve_base_caches_for_dense_anchor(
+                ph_id_list,
+                merged_prefix_kv,
+                placeholder_indices,
             )
             self.kv_engine.set_anchor(
                 request_uid,
@@ -2195,6 +3243,11 @@ class LLMChat(LLM):
                 base_prefix_cache,
                 max_anchor_num=max_anchor_num,
                 window_length=window_length,
+            )
+            self._sync_dense_anchor_to_pool(
+                request_uid=request_uid,
+                message=message,
+                ph_id_list=ph_id_list,
             )
 
         seq = outputs.sequences
@@ -2211,11 +3264,14 @@ class LLMChat(LLM):
         if not stored_text and raw_response_text.strip():
             stored_text = _sanitize_chat_template_leaks(raw_response_text)
 
-        response_kv_cache, token_dict = await asyncio.to_thread(
-            self._forward_text_to_kv_sync,
-            stored_text or " ",
+        response_tokens = generated_ids.unsqueeze(0)
+        response_kv_cache, token_dict = self._export_producer_contextual_response_kv(
+            full_kv_cache=full_kv_cache,
+            prefix_token_len=int(cached_prefix_token_length),
+            response_token_ids=generated_ids,
+            message=message,
+            stored_text=stored_text or " ",
         )
-        response_tokens = token_dict["input_ids"]
         attn_len = response_tokens.size(1)
         response_mask = torch.ones(response_tokens.size(0), attn_len, device=self.model.device)
 
@@ -2308,6 +3364,8 @@ class LLMChat(LLM):
             "anchor_pooled_tokens": (
                 int(response_tokens.numel()) if prob and not had_prior_response_anchor else 0
             ),
+            "blend_fallback": blend_fallback,
+            "routed_mode": initial_mode,
         }
         if reuse_kv_segments:
             joined_reuse = " | ".join(
@@ -2420,18 +3478,27 @@ class LLMChat(LLM):
         if placeholder_info_map is None:
             raise RuntimeError("placeholder_info missing in shared KV cache memory.")
 
+        from sidecar.stores.prefix_spans import normalize_placeholder_info, ordered_placeholders
+
         merged_prefix_kv = prefix_kv_list[0].copy()
         merged_prefix_token_ids = prefix_token_ids[0].copy()
 
-        placeholder_entries = list(placeholder_info_map.items())[::-1]
+        placeholder_info_norm = normalize_placeholder_info(placeholder_info_map)
 
         meta: List[Dict[str, Any]] = []
         ph_id_list: List[str] = []
         cum_offset = 0
         ph_cum_len = 0
-        for idx, ((ph_id, (start, end)), pf_kv, pf_token_id) in enumerate(
-            zip(placeholder_entries, prefix_kv_list[1:], prefix_token_ids[1:])
-        ):
+        for idx, (ph_id, ph_rec) in enumerate(ordered_placeholders(placeholder_info_norm)):
+            start = int(ph_rec["start"])
+            end = int(ph_rec["end"])
+            pf_kv, pf_token_id = self._resolve_pf_for_ph(
+                self.node_id,
+                ph_id,
+                prefix_store=prefix_store,
+                prefix_kv_list=prefix_kv_list,
+                prefix_token_ids=prefix_token_ids,
+            )
             ph_cache, ph_cache_ids, drop_num = self.kv_engine.fetch_shared_cache(ph_id, message)
             real_len = ph_cache._seen_tokens - drop_num
             templ_len = end - start
@@ -2457,6 +3524,18 @@ class LLMChat(LLM):
             ph_cum_len += real_len
             ph_id_list.append(ph_id)
 
+        if mode == "kv_reuse":
+            from sidecar.stores.topology_anchor import new_tail_placeholder_ids
+
+            prev_ph = (prefix_store.get("_prev_placeholder_info") or {}) if isinstance(prefix_store, dict) else {}
+            tail_ph_ids = new_tail_placeholder_ids(prev_ph, placeholder_info_norm)
+            await self._ensure_consumer_upstream_agent_slots(
+                message,
+                meta,
+                tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
+            )
+            self._refresh_meta_from_upstream_slots(message, meta)
+
         reuse_kv_segments: List[Dict[str, Any]] = []
         if mode == "kv_reuse":
             for m in meta:
@@ -2476,6 +3555,8 @@ class LLMChat(LLM):
                     }
                 )
 
+        initial_mode = mode
+        blend_fallback = False
         if mode == "dense_prefill":
             tasks = [(message, m) for m in meta]
             results = list(
@@ -2488,13 +3569,14 @@ class LLMChat(LLM):
                     request_uid,
                     message,
                     m,
-                    list(anchors_for_node.get(m["ph_id"], {}).values()),
+                    self._kv_reuse_anchors_for_ph(m["ph_id"], message, anchors_for_node),
                 )
                 for m in meta
             ]
             results = list(self._map_in_pool(self.kv_engine.update_kv_cache_segment, tasks, timeout=30))
             blend_failed = [m["ph_id"] for m, result in zip(meta, results) if not result[3]]
             if blend_failed:
+                blend_fallback = True
                 self.purge_incompatible_anchor_deltas(request_uid, message, blend_failed)
                 logger.debug(
                     "kv_reuse anchor blend failed node_id={} placeholders={} -> dense_prefill rematerialize",
