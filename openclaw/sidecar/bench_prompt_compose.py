@@ -9,7 +9,45 @@ _JOB_MARKER_RE = re.compile(r"\nYour job \(Agent ", re.IGNORECASE)
 
 BUGFIX_DISCOUNT_TASK_ID = "t1-bugfix-discount"
 QUICK_NOTE_TASK_ID = "t1-fs-quick-note"
+ADD_TESTS_NORMALIZER_TASK_ID = "t2-add-tests-normalizer"
+BROWSER_FORM_FIX_TASK_ID = "t2-browser-form-fix"
 QUICK_NOTE_VERIFIER_READ = frozenset({"quick_note.md"})
+
+
+def fix_normalizer_test_imports(content: str) -> str:
+    """Rewrite broken package-relative imports to flat `from normalizer import ...`."""
+    text = content or ""
+    text = re.sub(
+        r"from\s+\.\.normalizer\s+import",
+        "from normalizer import",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"from\s+\.\.\s+import\s+normalize_title,\s*normalize_tags",
+        "from normalizer import normalize_title, normalize_tags",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"from\s+\.\.\s+import\s+normalizer\b",
+        "from normalizer import",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"from\s+openclaw\.normalizer\s+import\s+normalize_text\b",
+        "from normalizer import normalize_title, normalize_tags",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"from\s+openclaw\.normalizer\s+import",
+        "from normalizer import",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
 
 
 def is_bugfix_discount_task(ctx) -> bool:
@@ -24,6 +62,20 @@ def is_quick_note_task(ctx) -> bool:
     if ctx is None:
         return False
     return str(getattr(ctx, "task_id", "") or "").strip() == QUICK_NOTE_TASK_ID
+
+
+def is_add_tests_normalizer_task(ctx) -> bool:
+    """True when the active bench row is the tier2 normalizer test-authoring task."""
+    if ctx is None:
+        return False
+    return str(getattr(ctx, "task_id", "") or "").strip() == ADD_TESTS_NORMALIZER_TASK_ID
+
+
+def is_browser_family_task(ctx) -> bool:
+    """True when the active bench row is a browser-family ClawBench task."""
+    if ctx is None:
+        return False
+    return str(getattr(ctx, "clawbench_family", "") or "").strip() == "browser"
 
 
 def inject_tool_constraints(user_template: str, tool_constraints: str | None) -> str:

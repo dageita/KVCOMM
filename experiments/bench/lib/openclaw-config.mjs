@@ -128,10 +128,19 @@ const DEFAULT_CAPABILITY_SUBAGENT_TOOLS = [
   "apply_patch",
   "exec",
   "process",
+  "browser",
   "session_status",
 ];
 
-const CAPABILITY_ACTION_TOOLS = new Set(["read", "write", "edit", "apply_patch", "exec", "process"]);
+const CAPABILITY_ACTION_TOOLS = new Set([
+  "read",
+  "write",
+  "edit",
+  "apply_patch",
+  "exec",
+  "process",
+  "browser",
+]);
 
 /** tools.subagents.tools.allow from openclaw.json (ClawBench capability lane). */
 export async function resolveCapabilitySubagentTools() {
@@ -151,7 +160,20 @@ export async function resolveCapabilitySubagentTools() {
     );
     return DEFAULT_CAPABILITY_SUBAGENT_TOOLS;
   }
-  return normalized;
+  const merged = [...normalized];
+  for (const tool of DEFAULT_CAPABILITY_SUBAGENT_TOOLS) {
+    if (!merged.includes(tool)) {
+      merged.push(tool);
+    }
+  }
+  if (!normalized.includes("browser") && merged.includes("browser")) {
+    console.warn(
+      `[clawbench-chain] tools.subagents.tools.allow in ${configPath} is missing browser. ` +
+        `Patching inheritedToolAllow with browser anyway. ` +
+        `Run: node cli.mjs setup clawbench-capability-sidecar && restart gateway.`,
+    );
+  }
+  return merged;
 }
 
 export async function assertCapabilitySubagentTools() {

@@ -17,6 +17,9 @@ class TurnPhSlot:
     slot_kind: SlotKind
     content_hash: str
     kv_ref: str | None = None
+    consumer_slot_key: str | None = None
+    branch_slot_key: str | None = None
+    tool_call_hash: str = ""
     absolute_kv: Any | None = None
     token_ids: dict[str, Any] | None = None
     drop_num: int = 0

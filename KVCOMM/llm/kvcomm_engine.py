@@ -1255,15 +1255,46 @@ class KVCOMMEngine:
             node_id = str(self.llm.node_id)
             slot = self.llm.resolve_turn_ph_slot(ph_id, message)
             if slot is not None:
-                if slot.slot_kind == "tool" and slot.kv_ref:
-                    try:
-                        from sidecar.stores.registry import get_store_registry
+                try:
+                    from sidecar.stores.registry import get_store_registry
 
-                        tool_entry = get_store_registry().tool_kv.get(slot.kv_ref)
-                        if tool_entry is not None:
-                            return tool_entry.absolute_kv, tool_entry.token_ids, slot.drop_num
-                    except ImportError:
-                        pass
+                    stores = get_store_registry()
+                    if slot.slot_kind == "tool":
+                        consumer = self.llm.resolve_tool_consumer_slot(ph_id, message)
+                        if consumer is not None and consumer.absolute_kv is not None:
+                            token_ids = (
+                                consumer.token_ids
+                                if isinstance(consumer.token_ids, dict)
+                                else {}
+                            )
+                            return (
+                                consumer.absolute_kv,
+                                token_ids,
+                                int(consumer.drop_num),
+                            )
+                        if slot.kv_ref:
+                            tool_entry = stores.tool_kv.get(slot.kv_ref)
+                            if tool_entry is not None:
+                                return (
+                                    tool_entry.absolute_kv,
+                                    tool_entry.token_ids,
+                                    slot.drop_num,
+                                )
+                    elif slot.slot_kind == "assistant":
+                        branch = self.llm.resolve_llm_branch_slot(ph_id, message)
+                        if branch is not None and branch.absolute_kv is not None:
+                            token_ids = (
+                                branch.token_ids
+                                if isinstance(branch.token_ids, dict)
+                                else {}
+                            )
+                            return (
+                                branch.absolute_kv,
+                                token_ids,
+                                int(branch.drop_num),
+                            )
+                except ImportError:
+                    pass
                 if slot.absolute_kv is not None and slot.token_ids is not None:
                     return slot.absolute_kv, slot.token_ids, slot.drop_num
 

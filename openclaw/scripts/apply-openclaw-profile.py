@@ -24,6 +24,7 @@ DEFAULT_CAPABILITY_SUBAGENT_TOOLS = [
     "apply_patch",
     "exec",
     "process",
+    "browser",
     "session_status",
 ]
 
@@ -84,6 +85,8 @@ def ensure_main_agent_tools(merged: dict[str, Any], profile: str = "") -> None:
             (merged.get("tools") or {}).get("subagents", {}).get("tools", {}).get("allow") or []
         )
         also_allow.update(str(name).strip() for name in subagent_allow if str(name).strip())
+        # OpenClaw coding profile excludes browser unless profile-stage alsoAllow adds it.
+        also_allow.add("browser")
     tools["alsoAllow"] = sorted(also_allow)
 
 
@@ -167,11 +170,13 @@ def ensure_capability_subagent_tools(
     """Force full coding-tool allowlist for capability lane subagents (do not inherit stale allow)."""
     if profile not in CLAWBENCH_CAPABILITY_PROFILES:
         return
-    template_allow = (
-        (template.get("tools") or {}).get("subagents", {}).get("tools", {}).get("allow")
-    )
+    template_tools = (template.get("tools") or {}).get("subagents", {}).get("tools", {}) or {}
+    template_allow = template_tools.get("allow")
     allow = [str(name).strip() for name in (template_allow or DEFAULT_CAPABILITY_SUBAGENT_TOOLS) if str(name).strip()]
-    merged.setdefault("tools", {}).setdefault("subagents", {}).setdefault("tools", {})["allow"] = allow
+    subagents_tools = merged.setdefault("tools", {}).setdefault("subagents", {}).setdefault("tools", {})
+    subagents_tools["allow"] = allow
+    # OpenClaw rejects allow+alsoAllow in the same tools policy scope.
+    subagents_tools.pop("alsoAllow", None)
     print(f"[apply-profile] set tools.subagents.tools.allow={allow}")
 
 

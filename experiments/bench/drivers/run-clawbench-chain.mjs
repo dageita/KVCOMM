@@ -18,6 +18,7 @@ import { summarizeBenchRows, summarizeClawbenchCapability } from "../lib/summari
 import { writeBenchReport } from "../lib/bench-report.mjs";
 import {
   buildChainTranscript,
+  buildScoringRuntimeValues,
   collectSessionMessages,
   scoreCapabilityRun,
   slimCapabilityScore,
@@ -25,6 +26,7 @@ import {
   stageCapabilityWorkspaceForAgents,
   syncCapabilityWorkspaceArtifacts,
 } from "../lib/clawbench-chain.mjs";
+import { startTaskBackgroundServices } from "../lib/clawbench-services.mjs";
 import {
   buildRunMetadata,
   computeRunKvReuseStats,
@@ -388,22 +390,51 @@ async function main() {
 
         await stageCapabilityWorkspaceForAgents(workspaceDir, taskRow);
 
-        const taskBody = await resolveTaskBody(taskRow, runIndex);
+        const { runtimeValues: serviceRuntime, stop: stopBackgroundServices } =
+          await startTaskBackgroundServices(taskRow, workspaceDir);
+        const runtimeValues = buildScoringRuntimeValues(workspaceDir, serviceRuntime);
+        let taskBody = await resolveTaskBody(taskRow, runIndex);
+        taskBody = renderTemplateStrict(taskBody, runtimeValues);
         const effectiveInferenceMode = isWarmup ? "dense_prefill" : args.inferenceMode;
-        const result = await runChainStackSpawn(client, {
-          agentId: args.agentId,
-          scenario,
-          taskRow: { ...taskRow, task_body: taskBody },
-          model: args.model || undefined,
-          runTimeoutSeconds: args.runTimeoutSeconds,
-          experimentId: args.experimentId,
-          runId,
-          spawnMode: "capability",
-          workspaceDir,
-          inferenceMode: effectiveInferenceMode,
-          inferenceBackend: args.inferenceBackend ?? runMetadata.inference_backend,
-          taskProfile: "clawbench",
-        });
+        let result;
+        let capabilityScore = null;
+        try {
+          result = await runChainStackSpawn(client, {
+            agentId: args.agentId,
+            scenario,
+            taskRow: { ...taskRow, task_body: taskBody },
+            model: args.model || undefined,
+            runTimeoutSeconds: args.runTimeoutSeconds,
+            experimentId: args.experimentId,
+            runId,
+            spawnMode: "capability",
+            workspaceDir,
+            inferenceMode: effectiveInferenceMode,
+            inferenceBackend: args.inferenceBackend ?? runMetadata.inference_backend,
+            taskProfile: "clawbench",
+            runtimeValues,
+          });
+
+          if (!isWarmup) {
+            const sessionMessages = await collectSessionMessages(client, result.records);
+            const transcript = buildChainTranscript(taskBody, result.records, sessionMessages);
+            await syncCapabilityWorkspaceArtifacts(workspaceDir, result.records, taskRow);
+
+            if (!args.skipScore) {
+              capabilityScore = slimCapabilityScore(
+                await scoreCapabilityRun({
+                  taskId: taskRow.task_id,
+                  workspaceDir,
+                  transcript,
+                  judgeModel: args.judgeModel,
+                  runtimeValues,
+                }),
+              );
+            }
+          }
+        } finally {
+          await stopBackgroundServices();
+        }
 
         if (!isWarmup) {
           measureIndex += 1;
@@ -439,22 +470,6 @@ async function main() {
             ),
           );
         } else {
-          const sessionMessages = await collectSessionMessages(client, result.records);
-          const transcript = buildChainTranscript(taskBody, result.records, sessionMessages);
-          await syncCapabilityWorkspaceArtifacts(workspaceDir, result.records, taskRow);
-
-          let capabilityScore = null;
-          if (!args.skipScore) {
-            capabilityScore = slimCapabilityScore(
-              await scoreCapabilityRun({
-                taskId: taskRow.task_id,
-                workspaceDir,
-                transcript,
-                judgeModel: args.judgeModel,
-              }),
-            );
-          }
-
           for (const record of result.records) {
             await appendJsonl(
               outputPath,

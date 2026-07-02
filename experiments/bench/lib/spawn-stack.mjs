@@ -7,7 +7,7 @@ import {
 } from "./gateway-client.mjs";
 import { resolveCapabilitySubagentTools } from "./openclaw-config.mjs";
 import { fetchSidecarAgentMetrics, registerKvcommContext, shouldFetchSidecarMetrics } from "./sidecar-metrics.mjs";
-import { restoreImmutableCodingFiles, syncEditableCodingFiles } from "./clawbench-chain.mjs";
+import { restoreImmutableCodingFiles, syncEditableBrowserFiles, syncEditableCodingFiles } from "./clawbench-chain.mjs";
 import { buildKvcommMetaPrefix, renderTemplateKvReuse, renderTemplateStrict, sha256Short } from "./template.mjs";
 
 const TOOL_JSON_PATTERN =
@@ -34,9 +34,6 @@ function analyzeOutputFormat(outputText, taskRow) {
 }
 
 function resolveAgentTasks(taskRow, spawnMode) {
-  if (spawnMode === "capability" && taskRow.agent_tasks && taskRow.tool_constraints) {
-    return taskRow.agent_tasks;
-  }
   if (spawnMode === "capability" && taskRow.capability_agent_tasks) {
     return taskRow.capability_agent_tasks;
   }
@@ -125,6 +122,7 @@ export async function runChainStackSpawn(client, params) {
     inferenceMode = "dense_prefill",
     inferenceBackend = "vllm_direct",
     taskProfile = "copy",
+    runtimeValues = {},
   } = params;
 
   const agentCount = scenario.agent_count ?? 3;
@@ -156,13 +154,17 @@ export async function runChainStackSpawn(client, params) {
       user_question: taskRow.user_question ?? taskRow.task_body ?? "",
       task_body: taskRow.task_body ?? "",
       workspace_dir: workspaceDir ?? "",
+      ...runtimeValues,
       ...Object.fromEntries(
         Object.entries(outputs).map(([key, value]) => [key, value]),
       ),
     };
 
     let taskText = renderAgentTask(template, variables, inferenceMode, agentIndex);
-    const messageKey = variables.user_question || variables.task_body || taskRow.task_id;
+    const messageKey = renderTemplateStrict(
+      variables.user_question || variables.task_body || taskRow.task_id,
+      variables,
+    );
     const agentKey = `agent_${agentIndex}`;
     const toolConstraints =
       taskRow.tool_constraints?.[agentKey] ??
@@ -173,6 +175,7 @@ export async function runChainStackSpawn(client, params) {
       task_body: variables.task_body,
       workspace_dir: variables.workspace_dir,
       tool_constraints: toolConstraints,
+      ...runtimeValues,
       ...(Array.isArray(taskRow.agent_roles)
         ? {
             agent_roles: JSON.stringify(taskRow.agent_roles),
@@ -417,8 +420,14 @@ export async function runChainStackSpawn(client, params) {
     records.push(record);
 
     if (spawnMode === "capability" && workspaceDir) {
-      await syncEditableCodingFiles(workspaceDir, taskRow);
-      await restoreImmutableCodingFiles(workspaceDir, taskRow);
+      if (taskRow?.clawbench_ref?.family === "browser") {
+        await syncEditableBrowserFiles(workspaceDir, taskRow, {
+          preferDefault: agentIndex === 1,
+        });
+      } else {
+        await syncEditableCodingFiles(workspaceDir, taskRow);
+        await restoreImmutableCodingFiles(workspaceDir, taskRow);
+      }
     }
   }
 

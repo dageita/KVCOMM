@@ -285,9 +285,87 @@ def patcher_read_satisfied(
     *,
     required: frozenset[str] = frozenset({"pricing.py"}),
 ) -> bool:
-    """True when Agent 1 patcher has non-empty read results for required files."""
+    """True when Agent 1 patcher has pricing.py context (read tool or Agent 0 quote)."""
     done = completed_read_paths(messages)
-    return required.issubset(done)
+    if required.issubset(done):
+        return True
+    if "pricing.py" in required:
+        upstream = pricing_content_from_context(messages)
+        if pricing_apply_discount_return_line(upstream):
+            return True
+    return False
+
+
+def pricing_content_from_context(messages: list[dict[str, Any]]) -> str:
+    """pricing.py text from tool reads or upstream Agent 0 analysis in the user prompt."""
+    latest = _latest_pricing_py_from_tool_messages(messages)
+    if latest.strip():
+        return latest
+    return _pricing_content_from_user_messages(messages)
+
+
+def _pricing_content_from_user_messages(messages: list[dict[str, Any]]) -> str:
+    """Extract a pricing.py snippet quoted by Agent 0 in the chain user prompt."""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        text = _message_content(msg)
+        if "apply_discount" not in text or "subtotal_cents" not in text:
+            continue
+        for block in re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE):
+            if "def apply_discount" in block:
+                return block.strip()
+        match = re.search(
+            r"(def apply_discount\([^\)]*\)\s*(?:->[^\n]*)?\n"
+            r"(?:.*\n)*?\s*return subtotal_cents[^\n]*)",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _latest_pricing_py_from_tool_messages(messages: list[dict[str, Any]]) -> str:
+    """Latest pricing.py body from read results or edit failure snapshots."""
+    latest = ""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            i += 1
+            continue
+        pending: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            for tool_name in ("edit", "read"):
+                path = _parse_tool_path_from_call(call, tool_name)
+                if path == "pricing.py":
+                    pending.append(tool_name)
+                    break
+        j = i + 1
+        result_idx = 0
+        while j < len(messages) and result_idx < len(pending):
+            nxt = messages[j]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            tool_name = pending[result_idx]
+            body = _message_content(nxt)
+            if tool_name == "read" and body.strip():
+                latest = body
+            elif tool_name == "edit":
+                current_match = _EDIT_CURRENT_FILE_RE.search(body)
+                if current_match:
+                    latest = current_match.group(1)
+            result_idx += 1
+            j += 1
+        i = j if j > i + 1 else i + 1
+    return latest
 
 
 def verifier_read_satisfied(
@@ -298,6 +376,82 @@ def verifier_read_satisfied(
     """True when verifier has non-empty read results for required files (basename match)."""
     done = completed_read_paths(messages)
     return required.issubset(done)
+
+
+_WRITE_SUCCESS_RE = re.compile(r"Successfully wrote", re.IGNORECASE)
+
+
+def quick_note_file_valid(content: str) -> bool:
+    """True when notes/quick_note.md content covers all three reminders in list form."""
+    text = (content or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    if "dry clean" not in lower:
+        return False
+    if "sam" not in lower:
+        return False
+    if "babysit" not in lower:
+        return False
+    if "60" not in lower:
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    list_lines = [
+        line
+        for line in lines
+        if line.startswith(("-", "*", "+")) or re.match(r"^\d+[.)]\s", line)
+    ]
+    return len(list_lines) >= 2 or len(lines) >= 3
+
+
+def _is_quick_note_path(path: str) -> bool:
+    return _normalize_read_path(path) == "quick_note.md"
+
+
+def quick_note_write_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when notes/quick_note.md was written/edited with all three reminders."""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            i += 1
+            continue
+        pending: list[tuple[str, dict[str, Any]]] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            for tool_name in ("edit", "write"):
+                path = _parse_tool_path_from_call(call, tool_name)
+                if _is_quick_note_path(path):
+                    pending.append((tool_name, call))
+                    break
+        j = i + 1
+        result_idx = 0
+        while j < len(messages) and result_idx < len(pending):
+            nxt = messages[j]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            tool_name, call = pending[result_idx]
+            body = _message_content(nxt)
+            if tool_name == "write" and body.strip() and "error" not in body.lower()[:120]:
+                if _WRITE_SUCCESS_RE.search(body) or "successfully wrote" in body.lower():
+                    written = _parse_write_content_from_call(call)
+                    if quick_note_file_valid(written):
+                        return True
+            elif tool_name == "edit":
+                if _EDIT_SUCCESS_RE.search(body):
+                    return True
+                current_match = _EDIT_CURRENT_FILE_RE.search(body)
+                if current_match and quick_note_file_valid(current_match.group(1)):
+                    return True
+            result_idx += 1
+            j += 1
+        i = j if j > i + 1 else i + 1
+    return False
 
 
 def _parse_exec_command_from_call(call: dict[str, Any]) -> str:
@@ -317,6 +471,11 @@ def _parse_exec_command_from_call(call: dict[str, Any]) -> str:
     return str(args.get("command") or "").strip()
 
 
+def _parse_tool_name_from_call(call: dict[str, Any]) -> str:
+    fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+    return str(fn.get("name") or "").strip()
+
+
 def _iter_exec_calls_from_messages(messages: list[dict[str, Any]]):
     for msg in messages:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -330,6 +489,212 @@ def _iter_exec_calls_from_messages(messages: list[dict[str, Any]]):
             command = _parse_exec_command_from_call(call)
             if command:
                 yield command
+
+
+def browser_form_fix_applied(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return False
+    return "contact-formm" not in text and "contact-form" in text
+
+
+def browser_patcher_read_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when Agent 1 read app.js (the file with the form id typo)."""
+    return "app.js" in completed_read_paths(messages)
+
+
+def browser_patcher_edit_applied_in_messages(messages: list[dict[str, Any]]) -> bool:
+    """True when Agent 1 successfully edited/wrote app.js in this transcript."""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            i += 1
+            continue
+        pending: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            for tool_name in ("edit", "write"):
+                path = _parse_tool_path_from_call(call, tool_name)
+                if path == "app.js":
+                    pending.append(tool_name)
+                    break
+        j = i + 1
+        result_idx = 0
+        while j < len(messages) and result_idx < len(pending):
+            nxt = messages[j]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            body = _message_content(nxt)
+            if _EDIT_SUCCESS_RE.search(body):
+                return True
+            result_idx += 1
+            j += 1
+        i = j if j > i + 1 else i + 1
+    return False
+
+
+def browser_patcher_fix_satisfied(
+    messages: list[dict[str, Any]],
+    *,
+    workspace_dir: str = "",
+) -> bool:
+    """True when app.js fix is confirmed via edit tool success in the transcript."""
+    _ = workspace_dir
+    if browser_patcher_edit_applied_in_messages(messages):
+        return True
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            i += 1
+            continue
+        pending: list[tuple[str, str]] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            path = _parse_tool_path_from_call(call, "read")
+            if path == "app.js":
+                pending.append(("read", str(call.get("id") or "")))
+                break
+        j = i + 1
+        result_idx = 0
+        while j < len(messages) and result_idx < len(pending):
+            nxt = messages[j]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            tool_name, _call_id = pending[result_idx]
+            body = _message_content(nxt)
+            if tool_name == "read" and browser_form_fix_applied(body):
+                return True
+            result_idx += 1
+            j += 1
+        i = j if j > i + 1 else i + 1
+    return False
+
+
+def browser_verifier_exec_done(messages: list[dict[str, Any]]) -> bool:
+    return any("verify_form" in command for command in _iter_exec_calls_from_messages(messages))
+
+
+def _verify_form_exec_body_succeeded(body: str) -> bool:
+    """Parse OpenClaw exec tool output for verify_form.cjs."""
+    stripped = (body or "").strip()
+    if not stripped:
+        return False
+    # verify_form exits 0 with no stdout; OpenClaw renders that as "(no output)".
+    if stripped == "(no output)":
+        return True
+    lowered = stripped.lower()
+    if "exit code 0" in lowered or 'exit_code": 0' in stripped or "exit_code\": 0" in stripped:
+        return True
+    if (
+        "exit code 1" in lowered
+        or "exited with code 1" in lowered
+        or "command exited with code 1" in lowered
+        or "timeout" in lowered
+        or "exceeded" in lowered
+        or "error:" in lowered
+        or "cannot find module" in lowered
+        or "enoent" in lowered
+        or '"status": "error"' in stripped
+        or '"status":"error"' in stripped
+    ):
+        return False
+    # Non-zero exits append "(Command exited with code N)"; absence implies success.
+    if "command exited with code" in lowered or "exited with code" in lowered:
+        return False
+    return True
+
+
+def browser_verifier_exec_passed(messages: list[dict[str, Any]]) -> bool:
+    """True when the latest verify_form exec result succeeded."""
+    last_body = ""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        pending_commands: list[str] = []
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                command = _parse_exec_command_from_call(call)
+                if command and "verify_form" in command:
+                    pending_commands.append(command)
+        j = i + 1
+        result_idx = 0
+        while j < len(messages) and result_idx < len(pending_commands):
+            nxt = messages[j]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            last_body = _message_content(nxt)
+            result_idx += 1
+            j += 1
+        i = j if j > i + 1 else i + 1
+    return _verify_form_exec_body_succeeded(last_body)
+
+
+def build_browser_appjs_edit_hint() -> str:
+    return (
+        "\napp.js uses getElementById(\"contact-formm\") but index.html defines id=\"contact-form\". "
+        "Edit app.js and replace contact-formm with contact-form. "
+        "Use the exact oldText from the file you read.\n"
+    )
+
+
+def build_browser_verifier_exec_hint(*, form_app_port: str = "", node_path: str = "") -> str:
+    port = (form_app_port or "").strip() or "{form_app_port}"
+    np = (node_path or "").strip() or "{openclaw_node_path}:{benchmark_node_path}"
+    return (
+        f"\nCall exec with command "
+        f"`NODE_PATH={np} node verify_form.cjs http://127.0.0.1:{port}/` from the workspace root. "
+        "Never set elevated: true.\n"
+    )
+
+
+def browser_exploration_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when Agent 0 successfully used the browser tool at least once."""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            i += 1
+            continue
+        pending = [
+            call
+            for call in tool_calls
+            if isinstance(call, dict) and _parse_tool_name_from_call(call) == "browser"
+        ]
+        j = i + 1
+        result_idx = 0
+        while j < len(messages) and result_idx < len(pending):
+            nxt = messages[j]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            body = _message_content(nxt)
+            if body.strip() and "error" not in body.lower()[:160]:
+                return True
+            result_idx += 1
+            j += 1
+        i = j if j > i + 1 else i + 1
+    return False
 
 
 def verifier_exec_pytest_done(messages: list[dict[str, Any]]) -> bool:
@@ -443,45 +808,8 @@ def pricing_apply_discount_return_line(content: str) -> str:
 
 
 def latest_pricing_py_content(messages: list[dict[str, Any]]) -> str:
-    """Latest pricing.py body from read results or edit failure snapshots."""
-    latest = ""
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            i += 1
-            continue
-        tool_calls = msg.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            i += 1
-            continue
-        pending: list[str] = []
-        for call in tool_calls:
-            if not isinstance(call, dict):
-                continue
-            for tool_name in ("edit", "read"):
-                path = _parse_tool_path_from_call(call, tool_name)
-                if path == "pricing.py":
-                    pending.append(tool_name)
-                    break
-        j = i + 1
-        result_idx = 0
-        while j < len(messages) and result_idx < len(pending):
-            nxt = messages[j]
-            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
-                break
-            tool_name = pending[result_idx]
-            body = _message_content(nxt)
-            if tool_name == "read" and body.strip():
-                latest = body
-            elif tool_name == "edit":
-                current_match = _EDIT_CURRENT_FILE_RE.search(body)
-                if current_match:
-                    latest = current_match.group(1)
-            result_idx += 1
-            j += 1
-        i = j if j > i + 1 else i + 1
-    return latest
+    """Latest pricing.py body from read results, edit snapshots, or Agent 0 quotes."""
+    return pricing_content_from_context(messages)
 
 
 def build_pricing_edit_hint(messages: list[dict[str, Any]]) -> str:
@@ -560,6 +888,116 @@ def patcher_fix_satisfied(messages: list[dict[str, Any]]) -> bool:
             j += 1
         i = j if j > i + 1 else i + 1
     return False
+
+
+def normalizer_test_file_valid(content: str) -> bool:
+    """True when tests/test_normalizer.py has the expected import and coverage hooks."""
+    text = (content or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    if "from ..normalizer" in lower or "openclaw" in lower or "normalize_text" in lower:
+        return False
+    if "from normalizer import" not in lower and "import normalizer" not in lower:
+        return False
+    if "normalize_title" not in lower or "normalize_tags" not in lower:
+        return False
+    return "def test_" in lower
+
+
+def normalizer_analyzer_read_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when Agent 0 has read normalizer.py."""
+    return "normalizer.py" in completed_read_paths(messages)
+
+
+def normalizer_patcher_read_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when Agent 1 has read normalizer.py before authoring tests."""
+    return "normalizer.py" in completed_read_paths(messages)
+
+
+def _parse_write_content_from_call(call: dict[str, Any]) -> str:
+    fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+    if str(fn.get("name") or "").strip() != "write":
+        return ""
+    raw_args = fn.get("arguments")
+    if isinstance(raw_args, dict):
+        args = raw_args
+    else:
+        try:
+            args = json.loads(str(raw_args or "{}"))
+        except json.JSONDecodeError:
+            return ""
+    if not isinstance(args, dict):
+        return ""
+    return str(args.get("content") or "")
+
+
+def _is_normalizer_test_path(path: str) -> bool:
+    return _normalize_read_path(path) == "test_normalizer.py"
+
+
+def normalizer_tests_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when tests/test_normalizer.py exists with a usable pytest suite."""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            i += 1
+            continue
+        pending: list[tuple[str, dict[str, Any]]] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            for tool_name in ("edit", "read", "write"):
+                path = _parse_tool_path_from_call(call, tool_name)
+                if _is_normalizer_test_path(path):
+                    pending.append((tool_name, call))
+                    break
+        j = i + 1
+        result_idx = 0
+        while j < len(messages) and result_idx < len(pending):
+            nxt = messages[j]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            tool_name, call = pending[result_idx]
+            body = _message_content(nxt)
+            if tool_name == "write" and body.strip() and "error" not in body.lower()[:120]:
+                written = _parse_write_content_from_call(call)
+                if normalizer_test_file_valid(written):
+                    return True
+            elif tool_name == "edit":
+                current_match = _EDIT_CURRENT_FILE_RE.search(body)
+                if current_match and normalizer_test_file_valid(current_match.group(1)):
+                    return True
+            elif tool_name == "read" and body.strip():
+                if normalizer_test_file_valid(body):
+                    return True
+            result_idx += 1
+            j += 1
+        i = j if j > i + 1 else i + 1
+    return False
+
+
+def normalizer_tests_ready(
+    messages: list[dict[str, Any]],
+    *,
+    workspace_dir: str = "",
+) -> bool:
+    """True when tests/test_normalizer.py is ready in session history or on disk."""
+    if normalizer_tests_satisfied(messages):
+        return True
+    root = (workspace_dir or "").strip()
+    if not root or not os.path.isdir(root):
+        return False
+    path = os.path.join(root, "tests", "test_normalizer.py")
+    if not os.path.isfile(path):
+        return False
+    with open(path, encoding="utf-8") as handle:
+        return normalizer_test_file_valid(handle.read())
 
 
 def missing_analyzer_reads(

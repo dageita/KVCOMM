@@ -18,6 +18,8 @@ class ToolKVEntry:
     token_len: int
     materialization: str = "isolated"
     ref_count: int = 0
+    tool_name: str = ""
+    tool_call_hash: str = ""
 
 
 class ToolKVBackend:
@@ -47,11 +49,18 @@ class ToolKVBackend:
         self,
         result_text: str,
         forward_fn: Callable[[str], tuple[Any, dict[str, Any]]],
+        *,
+        tool_name: str = "",
+        tool_call_hash: str = "",
     ) -> ToolKVEntry:
         content_hash = sha256_text(result_text)
         existing = self.get_by_content_hash(content_hash)
         if existing is not None:
             existing.ref_count += 1
+            if tool_name and not existing.tool_name:
+                existing.tool_name = tool_name
+            if tool_call_hash and not existing.tool_call_hash:
+                existing.tool_call_hash = tool_call_hash
             return existing
 
         absolute_kv, token_ids = forward_fn(result_text)
@@ -72,6 +81,8 @@ class ToolKVBackend:
             token_ids=token_ids,
             token_len=token_len,
             ref_count=1,
+            tool_name=str(tool_name or ""),
+            tool_call_hash=str(tool_call_hash or ""),
         )
         self._insert(entry)
         return entry

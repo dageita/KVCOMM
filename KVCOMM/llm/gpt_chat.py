@@ -747,8 +747,13 @@ class LLMChat(LLM):
         """Return anchor list for kv_reuse blend; empty list = pass-through rotate only."""
         ph_id = str(ph_id)
         if _TURN_PLACEHOLDER_RE.match(ph_id):
+            if ph_id.endswith("_tool"):
+                if self.resolve_tool_consumer_slot(ph_id, message) is not None:
+                    return []
+            elif self.resolve_llm_branch_slot(ph_id, message) is not None:
+                return []
             slot = self.resolve_turn_ph_slot(ph_id, message)
-            if slot is not None and (slot.absolute_kv is not None or slot.kv_ref):
+            if slot is not None and (slot.kv_ref or slot.absolute_kv is not None):
                 return []
         upstream_idx = self._upstream_agent_index(ph_id)
         if upstream_idx is not None:
@@ -2075,6 +2080,378 @@ class LLMChat(LLM):
         )
         return True
 
+    def _turn_index_from_ph_id(self, ph_id: str) -> int:
+        parts = str(ph_id).split("_")
+        if len(parts) >= 2 and parts[1].isdigit():
+            return int(parts[1])
+        return 0
+
+    def _paired_assistant_ph_id(self, ph_id: str) -> str | None:
+        if str(ph_id).endswith("_tool"):
+            return str(ph_id).replace("_tool", "_assistant")
+        return None
+
+    def _materialize_tool_consumer_slot_sync(
+        self,
+        *,
+        consumer_node_id: str,
+        message_key: str,
+        ph_id: str,
+        slot_token_start: int,
+        ph_token_ids: Dict[str, torch.Tensor],
+        content_hash: str,
+        kv_ref: str,
+        turn_index: int = 0,
+        tool_call_hash: str = "",
+        drop_num: int = 0,
+    ) -> bool:
+        """Forward tool-result tokens on consumer frozen prefix (TOOL_TO_LLM consume)."""
+        bucket = LLMChat._shared_kv_cache_memory.get(str(consumer_node_id)) or {}
+        base_kv_full = bucket.get("base_kv_full")
+        if base_kv_full is None:
+            return False
+
+        input_ids = ph_token_ids.get("input_ids")
+        if input_ids is None or int(input_ids.shape[-1]) <= 0:
+            return False
+
+        slot_start = int(slot_token_start)
+        real_ids = input_ids[:, drop_num:] if drop_num else input_ids
+        real_len = int(real_ids.shape[-1])
+        if real_len <= 0:
+            return False
+
+        attn_len = slot_start + real_len
+        attention_mask = torch.ones(1, attn_len, dtype=torch.long, device=self.model.device)
+
+        with torch.no_grad():
+            with LLMChat._model_lock:
+                past_kv = base_kv_full.slice(start=0, end=slot_start)
+                output = self.model(
+                    input_ids=real_ids.to(self.model.device),
+                    attention_mask=attention_mask,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    return_dict=True,
+                )
+        full_kv = output.past_key_values
+        ctx_slice = full_kv.slice(start=slot_start, end=slot_start + real_len)
+        ctx_relative = self.kv_engine.apply_rotary_pos_emb(
+            ctx_slice,
+            offset=-slot_start,
+            drop_num=0,
+        )
+        token_dict = {
+            "input_ids": real_ids.to(self.model.device),
+            "attention_mask": torch.ones_like(real_ids).to(self.model.device),
+        }
+        self._get_store_registry().tool_consumer_slots.put_consumer(
+            consumer_node_id=str(consumer_node_id),
+            message_key=str(message_key),
+            ph_id=str(ph_id),
+            content_hash=str(content_hash),
+            kv_ref=str(kv_ref),
+            absolute_kv=ctx_relative,
+            token_ids=token_dict,
+            slot_token_start=slot_start,
+            turn_index=int(turn_index),
+            tool_call_hash=str(tool_call_hash or ""),
+            drop_num=0,
+        )
+        return True
+
+    def _materialize_llm_branch_slot_sync(
+        self,
+        *,
+        consumer_node_id: str,
+        message_key: str,
+        ph_id: str,
+        slot_token_start: int,
+        ph_token_ids: Dict[str, torch.Tensor],
+        content_hash: str,
+        turn_index: int = 0,
+        drop_num: int = 0,
+    ) -> bool:
+        """Forward assistant branch tokens on consumer frozen prefix (LLM_TO_LLM consume)."""
+        bucket = LLMChat._shared_kv_cache_memory.get(str(consumer_node_id)) or {}
+        base_kv_full = bucket.get("base_kv_full")
+        if base_kv_full is None:
+            return False
+
+        input_ids = ph_token_ids.get("input_ids")
+        if input_ids is None or int(input_ids.shape[-1]) <= 0:
+            return False
+
+        slot_start = int(slot_token_start)
+        real_ids = input_ids[:, drop_num:] if drop_num else input_ids
+        real_len = int(real_ids.shape[-1])
+        if real_len <= 0:
+            return False
+
+        attn_len = slot_start + real_len
+        attention_mask = torch.ones(1, attn_len, dtype=torch.long, device=self.model.device)
+
+        with torch.no_grad():
+            with LLMChat._model_lock:
+                past_kv = base_kv_full.slice(start=0, end=slot_start)
+                output = self.model(
+                    input_ids=real_ids.to(self.model.device),
+                    attention_mask=attention_mask,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    return_dict=True,
+                )
+        full_kv = output.past_key_values
+        ctx_slice = full_kv.slice(start=slot_start, end=slot_start + real_len)
+        ctx_relative = self.kv_engine.apply_rotary_pos_emb(
+            ctx_slice,
+            offset=-slot_start,
+            drop_num=0,
+        )
+        token_dict = {
+            "input_ids": real_ids.to(self.model.device),
+            "attention_mask": torch.ones_like(real_ids).to(self.model.device),
+        }
+        self._get_store_registry().llm_branch_slots.put_consumer(
+            consumer_node_id=str(consumer_node_id),
+            message_key=str(message_key),
+            ph_id=str(ph_id),
+            content_hash=str(content_hash),
+            absolute_kv=ctx_relative,
+            token_ids=token_dict,
+            slot_token_start=slot_start,
+            turn_index=int(turn_index),
+            drop_num=0,
+        )
+        return True
+
+    def resolve_tool_consumer_slot(self, ph_id: str, message_key: str):
+        stores = self._get_store_registry()
+        turn_slot = self.resolve_turn_ph_slot(ph_id, message_key)
+        if turn_slot is None or not turn_slot.kv_ref:
+            return stores.tool_consumer_slots.find_consumer_for_ph(
+                str(self.node_id),
+                str(message_key),
+                str(ph_id),
+            )
+        bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        from sidecar.stores.prefix_spans import normalize_placeholder_info
+
+        ph_info = normalize_placeholder_info(bucket.get("placeholder_info"))
+        rec = ph_info.get(str(ph_id)) or {}
+        slot_start = int(rec.get("start", -1))
+        if slot_start >= 0:
+            hit = stores.tool_consumer_slots.get_consumer(
+                str(self.node_id),
+                str(message_key),
+                str(ph_id),
+                str(turn_slot.content_hash),
+                slot_start,
+            )
+            if hit is not None:
+                return hit
+        return stores.tool_consumer_slots.find_consumer_for_ph(
+            str(self.node_id),
+            str(message_key),
+            str(ph_id),
+        )
+
+    def resolve_llm_branch_slot(self, ph_id: str, message_key: str):
+        stores = self._get_store_registry()
+        turn_slot = self.resolve_turn_ph_slot(ph_id, message_key)
+        content_hash = turn_slot.content_hash if turn_slot is not None else None
+        bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        from sidecar.stores.prefix_spans import normalize_placeholder_info
+
+        ph_info = normalize_placeholder_info(bucket.get("placeholder_info"))
+        rec = ph_info.get(str(ph_id)) or {}
+        slot_start = int(rec.get("start", -1))
+        if content_hash and slot_start >= 0:
+            hit = stores.llm_branch_slots.get_consumer(
+                str(self.node_id),
+                str(message_key),
+                str(ph_id),
+                str(content_hash),
+                slot_start,
+            )
+            if hit is not None:
+                return hit
+        return stores.llm_branch_slots.find_consumer_for_ph(
+            str(self.node_id),
+            str(message_key),
+            str(ph_id),
+        )
+
+    async def _ensure_tool_consumer_slots(
+        self,
+        message: str,
+        meta: List[Dict[str, Any]],
+        *,
+        tail_only_ph_ids: set[str] | None = None,
+    ) -> None:
+        stores = self._get_store_registry()
+        bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        materialized = bucket.setdefault("_tool_consumer_materialized", {}).setdefault(str(message), set())
+        tasks: list[tuple] = []
+
+        for m in meta:
+            ph_id = str(m["ph_id"])
+            if not ph_id.startswith("turn_") or not ph_id.endswith("_tool"):
+                continue
+            if tail_only_ph_ids is not None and ph_id not in tail_only_ph_ids and ph_id in materialized:
+                continue
+
+            turn_slot = self.resolve_turn_ph_slot(ph_id, message)
+            if turn_slot is None or not turn_slot.kv_ref:
+                continue
+            tool_entry = stores.tool_kv.get(str(turn_slot.kv_ref))
+            if tool_entry is None or not isinstance(tool_entry.token_ids, dict):
+                continue
+
+            slot_start = int(m["start"])
+            existing = stores.tool_consumer_slots.get_consumer(
+                str(self.node_id),
+                str(message),
+                ph_id,
+                str(turn_slot.content_hash),
+                slot_start,
+            )
+            if existing is not None:
+                materialized.add(ph_id)
+                continue
+
+            tasks.append(
+                (
+                    str(self.node_id),
+                    str(message),
+                    ph_id,
+                    slot_start,
+                    tool_entry.token_ids,
+                    str(turn_slot.content_hash),
+                    str(turn_slot.kv_ref),
+                    int(turn_slot.turn_index),
+                    str(turn_slot.tool_call_hash or ""),
+                    int(m.get("drop_num") or 0),
+                )
+            )
+
+        if not tasks:
+            return
+
+        def _run_batch():
+            for args in tasks:
+                ok = self._materialize_tool_consumer_slot_sync(
+                    consumer_node_id=args[0],
+                    message_key=args[1],
+                    ph_id=args[2],
+                    slot_token_start=args[3],
+                    ph_token_ids=args[4],
+                    content_hash=args[5],
+                    kv_ref=args[6],
+                    turn_index=args[7],
+                    tool_call_hash=args[8],
+                    drop_num=args[9],
+                )
+                if ok:
+                    materialized.add(args[2])
+                    consumer_key = stores.tool_consumer_slots.consumer_key(
+                        args[0], args[1], args[2], args[5], args[3]
+                    )
+                    turn_slot = stores.turn_slots.get(args[0], args[1], args[2])
+                    if turn_slot is not None and turn_slot.consumer_slot_key != consumer_key:
+                        from dataclasses import replace
+
+                        stores.turn_slots.put(
+                            replace(turn_slot, consumer_slot_key=consumer_key)
+                        )
+
+        await asyncio.to_thread(_run_batch)
+
+    async def _ensure_llm_branch_slots(
+        self,
+        message: str,
+        meta: List[Dict[str, Any]],
+        *,
+        tail_only_ph_ids: set[str] | None = None,
+    ) -> None:
+        stores = self._get_store_registry()
+        bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        materialized = bucket.setdefault("_branch_consumer_materialized", {}).setdefault(str(message), set())
+        tasks: list[tuple] = []
+
+        for m in meta:
+            ph_id = str(m["ph_id"])
+            if not ph_id.startswith("turn_") or not ph_id.endswith("_assistant"):
+                continue
+            if tail_only_ph_ids is not None and ph_id not in tail_only_ph_ids and ph_id in materialized:
+                continue
+
+            turn_slot = self.resolve_turn_ph_slot(ph_id, message)
+            if turn_slot is None:
+                continue
+            token_ids = turn_slot.token_ids
+            if not isinstance(token_ids, dict) or token_ids.get("input_ids") is None:
+                ph_cache_ids = m.get("ph_cache_ids")
+                if isinstance(ph_cache_ids, dict):
+                    token_ids = ph_cache_ids
+            if not isinstance(token_ids, dict) or token_ids.get("input_ids") is None:
+                continue
+
+            slot_start = int(m["start"])
+            existing = stores.llm_branch_slots.get_consumer(
+                str(self.node_id),
+                str(message),
+                ph_id,
+                str(turn_slot.content_hash),
+                slot_start,
+            )
+            if existing is not None:
+                materialized.add(ph_id)
+                continue
+
+            tasks.append(
+                (
+                    str(self.node_id),
+                    str(message),
+                    ph_id,
+                    slot_start,
+                    token_ids,
+                    str(turn_slot.content_hash),
+                    int(turn_slot.turn_index),
+                    int(m.get("drop_num") or 0),
+                )
+            )
+
+        if not tasks:
+            return
+
+        def _run_batch():
+            for args in tasks:
+                ok = self._materialize_llm_branch_slot_sync(
+                    consumer_node_id=args[0],
+                    message_key=args[1],
+                    ph_id=args[2],
+                    slot_token_start=args[3],
+                    ph_token_ids=args[4],
+                    content_hash=args[5],
+                    turn_index=args[6],
+                    drop_num=args[7],
+                )
+                if ok:
+                    materialized.add(args[2])
+                    branch_key = stores.llm_branch_slots.consumer_key(
+                        args[0], args[1], args[2], args[5], args[3]
+                    )
+                    turn_slot = stores.turn_slots.get(args[0], args[1], args[2])
+                    if turn_slot is not None and turn_slot.branch_slot_key != branch_key:
+                        from dataclasses import replace
+
+                        stores.turn_slots.put(
+                            replace(turn_slot, branch_slot_key=branch_key)
+                        )
+
+        await asyncio.to_thread(_run_batch)
+
     def _resolve_base_caches_for_dense_anchor(
         self,
         ph_id_list: List[str],
@@ -2244,11 +2621,20 @@ class LLMChat(LLM):
         cum_offset = 0
         ph_cum_len = 0
         for m in meta:
-            slot = self.resolve_upstream_agent_slot(str(m["ph_id"]), message)
-            if slot is not None and slot.materialization == "consumer_contextual":
+            ph_id = str(m["ph_id"])
+            if ph_id.startswith("turn_") and ph_id.endswith("_tool"):
+                slot = self.resolve_tool_consumer_slot(ph_id, message)
+            elif ph_id.startswith("turn_") and ph_id.endswith("_assistant"):
+                slot = self.resolve_llm_branch_slot(ph_id, message)
+            else:
+                slot = self.resolve_upstream_agent_slot(ph_id, message)
+            if slot is not None and getattr(slot, "materialization", "") in (
+                "consumer_contextual",
+                "producer_contextual",
+            ):
                 m["ph_cache"] = slot.absolute_kv
                 m["ph_cache_ids"] = slot.token_ids
-                m["drop_num"] = int(slot.drop_num)
+                m["drop_num"] = int(getattr(slot, "drop_num", 0))
             ph_cache = m["ph_cache"]
             drop_num = int(m.get("drop_num") or 0)
             real_len = int(ph_cache._seen_tokens - drop_num)
@@ -2283,7 +2669,7 @@ class LLMChat(LLM):
         message_key: str,
         turn_content: Dict[str, str],
     ) -> None:
-        """Materialize KV caches for completed assistant/tool turn placeholders."""
+        """Produce global tool KV + turn slot pointers (consume at generation)."""
         if not turn_content:
             return
 
@@ -2291,17 +2677,21 @@ class LLMChat(LLM):
         from sidecar.stores.turn_slot_registry import TurnPhSlot
 
         stores = self._get_store_registry()
-        mem = LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
+        LLMChat._shared_kv_cache_memory.setdefault(node_id, {})
+
+        assistant_by_turn: dict[int, str] = {}
+        for ph_id, content in turn_content.items():
+            if not str(ph_id).startswith("turn_") or not str(ph_id).endswith("_assistant"):
+                continue
+            idx = self._turn_index_from_ph_id(str(ph_id))
+            assistant_by_turn[idx] = str(content).strip() or " "
 
         for ph_id, content in turn_content.items():
             if not ph_id.startswith("turn_"):
                 continue
             content_str = str(content).strip() or " "
             content_hash = sha256_text(content_str)
-            turn_index = 0
-            parts = ph_id.split("_")
-            if len(parts) >= 2 and parts[1].isdigit():
-                turn_index = int(parts[1])
+            turn_index = self._turn_index_from_ph_id(str(ph_id))
 
             existing_slot = stores.turn_slots.get(node_id, message_key, ph_id)
             if existing_slot is not None and existing_slot.content_hash == content_hash:
@@ -2309,21 +2699,58 @@ class LLMChat(LLM):
 
             is_tool = ph_id.endswith("_tool")
             if is_tool:
-                lookup = stores.tool_semantic.lookup(content_str, content_hash=content_hash)
+                asst_text = assistant_by_turn.get(turn_index, "")
+                tool_call_hash = sha256_text(asst_text) if asst_text else ""
+                lookup = stores.tool_semantic.lookup(
+                    asst_text or content_str,
+                    content_hash=content_hash,
+                )
+                tool_entry = None
                 if lookup.hit and lookup.kv_ref:
-                    tool_entry = stores.tool_kv.get(lookup.kv_ref)
-                else:
+                    tool_entry = stores.tool_kv.get(str(lookup.kv_ref))
+                if tool_entry is None:
                     tool_entry = stores.tool_kv.get_or_create(
                         content_str,
                         self._forward_text_to_kv_sync,
+                        tool_call_hash=tool_call_hash,
                     )
                     stores.tool_semantic.upsert(
-                        query=content_str,
+                        query=asst_text or content_str,
                         kv_ref=tool_entry.kv_ref,
                         content_hash=tool_entry.content_hash,
                         ph_id_hint=ph_id,
                         token_len=tool_entry.token_len,
                     )
+                consumer_key = ""
+                bucket = LLMChat._shared_kv_cache_memory.get(str(node_id)) or {}
+                from sidecar.stores.prefix_spans import normalize_placeholder_info
+
+                ph_info = normalize_placeholder_info(bucket.get("placeholder_info"))
+                rec = ph_info.get(str(ph_id)) or {}
+                slot_start = int(rec.get("start", -1))
+                if (
+                    slot_start >= 0
+                    and isinstance(tool_entry.token_ids, dict)
+                    and bucket.get("base_kv_full") is not None
+                ):
+                    if self._materialize_tool_consumer_slot_sync(
+                        consumer_node_id=str(node_id),
+                        message_key=str(message_key),
+                        ph_id=str(ph_id),
+                        slot_token_start=slot_start,
+                        ph_token_ids=tool_entry.token_ids,
+                        content_hash=content_hash,
+                        kv_ref=str(tool_entry.kv_ref),
+                        turn_index=turn_index,
+                        tool_call_hash=tool_call_hash,
+                    ):
+                        consumer_key = stores.tool_consumer_slots.consumer_key(
+                            str(node_id),
+                            str(message_key),
+                            str(ph_id),
+                            content_hash,
+                            slot_start,
+                        )
                 stores.turn_slots.put(
                     TurnPhSlot(
                         node_id=str(node_id),
@@ -2332,6 +2759,8 @@ class LLMChat(LLM):
                         slot_kind="tool",
                         content_hash=content_hash,
                         kv_ref=tool_entry.kv_ref,
+                        consumer_slot_key=consumer_key or None,
+                        tool_call_hash=tool_call_hash,
                         token_ids=tool_entry.token_ids,
                         drop_num=0,
                         turn_index=turn_index,
@@ -2339,7 +2768,38 @@ class LLMChat(LLM):
                 )
                 continue
 
-            kv_cache, token_ids = await asyncio.to_thread(self._forward_text_to_kv_sync, content_str)
+            token_ids: dict = {}
+            if existing_slot is not None and isinstance(existing_slot.token_ids, dict):
+                token_ids = existing_slot.token_ids
+            else:
+                _kv, token_ids = await asyncio.to_thread(
+                    self._forward_text_to_kv_sync,
+                    content_str,
+                )
+            branch_key = None
+            bucket = LLMChat._shared_kv_cache_memory.get(str(node_id)) or {}
+            from sidecar.stores.prefix_spans import normalize_placeholder_info
+
+            ph_info = normalize_placeholder_info(bucket.get("placeholder_info"))
+            rec = ph_info.get(str(ph_id)) or {}
+            slot_start = int(rec.get("start", -1))
+            if slot_start >= 0 and token_ids.get("input_ids") is not None and bucket.get("base_kv_full"):
+                if self._materialize_llm_branch_slot_sync(
+                    consumer_node_id=str(node_id),
+                    message_key=str(message_key),
+                    ph_id=str(ph_id),
+                    slot_token_start=slot_start,
+                    ph_token_ids=token_ids,
+                    content_hash=content_hash,
+                    turn_index=turn_index,
+                ):
+                    branch_key = stores.llm_branch_slots.consumer_key(
+                        str(node_id),
+                        str(message_key),
+                        str(ph_id),
+                        content_hash,
+                        slot_start,
+                    )
             stores.turn_slots.put(
                 TurnPhSlot(
                     node_id=str(node_id),
@@ -2347,7 +2807,7 @@ class LLMChat(LLM):
                     ph_id=str(ph_id),
                     slot_kind="assistant",
                     content_hash=content_hash,
-                    absolute_kv=kv_cache,
+                    branch_slot_key=branch_key,
                     token_ids=token_ids,
                     drop_num=0,
                     turn_index=turn_index,
@@ -3067,17 +3527,26 @@ class LLMChat(LLM):
             ph_cum_len += real_len
             ph_id_list.append(ph_id)
 
-        if mode == "kv_reuse":
-            from sidecar.stores.topology_anchor import new_tail_placeholder_ids
+        from sidecar.stores.topology_anchor import new_tail_placeholder_ids
 
-            prev_ph = (prefix_store.get("_prev_placeholder_info") or {}) if isinstance(prefix_store, dict) else {}
-            tail_ph_ids = new_tail_placeholder_ids(prev_ph, placeholder_info_norm)
-            await self._ensure_consumer_upstream_agent_slots(
-                message,
-                meta,
-                tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
-            )
-            self._refresh_meta_from_upstream_slots(message, meta)
+        prev_ph = (prefix_store.get("_prev_placeholder_info") or {}) if isinstance(prefix_store, dict) else {}
+        tail_ph_ids = new_tail_placeholder_ids(prev_ph, placeholder_info_norm)
+        await self._ensure_consumer_upstream_agent_slots(
+            message,
+            meta,
+            tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
+        )
+        await self._ensure_tool_consumer_slots(
+            message,
+            meta,
+            tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
+        )
+        await self._ensure_llm_branch_slots(
+            message,
+            meta,
+            tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
+        )
+        self._refresh_meta_from_upstream_slots(message, meta)
 
         reuse_kv_segments: List[Dict[str, Any]] = []
         if mode == "kv_reuse":
@@ -3524,17 +3993,26 @@ class LLMChat(LLM):
             ph_cum_len += real_len
             ph_id_list.append(ph_id)
 
-        if mode == "kv_reuse":
-            from sidecar.stores.topology_anchor import new_tail_placeholder_ids
+        from sidecar.stores.topology_anchor import new_tail_placeholder_ids
 
-            prev_ph = (prefix_store.get("_prev_placeholder_info") or {}) if isinstance(prefix_store, dict) else {}
-            tail_ph_ids = new_tail_placeholder_ids(prev_ph, placeholder_info_norm)
-            await self._ensure_consumer_upstream_agent_slots(
-                message,
-                meta,
-                tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
-            )
-            self._refresh_meta_from_upstream_slots(message, meta)
+        prev_ph = (prefix_store.get("_prev_placeholder_info") or {}) if isinstance(prefix_store, dict) else {}
+        tail_ph_ids = new_tail_placeholder_ids(prev_ph, placeholder_info_norm)
+        await self._ensure_consumer_upstream_agent_slots(
+            message,
+            meta,
+            tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
+        )
+        await self._ensure_tool_consumer_slots(
+            message,
+            meta,
+            tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
+        )
+        await self._ensure_llm_branch_slots(
+            message,
+            meta,
+            tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
+        )
+        self._refresh_meta_from_upstream_slots(message, meta)
 
         reuse_kv_segments: List[Dict[str, Any]] = []
         if mode == "kv_reuse":

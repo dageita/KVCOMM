@@ -165,6 +165,26 @@ def test_write_topology_updates_bucket() -> None:
     assert bucket["topology_id"].endswith(":turns:1")
 
 
+def test_purge_turn_downstream_preserves_tool_kv() -> None:
+    reset_store_registry()
+    stores = get_store_registry()
+    entry = stores.tool_kv.get_or_create("x", lambda t: ({"kv": t}, {"input_ids": [[1]]}))
+    stores.turn_slots.put(
+        TurnPhSlot(
+            node_id="1",
+            message_key="msg",
+            ph_id="turn_0_tool",
+            slot_kind="tool",
+            content_hash=entry.content_hash,
+            kv_ref=entry.kv_ref,
+            turn_index=0,
+        )
+    )
+    stores.purge_turn_downstream(node_id="1", message_key="msg", turn_index=0)
+    assert stores.turn_slots.get("1", "msg", "turn_0_tool") is None
+    assert stores.tool_kv.get(entry.kv_ref) is not None
+
+
 def test_asst_anchor_pool_left_fingerprint() -> None:
     pool = AsstAnchorPool()
     pool.put(

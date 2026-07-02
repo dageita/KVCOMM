@@ -108,6 +108,33 @@ def test_build_pricing_edit_hint_uses_buggy_old_text() -> None:
     assert "return subtotal_cents * (100 - discount_percent)" not in hint.split("newText:")[0]
 
 
+def _agent0_pricing_user_prompt() -> dict:
+    return {
+        "role": "user",
+        "content": (
+            "Output from Agent 0 (Analyzer):\n\n"
+            "```python\n"
+            "def apply_discount(subtotal_cents: int, discount_percent: int) -> int:\n"
+            "    # BUG: this subtracts the raw percent value instead of a percentage of the subtotal.\n"
+            "    return subtotal_cents - discount_percent\n"
+            "```\n"
+        ),
+    }
+
+
+def test_patcher_read_satisfied_when_agent0_quoted_pricing() -> None:
+    messages = [{"role": "user", "content": "task"}, _agent0_pricing_user_prompt()]
+    assert patcher_read_satisfied(messages) is True
+    assert "return subtotal_cents - discount_percent" in latest_pricing_py_content(messages)
+    hint = build_pricing_edit_hint(messages)
+    assert "Do not read again" in hint
+
+
+def test_patcher_read_not_satisfied_without_pricing_context() -> None:
+    messages = [{"role": "user", "content": "task only"}]
+    assert patcher_read_satisfied(messages) is False
+
+
 def _pricing_edit_success_turn() -> list[dict]:
     return [
         {

@@ -53,7 +53,7 @@ def _snapshot_pristine_fixtures(workspace: Path, *, state_dir: Path, asset_packs
     """Cache read-only fixtures outside the agent workspace (agents must not mutate this)."""
     for pack in asset_packs:
         pristine = _bench_pristine_root(state_dir, pack)
-        for name in ("cart.py",):
+        for name in ("cart.py", "normalizer.py"):
             src = workspace / name
             if src.is_file():
                 dst = pristine / name

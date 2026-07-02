@@ -44,6 +44,16 @@ def test_strips_response_block_template_leak() -> None:
     assert "read" in cleaned
 
 
+def test_strips_same_tool_spam() -> None:
+    line = "Do not use the same tool more than once unless necessary."
+    raw = (
+        "If multiple steps are needed, make one tool call per step. Do not combine multiple actions in one tool call.\n"
+        + "\n".join([line] * 10)
+    )
+    cleaned = sanitize_generation_text(raw)
+    assert cleaned.count(line) <= 2
+
+
 def test_strips_tool_guideline_preamble() -> None:
     raw = (
         "If multiple actions are needed, make separate tool calls in sequence.\n"

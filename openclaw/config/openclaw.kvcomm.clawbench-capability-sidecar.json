@@ -57,7 +57,7 @@
     },
     "subagents": {
       "tools": {
-        "allow": ["read", "write", "edit", "apply_patch", "exec", "process", "session_status"]
+        "allow": ["read", "write", "edit", "apply_patch", "exec", "process", "browser", "session_status"]
       }
     }
   },
