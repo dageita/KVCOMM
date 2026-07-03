@@ -19,6 +19,7 @@ from sidecar.bench_prompt_compose import (
     is_add_tests_normalizer_task,
     is_browser_family_task,
     is_bugfix_discount_task,
+    is_config_loader_task,
     is_quick_note_task,
     tool_constraints_for_context,
 )
@@ -31,6 +32,9 @@ from sidecar.openclaw_prefix import (
     missing_analyzer_reads,
     normalize_run_specific_paths,
     build_pricing_edit_hint,
+    build_config_loader_analyzer_read_hint,
+    build_config_loader_edit_hint,
+    build_config_loader_edit_message,
     browser_exploration_satisfied,
     browser_patcher_edit_applied_in_messages,
     browser_patcher_read_satisfied,
@@ -38,6 +42,13 @@ from sidecar.openclaw_prefix import (
     browser_verifier_exec_passed,
     build_browser_appjs_edit_hint,
     build_browser_verifier_exec_hint,
+    config_loader_analyzer_reads_satisfied,
+    config_loader_missing_analyzer_reads,
+    config_loader_patcher_fix_satisfied,
+    config_loader_patcher_read_satisfied,
+    config_loader_verifier_should_force_edit,
+    config_loader_verifier_should_force_exec,
+    config_loader_verifier_should_force_read,
     normalizer_analyzer_read_satisfied,
     normalizer_patcher_read_satisfied,
     normalizer_tests_ready,
@@ -71,6 +82,7 @@ from sidecar.tool_bridge import (
     sse_tool_call_deltas,
     sync_clawbench_browser_default_to_chain,
     sync_clawbench_browser_workspaces,
+    sync_clawbench_config_loader_default_to_chain,
     tool_bridge_buffered_sse_enabled,
 )
 
@@ -78,6 +90,7 @@ KVCOMM_META_RE = re.compile(r"<!--KVCOMM_META:(\{.*?\})-->", re.DOTALL)
 SIDECAR_VERSION = "0.2.0-kvcomm-engine"
 _CLAWBENCH_TEXT_ONLY_MAX_TOKENS = 96
 _CLAWBENCH_TOOL_CONTINUATION_MAX_TOKENS = 128
+_CONFIG_LOADER_PYTEST_CMD = "PYTHONPATH=. python -m pytest -q tests/test_config_loader.py"
 
 
 def _anchor_pool_key(node_id: str, message_key: str) -> str:
@@ -160,6 +173,52 @@ _browser_tool_emit_count: dict[str, int] = {}
 
 def _browser_emit_key(run_id: str, agent_index: str) -> str:
     return f"{run_id}:{agent_index}"
+
+
+def _emitted_tool_call_key(entry: dict[str, Any]) -> str:
+    name = str(entry.get("name") or "")
+    payload = entry.get("input") if isinstance(entry.get("input"), dict) else {}
+    return f"{name}:{json.dumps(payload, sort_keys=True, ensure_ascii=False)}"
+
+
+def _tool_call_to_emitted_record(call: dict[str, Any]) -> dict[str, Any] | None:
+    fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+    name = str(fn.get("name") or "").strip()
+    if not name:
+        return None
+    args_raw = fn.get("arguments")
+    input_obj: dict[str, Any] = {}
+    if isinstance(args_raw, str) and args_raw.strip():
+        try:
+            parsed = json.loads(args_raw)
+            if isinstance(parsed, dict):
+                input_obj = parsed
+        except json.JSONDecodeError:
+            input_obj = {}
+    elif isinstance(args_raw, dict):
+        input_obj = dict(args_raw)
+    return {"name": name, "input": input_obj}
+
+
+def _append_emitted_tool_calls(metrics: dict[str, Any], message: dict[str, Any]) -> None:
+    """Persist sidecar-emitted tool calls for bench trajectory scoring."""
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return
+    emitted: list[dict[str, Any]] = list(metrics.get("emitted_tool_calls") or [])
+    seen = {_emitted_tool_call_key(entry) for entry in emitted}
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        entry = _tool_call_to_emitted_record(call)
+        if entry is None:
+            continue
+        key = _emitted_tool_call_key(entry)
+        if key in seen:
+            continue
+        seen.add(key)
+        emitted.append(entry)
+    metrics["emitted_tool_calls"] = emitted
 
 
 def _browser_agent_exploration_done(
@@ -1222,6 +1281,17 @@ def _accumulate_agent_metrics(
         out["kv_reuse_request_count"] = int(existing.get("kv_reuse_request_count", 0)) + (1 if is_kv else 0)
         out["dense_request_count"] = int(existing.get("dense_request_count", 0)) + (1 if is_dense else 0)
         out["blend_fallback_count"] = int(existing.get("blend_fallback_count", 0)) + (1 if blend_fb else 0)
+        merged_emitted: list[dict[str, Any]] = list(existing.get("emitted_tool_calls") or [])
+        seen = {_emitted_tool_call_key(entry) for entry in merged_emitted}
+        for entry in latest.get("emitted_tool_calls") or []:
+            if not isinstance(entry, dict):
+                continue
+            key = _emitted_tool_call_key(entry)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_emitted.append(entry)
+        out["emitted_tool_calls"] = merged_emitted
 
     total = int(out.get("sidecar_request_count", 1))
     kv_count = int(out.get("kv_reuse_request_count", 0))
@@ -1971,6 +2041,7 @@ class KvcommEngineAdapter:
         *,
         model: str,
         openai_tools: list[dict[str, Any]] | None = None,
+        config_loader_edit_fallback: bool = False,
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
         if ctx.task_profile == "clawbench":
             self._snapshot_anchors(llm, ctx.run_id, ctx.agent_index, ctx.message_key)
@@ -1996,7 +2067,33 @@ class KvcommEngineAdapter:
             input_anchor_meta=input_anchor_meta,
         )
         metric_key = f"{ctx.run_id}:{ctx.agent_index}"
-        metrics = _accumulate_agent_metrics(self._request_metrics.get(metric_key), metrics)
+        if openai_tools:
+            message = openai_message_from_generation(
+                result.text,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                workspace_dir=str((ctx.vars or {}).get("workspace_dir") or ""),
+                task_vars=dict(ctx.vars or {}),
+            )
+            if config_loader_edit_fallback and not (message.get("tool_calls") or []):
+                message = build_config_loader_edit_message()
+                logger.debug(
+                    "[tool-bridge] run_id={} agent={} config-loader edit parse failed — injecting canonical edit",
+                    ctx.run_id,
+                    ctx.agent_index,
+                )
+            _note_browser_tool_emission(ctx.run_id, ctx.agent_index, message)
+            request_metrics = dict(metrics)
+            _append_emitted_tool_calls(request_metrics, message)
+            metrics = _accumulate_agent_metrics(self._request_metrics.get(metric_key), request_metrics)
+            metrics["tool_bridge"] = True
+            metrics["tool_calls_count"] = len(message.get("tool_calls") or [])
+        else:
+            metrics = _accumulate_agent_metrics(self._request_metrics.get(metric_key), metrics)
+            message = {
+                "role": "assistant",
+                "content": sanitize_generation_text(result.text or ""),
+            }
         self._request_metrics[metric_key] = metrics
         self._sessions.setdefault(ctx.run_id, {})[ctx.agent_index] = metrics
 
@@ -2008,22 +2105,6 @@ class KvcommEngineAdapter:
             "X-KVCOMM-TTFT-Ms": str(metrics.get("ttft_ms")),
             "X-KVCOMM-Generation-TTFT-Ms": str(metrics.get("generation_ttft_ms") or ""),
         }
-        if openai_tools:
-            message = openai_message_from_generation(
-                result.text,
-                task_profile=ctx.task_profile,
-                task_id=ctx.task_id,
-                workspace_dir=str((ctx.vars or {}).get("workspace_dir") or ""),
-                task_vars=dict(ctx.vars or {}),
-            )
-            _note_browser_tool_emission(ctx.run_id, ctx.agent_index, message)
-            metrics["tool_bridge"] = True
-            metrics["tool_calls_count"] = len(message.get("tool_calls") or [])
-        else:
-            message = {
-                "role": "assistant",
-                "content": sanitize_generation_text(result.text or ""),
-            }
         return _openai_completion(message, model, metrics), resp_headers, metrics
 
     async def check_request(
@@ -2068,6 +2149,7 @@ class KvcommEngineAdapter:
         bugfix_bridge = ctx.task_profile == "clawbench" and is_bugfix_discount_task(ctx)
         quick_note_bridge = ctx.task_profile == "clawbench" and is_quick_note_task(ctx)
         normalizer_bridge = ctx.task_profile == "clawbench" and is_add_tests_normalizer_task(ctx)
+        config_loader_bridge = ctx.task_profile == "clawbench" and is_config_loader_task(ctx)
         browser_bridge = ctx.task_profile == "clawbench" and is_browser_family_task(ctx)
         chain_workspace = str((ctx.vars or {}).get("workspace_dir") or "")
         if browser_bridge and chain_workspace:
@@ -2116,6 +2198,59 @@ class KvcommEngineAdapter:
             browser_bridge
             and agent_idx == 2
             and not browser_verifier_exec_done(messages)
+        )
+        force_config_loader_analyzer_done = (
+            config_loader_bridge
+            and agent_idx == 0
+            and config_loader_analyzer_reads_satisfied(messages)
+        )
+        force_config_loader_analyzer_read = (
+            config_loader_bridge
+            and agent_idx == 0
+            and not config_loader_analyzer_reads_satisfied(messages)
+        )
+        force_config_loader_patcher_done = (
+            config_loader_bridge
+            and agent_idx == 1
+            and config_loader_patcher_fix_satisfied(messages)
+            and verifier_exec_pytest_done(messages)
+        )
+        force_config_loader_patcher_pytest = (
+            config_loader_bridge
+            and agent_idx == 1
+            and config_loader_patcher_fix_satisfied(messages)
+            and not verifier_exec_pytest_done(messages)
+        )
+        force_config_loader_patcher_read = (
+            config_loader_bridge
+            and agent_idx == 1
+            and not config_loader_patcher_read_satisfied(messages)
+        )
+        force_config_loader_edit_only = (
+            config_loader_bridge
+            and agent_idx == 1
+            and config_loader_patcher_read_satisfied(messages)
+            and not config_loader_patcher_fix_satisfied(messages)
+        )
+        force_config_loader_verifier_pass = (
+            config_loader_bridge
+            and agent_idx == 2
+            and verifier_pytest_passed(messages)
+        )
+        force_config_loader_verifier_exec = (
+            config_loader_bridge
+            and agent_idx == 2
+            and config_loader_verifier_should_force_exec(messages)
+        )
+        force_config_loader_verifier_edit = (
+            config_loader_bridge
+            and agent_idx == 2
+            and config_loader_verifier_should_force_edit(messages)
+        )
+        force_config_loader_verifier_read = (
+            config_loader_bridge
+            and agent_idx == 2
+            and config_loader_verifier_should_force_read(messages)
         )
         force_text_only = (
             bugfix_bridge
@@ -2219,6 +2354,7 @@ class KvcommEngineAdapter:
             and quick_note_write_satisfied(messages)
         )
         analyzer_cart_hint = None
+        config_loader_read_hint = None
         if (
             bugfix_bridge
             and agent_idx == 0
@@ -2228,6 +2364,11 @@ class KvcommEngineAdapter:
             analyzer_cart_hint = (
                 "\npricing.py is already in context above. "
                 "Read cart.py next — do not re-read pricing.py.\n"
+            )
+        if config_loader_bridge and agent_idx == 0 and openai_tools:
+            missing_reads = config_loader_missing_analyzer_reads(messages)
+            config_loader_read_hint = build_config_loader_analyzer_read_hint(
+                missing_reads, soft=True
             )
         if force_browser_analyzer_done:
             openai_tools = None
@@ -2384,6 +2525,234 @@ class KvcommEngineAdapter:
             ) + exec_hint
             logger.debug(
                 "[tool-bridge] run_id={} agent=2 browser task — forcing exec-only verify_form",
+                ctx.run_id,
+            )
+        elif force_config_loader_analyzer_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nconfig_loader.py, app_config.py, and tests/test_config_loader.py are already in context above. "
+                "Output your Agent 0 analysis in plain text: explain the config precedence and validation bugs. "
+                "Do not call read or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 config-loader reads satisfied — forcing text-only",
+                ctx.run_id,
+            )
+        elif force_config_loader_analyzer_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            missing_reads = config_loader_missing_analyzer_reads(messages)
+            read_hint = build_config_loader_analyzer_read_hint(missing_reads)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + read_hint
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 config-loader missing reads={} — forcing read-only",
+                ctx.run_id,
+                sorted(missing_reads),
+            )
+        elif force_config_loader_patcher_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nconfig_loader.py fix and pytest are complete. "
+                "Reply with one short line starting with DONE summarizing the fix. "
+                "Do not call edit, read, exec, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 config-loader patcher fix satisfied — forcing text-only DONE",
+                ctx.run_id,
+            )
+        elif force_config_loader_patcher_pytest:
+            sync_clawbench_config_loader_default_to_chain(workspace_dir=chain_workspace)
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            exec_hint = (
+                "\nconfig_loader.py fix is applied. Call exec with command "
+                f"`{_CONFIG_LOADER_PYTEST_CMD}` and workdir `.` "
+                "(not ~/.openclaw/workspace). Never set elevated: true.\n"
+            )
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + exec_hint
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 config-loader fix satisfied — forcing exec-only pytest",
+                ctx.run_id,
+            )
+        elif force_config_loader_verifier_pass:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\npytest passed. Reply PASS in plain text summarizing verification. "
+                "Do not call exec, read, edit, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 config-loader pytest passed — forcing text-only PASS",
+                ctx.run_id,
+            )
+        elif force_config_loader_verifier_exec:
+            sync_clawbench_config_loader_default_to_chain(workspace_dir=chain_workspace)
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            exec_hint = (
+                "\nRun pytest now. Call exec with command "
+                f"`{_CONFIG_LOADER_PYTEST_CMD}` and workdir `.`. "
+                "Do not read config_loader.py first — run tests first. "
+                "Never set elevated: true.\n"
+            )
+            if config_loader_patcher_read_satisfied(messages):
+                exec_hint = (
+                    "\nconfig_loader.py is already in context above. "
+                    "Do not read again. Call exec with command "
+                    f"`{_CONFIG_LOADER_PYTEST_CMD}` and workdir `.` only.\n"
+                )
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + exec_hint
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 config-loader forcing exec-only pytest",
+                ctx.run_id,
+            )
+        elif force_config_loader_verifier_edit:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "edit"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "edit"}}
+            edit_hint = build_config_loader_edit_hint(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + edit_hint
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 config-loader verifier forcing edit-only",
+                ctx.run_id,
+            )
+        elif force_config_loader_verifier_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            read_hint = (
+                "\npytest failed. Call read on config_loader.py once to inspect load_config, "
+                "then you will edit on the next turn.\n"
+            )
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + read_hint
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 config-loader pytest failed — forcing read",
+                ctx.run_id,
+            )
+        elif force_config_loader_patcher_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            read_hint = (
+                "\nStep 1: call read on config_loader.py first. "
+                "Do not output analysis text — only a read tool call.\n"
+            )
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + read_hint
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 config-loader patcher must read — forcing read-only",
+                ctx.run_id,
+            )
+        elif force_config_loader_edit_only:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "edit"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "edit"}}
+            edit_hint = build_config_loader_edit_hint(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + edit_hint
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 config-loader patcher read satisfied — forcing edit-only",
                 ctx.run_id,
             )
         elif force_text_only:
@@ -2786,6 +3155,12 @@ class KvcommEngineAdapter:
                     "[tool-bridge] run_id={} agent=0 pricing read done — hint read cart.py",
                     ctx.run_id,
                 )
+            if config_loader_read_hint:
+                tool_injection_text += config_loader_read_hint
+                logger.debug(
+                    "[tool-bridge] run_id={} agent=0 config-loader partial reads — sequential read hint",
+                    ctx.run_id,
+                )
             logger.debug(
                 "[tool-bridge] run_id={} agent={} tools={} choice={}",
                 ctx.run_id,
@@ -2793,9 +3168,9 @@ class KvcommEngineAdapter:
                 [str((t.get("function") or {}).get("name") or "") for t in openai_tools],
                 tool_choice,
             )
-        elif analyzer_cart_hint:
+        elif analyzer_cart_hint or config_loader_read_hint:
             logger.debug(
-                "[tool-bridge] run_id={} agent=0 pricing read done — hint read cart.py (no inject)",
+                "[tool-bridge] run_id={} agent=0 partial reads — hint next file (no inject)",
                 ctx.run_id,
             )
         elif isinstance(body.get("tools"), list) and body.get("tools"):
@@ -2836,6 +3211,10 @@ class KvcommEngineAdapter:
             started,
             model=model,
             openai_tools=openai_tools,
+            config_loader_edit_fallback=(
+                config_loader_bridge
+                and (force_config_loader_edit_only or force_config_loader_verifier_edit)
+            ),
         )
         return payload, resp_headers
 

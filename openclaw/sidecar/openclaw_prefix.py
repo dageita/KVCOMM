@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -702,8 +703,8 @@ def verifier_exec_pytest_done(messages: list[dict[str, Any]]) -> bool:
     return any("pytest" in command.lower() for command in _iter_exec_calls_from_messages(messages))
 
 
-def verifier_pytest_passed(messages: list[dict[str, Any]]) -> bool:
-    """True when the latest pytest exec result indicates all tests passed."""
+def last_pytest_exec_body(messages: list[dict[str, Any]]) -> str:
+    """Return the tool result body from the most recent pytest exec call."""
     last_pytest_body = ""
     i = 0
     while i < len(messages):
@@ -732,6 +733,28 @@ def verifier_pytest_passed(messages: list[dict[str, Any]]) -> bool:
             result_idx += 1
             j += 1
         i = j if j > i + 1 else i + 1
+    return last_pytest_body
+
+
+def pytest_collection_or_import_failed(messages: list[dict[str, Any]]) -> bool:
+    """True when the latest pytest exec failed during collection/import (not assertion failures)."""
+    body = last_pytest_exec_body(messages)
+    if not body:
+        return False
+    lowered = body.lower()
+    if re.search(r"\b\d+\s+failed\b", lowered):
+        return False
+    return (
+        "modulenotfounderror" in lowered
+        or "importerror while importing" in lowered
+        or "error collecting" in lowered
+        or "interrupted: 1 error during collection" in lowered
+    )
+
+
+def verifier_pytest_passed(messages: list[dict[str, Any]]) -> bool:
+    """True when the latest pytest exec result indicates all tests passed."""
+    last_pytest_body = last_pytest_exec_body(messages)
     if not last_pytest_body:
         return False
     lowered = last_pytest_body.lower()
@@ -827,6 +850,70 @@ def build_pricing_edit_hint(messages: list[dict[str, Any]]) -> str:
         f"newText: {new_line!r}. "
         "Do not read again. One edit call only.\n"
     )
+
+
+_CONFIG_LOADER_BUGGY_BLOCK = (
+    '    if "APP_PORT" in os.environ and path:\n'
+    '        config["port"] = json.loads(Path(path).read_text(encoding="utf-8")).get("port", DEFAULTS["port"])\n'
+    '    if "APP_DEBUG" in os.environ:\n'
+    '        config["debug"] = os.environ["APP_DEBUG"]'
+)
+_CONFIG_LOADER_FIXED_BLOCK = (
+    '    if "APP_PORT" in os.environ:\n'
+    '        config["port"] = int(os.environ["APP_PORT"])\n'
+    '    elif path:\n'
+    '        config["port"] = json.loads(Path(path).read_text(encoding="utf-8")).get("port", DEFAULTS["port"])\n'
+    '    \n'
+    '    if "APP_DEBUG" in os.environ:\n'
+    '        config["debug"] = os.environ["APP_DEBUG"].lower() == "true"'
+)
+
+
+def config_loader_fix_applied(content: str) -> bool:
+    """True when config_loader.py applies env overrides and boolean debug parsing."""
+    text = content or ""
+    if _CONFIG_LOADER_BUGGY_BLOCK in text:
+        return False
+    return "int(os.environ[\"APP_PORT\"])" in text and '.lower() == "true"' in text
+
+
+def build_config_loader_edit_hint(messages: list[dict[str, Any]]) -> str:
+    """Tool-bridge hint with exact config_loader.py edit oldText/newText."""
+    _ = messages
+    return (
+        "\nconfig_loader.py is in context above. Call edit on config_loader.py with ONE edit. "
+        f"oldText must match read output exactly: {_CONFIG_LOADER_BUGGY_BLOCK!r}. "
+        f"newText: {_CONFIG_LOADER_FIXED_BLOCK!r}. "
+        "Use valid JSON with double-quoted strings in the tool_call. "
+        "Do not read again. One edit call only.\n"
+    )
+
+
+def build_config_loader_edit_message() -> dict[str, Any]:
+    """Canonical OpenAI assistant message for the config-loader patch edit."""
+    arguments = {
+        "path": "config_loader.py",
+        "edits": [
+            {
+                "oldText": _CONFIG_LOADER_BUGGY_BLOCK,
+                "newText": _CONFIG_LOADER_FIXED_BLOCK,
+            }
+        ],
+    }
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": "edit",
+                    "arguments": json.dumps(arguments),
+                },
+            }
+        ],
+    }
 
 
 def _parse_tool_path_from_call(call: dict[str, Any], tool_name: str) -> str:
@@ -1007,6 +1094,150 @@ def missing_analyzer_reads(
 ) -> frozenset[str]:
     """Paths the analyzer still needs to read."""
     return required - completed_read_paths(messages)
+
+
+CONFIG_LOADER_ANALYZER_READS = frozenset({"config_loader.py", "app_config.py", "test_config_loader.py"})
+CONFIG_LOADER_ANALYZER_READ_ORDER = (
+    "config_loader.py",
+    "app_config.py",
+    "test_config_loader.py",
+)
+
+
+def _config_loader_read_target(basename: str) -> str:
+    if basename == "test_config_loader.py":
+        return "tests/test_config_loader.py"
+    return basename
+
+
+def next_config_loader_analyzer_read(missing_reads: frozenset[str]) -> str | None:
+    """Return the basename of the next config-loader analyzer read in canonical order."""
+    for path in CONFIG_LOADER_ANALYZER_READ_ORDER:
+        if path in missing_reads:
+            return path
+    return None
+
+
+def build_config_loader_analyzer_read_hint(
+    missing_reads: frozenset[str],
+    *,
+    soft: bool = False,
+) -> str:
+    """Build the next sequential read hint for the config-loader analyzer."""
+    next_path = next_config_loader_analyzer_read(missing_reads)
+    if next_path is None:
+        return ""
+    target = _config_loader_read_target(next_path)
+    if soft:
+        if next_path == "app_config.py":
+            return (
+                "\nconfig_loader.py is already in context above. "
+                "Read app_config.py next — do not re-read config_loader.py.\n"
+            )
+        if next_path == "test_config_loader.py":
+            return (
+                "\nconfig_loader.py and app_config.py are already in context above. "
+                "Read tests/test_config_loader.py next.\n"
+            )
+        return ""
+    if next_path == "config_loader.py":
+        if missing_reads == CONFIG_LOADER_ANALYZER_READS:
+            return (
+                "\nStep 1: call read on config_loader.py first. "
+                "Do not output analysis text — only a read tool call.\n"
+            )
+        return (
+            "\nCall read on config_loader.py next. "
+            "Do not output analysis text — only a read tool call.\n"
+        )
+    return (
+        f"\nCall read on {target} next. "
+        "Do not output analysis text — only a read tool call.\n"
+    )
+
+
+def config_loader_analyzer_reads_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when Agent 0 has read config_loader.py, app_config.py, and the pytest file."""
+    return CONFIG_LOADER_ANALYZER_READS.issubset(completed_read_paths(messages))
+
+
+def config_loader_missing_analyzer_reads(messages: list[dict[str, Any]]) -> frozenset[str]:
+    """Paths the config-loader analyzer still needs to read."""
+    return CONFIG_LOADER_ANALYZER_READS - completed_read_paths(messages)
+
+
+def config_loader_patcher_read_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when Agent 1 has config_loader.py in context."""
+    return "config_loader.py" in completed_read_paths(messages)
+
+
+def config_loader_patcher_fix_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when Agent 1 successfully edited config_loader.py or fix is already present."""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            i += 1
+            continue
+        pending: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            for tool_name in ("edit", "write"):
+                path = _parse_tool_path_from_call(call, tool_name)
+                if path == "config_loader.py":
+                    pending.append(tool_name)
+                    break
+        j = i + 1
+        result_idx = 0
+        while j < len(messages) and result_idx < len(pending):
+            nxt = messages[j]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            body = _message_content(nxt)
+            if _EDIT_SUCCESS_RE.search(body):
+                return True
+            result_idx += 1
+            j += 1
+        i = j if j > i + 1 else i + 1
+    return False
+
+
+def config_loader_verifier_should_force_exec(messages: list[dict[str, Any]]) -> bool:
+    """Verifier must run pytest before read/edit loops when tests not yet passed."""
+    if verifier_pytest_passed(messages):
+        return False
+    if not verifier_exec_pytest_done(messages):
+        return True
+    if pytest_collection_or_import_failed(messages):
+        return True
+    if config_loader_patcher_fix_satisfied(messages):
+        return not verifier_pytest_passed(messages)
+    return False
+
+
+def config_loader_verifier_should_force_read(messages: list[dict[str, Any]]) -> bool:
+    """After a failing pytest, read config_loader.py before editing."""
+    if verifier_pytest_passed(messages) or config_loader_patcher_read_satisfied(messages):
+        return False
+    if pytest_collection_or_import_failed(messages):
+        return False
+    return verifier_exec_pytest_done(messages) and not config_loader_patcher_fix_satisfied(messages)
+
+
+def config_loader_verifier_should_force_edit(messages: list[dict[str, Any]]) -> bool:
+    """After a failing pytest, edit config_loader.py when the bug is still present."""
+    if verifier_pytest_passed(messages) or config_loader_patcher_fix_satisfied(messages):
+        return False
+    if not verifier_exec_pytest_done(messages):
+        return False
+    if not config_loader_patcher_read_satisfied(messages):
+        return False
+    return True
 
 
 def _first_user_text(messages: list[dict[str, Any]]) -> str:

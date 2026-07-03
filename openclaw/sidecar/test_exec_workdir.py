@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
-from sidecar.bench_prompt_compose import ADD_TESTS_NORMALIZER_TASK_ID, BUGFIX_DISCOUNT_TASK_ID
+from sidecar.bench_prompt_compose import ADD_TESTS_NORMALIZER_TASK_ID, BUGFIX_DISCOUNT_TASK_ID, CONFIG_LOADER_TASK_ID
 from sidecar.tool_bridge import (
     clawbench_tool_workspace,
     openai_message_from_generation,
+    sync_clawbench_config_loader_default_to_chain,
     sync_clawbench_tests_default_to_chain,
 )
 
@@ -97,6 +99,58 @@ def test_sync_clawbench_tests_default_to_chain(tmp_path, monkeypatch) -> None:
     synced = (chain_tests / "test_normalizer.py").read_text(encoding="utf-8")
     assert "from normalizer import normalize_title, normalize_tags" in synced
     assert "openclaw" not in synced
+
+
+def test_exec_workdir_uses_pythonpath_for_config_loader(tmp_path) -> None:
+    raw = (
+        '<tool_call>\n'
+        '{"name": "exec", "arguments": {"command": "pytest -q", "workdir": "."}}\n'
+        "</tool_call>"
+    )
+    chain_workspace_path = tmp_path / "run-deadbeef"
+    chain_workspace_path.mkdir()
+    message = openai_message_from_generation(
+        raw,
+        task_profile="clawbench",
+        task_id=CONFIG_LOADER_TASK_ID,
+        workspace_dir=str(chain_workspace_path),
+    )
+    args = json.loads(message["tool_calls"][0]["function"]["arguments"])
+    assert args["workdir"] == str(chain_workspace_path)
+    assert args["command"] == "PYTHONPATH=. python -m pytest -q tests/test_config_loader.py"
+
+
+def test_sync_clawbench_config_loader_default_to_chain(tmp_path, monkeypatch) -> None:
+    default_root = tmp_path / "default-workspace"
+    chain_root = tmp_path / "chain-workspace"
+    default_root.mkdir()
+    chain_root.mkdir()
+    (default_root / "config_loader.py").write_text("fixed = True\n", encoding="utf-8")
+    (default_root / "app_config.py").write_text("DEFAULTS = {}\n", encoding="utf-8")
+    chain_test = chain_root / "tests" / "test_config_loader.py"
+    chain_test.parent.mkdir(parents=True)
+    chain_test.write_text("unchanged test\n", encoding="utf-8")
+    (chain_root / "config_loader.py").write_text("fixed = False\n", encoding="utf-8")
+    chattr_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        chattr_calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    def fake_workspace(*, workspace_dir: str = "") -> str:
+        explicit = (workspace_dir or "").strip()
+        if explicit:
+            return explicit
+        return str(default_root)
+
+    monkeypatch.setattr("sidecar.tool_bridge.subprocess.run", fake_run)
+    monkeypatch.setattr("sidecar.tool_bridge.clawbench_tool_workspace", fake_workspace)
+    changed = sync_clawbench_config_loader_default_to_chain(workspace_dir=str(chain_root))
+    assert changed is True
+    assert (chain_root / "config_loader.py").read_text(encoding="utf-8") == "fixed = True\n"
+    assert (chain_root / "app_config.py").read_text(encoding="utf-8") == "DEFAULTS = {}\n"
+    assert chain_test.read_text(encoding="utf-8") == "unchanged test\n"
+    assert any(call[:2] == ["chattr", "-i"] for call in chattr_calls)
 
 
 def test_exec_workdir_unchanged_for_non_clawbench() -> None:

@@ -75,6 +75,7 @@ export async function fetchSidecarAgentMetrics({ runId, agentIndex, sidecarUrl =
       input_routing_mode: row.input_routing_mode ?? null,
       reuse_kv_text: row.reuse_kv_text ?? null,
       prefix_estimated_tokens: row.prefix_estimated_tokens ?? null,
+      emitted_tool_calls: Array.isArray(row.emitted_tool_calls) ? row.emitted_tool_calls : [],
     };
   } catch {
     return null;

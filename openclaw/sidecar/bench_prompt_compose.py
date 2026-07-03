@@ -10,6 +10,7 @@ _JOB_MARKER_RE = re.compile(r"\nYour job \(Agent ", re.IGNORECASE)
 BUGFIX_DISCOUNT_TASK_ID = "t1-bugfix-discount"
 QUICK_NOTE_TASK_ID = "t1-fs-quick-note"
 ADD_TESTS_NORMALIZER_TASK_ID = "t2-add-tests-normalizer"
+CONFIG_LOADER_TASK_ID = "t2-config-loader"
 BROWSER_FORM_FIX_TASK_ID = "t2-browser-form-fix"
 QUICK_NOTE_VERIFIER_READ = frozenset({"quick_note.md"})
 
@@ -69,6 +70,13 @@ def is_add_tests_normalizer_task(ctx) -> bool:
     if ctx is None:
         return False
     return str(getattr(ctx, "task_id", "") or "").strip() == ADD_TESTS_NORMALIZER_TASK_ID
+
+
+def is_config_loader_task(ctx) -> bool:
+    """True when the active bench row is the tier2 config-loader repo task."""
+    if ctx is None:
+        return False
+    return str(getattr(ctx, "task_id", "") or "").strip() == CONFIG_LOADER_TASK_ID
 
 
 def is_browser_family_task(ctx) -> bool:

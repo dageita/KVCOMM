@@ -417,7 +417,10 @@ async function main() {
 
           if (!isWarmup) {
             const sessionMessages = await collectSessionMessages(client, result.records);
-            const transcript = buildChainTranscript(taskBody, result.records, sessionMessages);
+            const transcript = buildChainTranscript(taskBody, result.records, sessionMessages, {
+              taskRow,
+              runtimeValues,
+            });
             await syncCapabilityWorkspaceArtifacts(workspaceDir, result.records, taskRow);
 
             if (!args.skipScore) {

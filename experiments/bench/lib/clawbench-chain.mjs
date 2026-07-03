@@ -10,24 +10,177 @@ import { resolveGatewayToken } from "./openclaw-config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BENCH_ROOT = join(__dirname, "..");
-const DEFAULT_AGENT_WORKSPACE = join(process.env.HOME || "/root", ".openclaw/workspace");
+
+function openclawStateDir() {
+  return process.env.OPENCLAW_STATE_DIR || join(process.env.HOME || "/root", ".openclaw");
+}
+
+/** OpenClaw read/edit cwd — must match sidecar clawbench_tool_workspace() default. */
+export function resolveDefaultAgentWorkspace() {
+  return join(openclawStateDir(), "workspace");
+}
+
+function defaultAgentWorkspace() {
+  return resolveDefaultAgentWorkspace();
+}
 const BENCH_PRISTINE = ".bench-pristine";
 const READ_ONLY_CODING_FILES = new Set(["cart.py"]);
 /** Tasks where agents must create/edit tests/ (do not chattr +i test files). */
 const CODING_TASKS_WITH_MUTABLE_TESTS = new Set(["t2-add-tests-normalizer"]);
 const BROWSER_FRONTEND_FILES = ["index.html", "app.js"];
+/** Legacy root-level tests removed by asset-pack purge (kept for mutable-test prep). */
 const STALE_DEFAULT_TEST_FILES = ["test_pricing.py"];
+
+function resolveTasksPublicDir() {
+  const candidates = [
+    join(BENCH_ROOT, "../../../clawbench/tasks-public"),
+    join(process.cwd(), "clawbench/tasks-public"),
+  ];
+  for (const candidate of candidates) {
+    const resolved = resolve(candidate);
+    if (existsSync(join(resolved, "assets"))) {
+      return resolved;
+    }
+  }
+  throw new Error("Could not locate clawbench/tasks-public");
+}
+
+/** Basenames allowed for the active task (from tasks-public asset pack). */
+export async function collectTaskCodingArtifacts(taskRow) {
+  const allowedRoot = new Set();
+  const allowedTests = new Set();
+  const assetPacks = taskRow?.clawbench_ref?.asset_packs ?? [];
+  const tasksPublic = resolveTasksPublicDir();
+
+  for (const pack of assetPacks) {
+    const packDir = join(tasksPublic, "assets", pack);
+    if (!existsSync(packDir)) {
+      continue;
+    }
+    const entries = await readdir(packDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith(".py") && !entry.name.startsWith("verify_")) {
+        allowedRoot.add(entry.name);
+      }
+    }
+    const testsDir = join(packDir, "tests");
+    if (existsSync(testsDir)) {
+      const testEntries = await readdir(testsDir, { withFileTypes: true }).catch(() => []);
+      for (const entry of testEntries) {
+        if (entry.isFile() && entry.name.endsWith(".py")) {
+          allowedTests.add(entry.name);
+        }
+      }
+    }
+  }
+
+  return { allowedRoot, allowedTests };
+}
+
+async function removeCodingArtifact(filePath) {
+  if (!existsSync(filePath)) {
+    return false;
+  }
+  setFileImmutable(filePath, false);
+  await rm(filePath, { force: true });
+  return true;
+}
+
+/**
+ * Drop .py fixtures from prior bench tasks so bare `pytest -q` and completion
+ * checks only see the active task's asset pack.
+ */
+export async function purgeStaleCodingArtifacts(targetDir, taskRow) {
+  if (!targetDir || !existsSync(targetDir)) {
+    return { removed: [] };
+  }
+
+  const { allowedRoot, allowedTests } = await collectTaskCodingArtifacts(taskRow);
+  const removed = [];
+
+  const entries = await readdir(targetDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".py") || entry.name.startsWith("verify_")) {
+      continue;
+    }
+    const fullPath = join(targetDir, entry.name);
+    const isRootTest = /^test_.*\.py$/i.test(entry.name);
+    if (isRootTest && !allowedRoot.has(entry.name)) {
+      if (await removeCodingArtifact(fullPath)) {
+        removed.push(entry.name);
+      }
+      continue;
+    }
+    if (!allowedRoot.has(entry.name)) {
+      if (await removeCodingArtifact(fullPath)) {
+        removed.push(entry.name);
+      }
+    }
+  }
+
+  const testsDir = join(targetDir, "tests");
+  if (existsSync(testsDir)) {
+    const testEntries = await readdir(testsDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of testEntries) {
+      if (!entry.isFile() || !entry.name.endsWith(".py")) {
+        continue;
+      }
+      if (!allowedTests.has(entry.name)) {
+        const fullPath = join(testsDir, entry.name);
+        if (await removeCodingArtifact(fullPath)) {
+          removed.push(`tests/${entry.name}`);
+        }
+      }
+    }
+  }
+
+  return { removed };
+}
+
+/** Purge stale browser/coding artifacts before staging a new task workspace. */
+async function purgeStaleWorkspaceArtifacts(workspaceDir, taskRow) {
+  if (!workspaceDir || !taskRow) {
+    return;
+  }
+  const family = taskRow?.clawbench_ref?.family ?? "";
+  if (family === "browser") {
+    await purgeStaleCodingArtifacts(workspaceDir, taskRow);
+    const allowedFrontend = new Set(BROWSER_FRONTEND_FILES);
+    const { allowedRoot } = await collectTaskCodingArtifacts(taskRow);
+    const entries = await readdir(workspaceDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        continue;
+      }
+      const fullPath = join(workspaceDir, entry.name);
+      if (allowedFrontend.has(entry.name)) {
+        continue;
+      }
+      if (entry.name.endsWith(".py") && !allowedRoot.has(entry.name) && !entry.name.startsWith("verify_")) {
+        await removeCodingArtifact(fullPath);
+      }
+    }
+    return;
+  }
+  if (isCodingLikeTask(taskRow)) {
+    await purgeStaleCodingArtifacts(workspaceDir, taskRow);
+    await purgeStaleCodingArtifacts(defaultAgentWorkspace(), taskRow);
+  }
+}
 
 function isBrowserFamilyTask(taskRow) {
   return taskRow?.clawbench_ref?.family === "browser";
 }
 
-function taskAllowsMutableTests(taskRow) {
-  return CODING_TASKS_WITH_MUTABLE_TESTS.has(taskRow?.task_id ?? "");
+const CODING_LIKE_FAMILIES = new Set(["coding", "repo"]);
+
+/** Tasks where subagents read/edit/exec Python fixtures from the chain workspace. */
+export function isCodingLikeTask(taskRow) {
+  return CODING_LIKE_FAMILIES.has(taskRow?.clawbench_ref?.family ?? "");
 }
 
-function openclawStateDir() {
-  return process.env.OPENCLAW_STATE_DIR || join(process.env.HOME || "/root", ".openclaw");
+function taskAllowsMutableTests(taskRow) {
+  return CODING_TASKS_WITH_MUTABLE_TESTS.has(taskRow?.task_id ?? "");
 }
 
 function resolveBenchPristineRoot(taskRow) {
@@ -36,6 +189,23 @@ function resolveBenchPristineRoot(taskRow) {
     return null;
   }
   return join(openclawStateDir(), "bench-pristine", pack);
+}
+
+export function resolvePristineOnlyPath(taskRow, relativePath, workspaceDir = "") {
+  const externalRoot = resolveBenchPristineRoot(taskRow);
+  if (externalRoot) {
+    const external = join(externalRoot, relativePath);
+    if (existsSync(external)) {
+      return external;
+    }
+  }
+  if (workspaceDir) {
+    const local = join(workspaceDir, BENCH_PRISTINE, relativePath);
+    if (existsSync(local)) {
+      return local;
+    }
+  }
+  return null;
 }
 
 function resolvePristinePath(workspaceDir, relativePath, taskRow = null) {
@@ -69,15 +239,18 @@ function setFileImmutable(filePath, immutable) {
   spawnSync("chattr", [immutable ? "+i" : "-i", filePath], { stdio: "ignore" });
 }
 
-async function clearImmutableFlags(targetPath) {
-  if (!existsSync(targetPath)) {
+async function clearImmutableFlags(targetPath, { maxDepth = 8, depth = 0 } = {}) {
+  if (!existsSync(targetPath) || depth > maxDepth) {
     return;
   }
   const entries = await readdir(targetPath, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
     const fullPath = join(targetPath, entry.name);
     if (entry.isDirectory()) {
-      await clearImmutableFlags(fullPath);
+      if (entry.name === "kvcomm-chain" || entry.name === "__pycache__") {
+        continue;
+      }
+      await clearImmutableFlags(fullPath, { maxDepth, depth: depth + 1 });
     } else {
       setFileImmutable(fullPath, false);
     }
@@ -105,7 +278,7 @@ async function protectImmutableFixtures(targetDir, { protectTests = true } = {})
 }
 
 async function prepareMutableTestsWorkspace() {
-  const testsDir = join(DEFAULT_AGENT_WORKSPACE, "tests");
+  const testsDir = join(defaultAgentWorkspace(), "tests");
   await mkdir(testsDir, { recursive: true });
   await clearImmutableFlags(testsDir);
   for (const name of [...STALE_DEFAULT_TEST_FILES, "test_normalizer.py"]) {
@@ -139,11 +312,11 @@ async function syncMutableCodingWorkspaceToDefault(workspaceDir, taskRow = null)
   if (!workspaceDir) {
     return;
   }
-  await mkdir(DEFAULT_AGENT_WORKSPACE, { recursive: true });
+  await mkdir(defaultAgentWorkspace(), { recursive: true });
   await mkdir(workspaceDir, { recursive: true });
 
   const chainNormalizer = join(workspaceDir, "normalizer.py");
-  const defaultNormalizer = join(DEFAULT_AGENT_WORKSPACE, "normalizer.py");
+  const defaultNormalizer = join(defaultAgentWorkspace(), "normalizer.py");
   if (!existsSync(chainNormalizer) && !existsSync(defaultNormalizer)) {
     const pristine = resolvePristinePath(workspaceDir, "normalizer.py", taskRow);
     if (existsSync(pristine)) {
@@ -173,13 +346,13 @@ async function syncMutableCodingWorkspaceToDefault(workspaceDir, taskRow = null)
     ) {
       continue;
     }
-    const target = join(DEFAULT_AGENT_WORKSPACE, entry.name);
+    const target = join(defaultAgentWorkspace(), entry.name);
     setFileImmutable(target, false);
     await cp(join(workspaceDir, entry.name), target);
   }
 
   const chainTests = join(workspaceDir, "tests");
-  const defaultTests = join(DEFAULT_AGENT_WORKSPACE, "tests");
+  const defaultTests = join(defaultAgentWorkspace(), "tests");
   if (existsSync(chainTests)) {
     await clearImmutableFlags(defaultTests);
     await restoreTestsTree(chainTests, defaultTests);
@@ -191,22 +364,26 @@ async function syncMutableCodingWorkspaceToDefault(workspaceDir, taskRow = null)
 
   if (taskAllowsMutableTests(taskRow)) {
     await fixNormalizerTestImports(workspaceDir);
-    await fixNormalizerTestImports(DEFAULT_AGENT_WORKSPACE);
+    await fixNormalizerTestImports(defaultAgentWorkspace());
   }
 }
 
 async function restoreImmutableFixturesToDir(workspaceDir, targetDir, taskRow = null) {
   const protectTests = !taskAllowsMutableTests(taskRow);
   await mkdir(targetDir, { recursive: true });
-  const cartSrc = resolvePristinePath(workspaceDir, "cart.py", taskRow);
-  if (existsSync(cartSrc)) {
-    setFileImmutable(join(targetDir, "cart.py"), false);
-    await cp(cartSrc, join(targetDir, "cart.py"));
+  const cartSrc = resolvePristineOnlyPath(taskRow, "cart.py", workspaceDir);
+  const cartDest = join(targetDir, "cart.py");
+  if (cartSrc && resolve(cartSrc) !== resolve(cartDest)) {
+    setFileImmutable(cartDest, false);
+    await cp(cartSrc, cartDest);
   }
   if (protectTests) {
-    const testsSrc = resolvePristinePath(workspaceDir, "tests", taskRow);
-    if (existsSync(testsSrc)) {
-      await restoreTestsTree(testsSrc, join(targetDir, "tests"));
+    const testsSrc =
+      resolvePristineOnlyPath(taskRow, "tests", workspaceDir)
+      ?? resolvePristinePath(workspaceDir, "tests", taskRow);
+    const testsDest = join(targetDir, "tests");
+    if (testsSrc && resolve(testsSrc) !== resolve(testsDest)) {
+      await restoreTestsTree(testsSrc, testsDest);
     }
   }
   await protectImmutableFixtures(targetDir, { protectTests });
@@ -236,11 +413,11 @@ async function syncBrowserFrontendFiles(workspaceDir, { preferDefault = false } 
   if (!workspaceDir) {
     return;
   }
-  await mkdir(DEFAULT_AGENT_WORKSPACE, { recursive: true });
+  await mkdir(defaultAgentWorkspace(), { recursive: true });
   await mkdir(workspaceDir, { recursive: true });
   for (const name of BROWSER_FRONTEND_FILES) {
     const chainPath = join(workspaceDir, name);
-    const defaultPath = join(DEFAULT_AGENT_WORKSPACE, name);
+    const defaultPath = join(defaultAgentWorkspace(), name);
     const chainExists = existsSync(chainPath);
     const defaultExists = existsSync(defaultPath);
     if (chainExists && !defaultExists) {
@@ -284,18 +461,21 @@ export async function stageCapabilityWorkspaceForAgents(workspaceDir, taskRow) {
   }
   const family = taskRow?.clawbench_ref?.family ?? "";
   if (family === "browser") {
+    await purgeStaleWorkspaceArtifacts(workspaceDir, taskRow);
     await syncBrowserFrontendFiles(workspaceDir);
     return;
   }
-  if (family !== "coding") {
+  if (!isCodingLikeTask(taskRow)) {
     return;
   }
+
+  await purgeStaleWorkspaceArtifacts(workspaceDir, taskRow);
 
   if (taskAllowsMutableTests(taskRow)) {
     await prepareMutableTestsWorkspace();
   }
 
-  await purgePycache(DEFAULT_AGENT_WORKSPACE);
+  await purgePycache(defaultAgentWorkspace());
   const entries = await readdir(workspaceDir, { withFileTypes: true });
   for (const entry of entries) {
     if (
@@ -306,13 +486,13 @@ export async function stageCapabilityWorkspaceForAgents(workspaceDir, taskRow) {
     ) {
       continue;
     }
-    await mkdir(DEFAULT_AGENT_WORKSPACE, { recursive: true });
-    const target = join(DEFAULT_AGENT_WORKSPACE, entry.name);
+    await mkdir(defaultAgentWorkspace(), { recursive: true });
+    const target = join(defaultAgentWorkspace(), entry.name);
     setFileImmutable(target, false);
     await cp(join(workspaceDir, entry.name), target);
   }
 
-  await restoreImmutableFixturesToDir(workspaceDir, DEFAULT_AGENT_WORKSPACE, taskRow);
+  await restoreImmutableFixturesToDir(workspaceDir, defaultAgentWorkspace(), taskRow);
   await syncCodingTestsToDefaultWorkspace(workspaceDir, taskRow);
   if (taskAllowsMutableTests(taskRow)) {
     await syncMutableCodingWorkspaceToDefault(workspaceDir, taskRow);
@@ -324,36 +504,30 @@ async function syncCodingTestsToDefaultWorkspace(workspaceDir, taskRow = null) {
   if (!existsSync(testsFromRun)) {
     return;
   }
-  await restoreTestsTree(testsFromRun, join(DEFAULT_AGENT_WORKSPACE, "tests"));
-  await protectImmutableFixtures(DEFAULT_AGENT_WORKSPACE, {
+  await restoreTestsTree(testsFromRun, join(defaultAgentWorkspace(), "tests"));
+  await protectImmutableFixtures(defaultAgentWorkspace(), {
     protectTests: !taskAllowsMutableTests(taskRow),
   });
-
-  const staleRootTest = join(DEFAULT_AGENT_WORKSPACE, "test_pricing.py");
-  const canonicalTest = join(DEFAULT_AGENT_WORKSPACE, "tests", "test_pricing.py");
-  if (existsSync(staleRootTest) && existsSync(canonicalTest)) {
-    setFileImmutable(staleRootTest, false);
-    await rm(staleRootTest, { force: true });
-  }
 }
 
 /** Restore read-only coding fixtures; preserve pricing.py edits in both workspaces. */
 export async function restoreImmutableCodingFiles(workspaceDir, taskRow) {
-  if (!workspaceDir || taskRow?.clawbench_ref?.family !== "coding") {
+  if (!workspaceDir || !isCodingLikeTask(taskRow)) {
     return;
   }
+  await purgeStaleWorkspaceArtifacts(workspaceDir, taskRow);
   if (taskAllowsMutableTests(taskRow)) {
     await prepareMutableTestsWorkspace();
     await syncMutableCodingWorkspaceToDefault(workspaceDir, taskRow);
     return;
   }
   await restoreImmutableFixturesToDir(workspaceDir, workspaceDir, taskRow);
-  await restoreImmutableFixturesToDir(workspaceDir, DEFAULT_AGENT_WORKSPACE, taskRow);
+  await restoreImmutableFixturesToDir(workspaceDir, defaultAgentWorkspace(), taskRow);
   await syncCodingTestsToDefaultWorkspace(workspaceDir, taskRow);
 }
 
 async function syncCodingTestsFromDefault(chainWorkspaceDir) {
-  const testsFromDefault = join(DEFAULT_AGENT_WORKSPACE, "tests");
+  const testsFromDefault = join(defaultAgentWorkspace(), "tests");
   if (!existsSync(testsFromDefault)) {
     return;
   }
@@ -372,7 +546,7 @@ async function syncCodingArtifactsFromDefault(chainWorkspaceDir) {
     ) {
       continue;
     }
-    const fromDefault = join(DEFAULT_AGENT_WORKSPACE, entry.name);
+    const fromDefault = join(defaultAgentWorkspace(), entry.name);
     if (existsSync(fromDefault)) {
       await cp(fromDefault, join(chainWorkspaceDir, entry.name));
     }
@@ -381,10 +555,11 @@ async function syncCodingArtifactsFromDefault(chainWorkspaceDir) {
 
 /** Keep editable coding files aligned when agents use absolute default-workspace paths. */
 export async function syncEditableCodingFiles(workspaceDir, taskRow) {
-  if (!workspaceDir || taskRow?.clawbench_ref?.family !== "coding") {
+  if (!workspaceDir || !isCodingLikeTask(taskRow)) {
     return;
   }
-  await mkdir(DEFAULT_AGENT_WORKSPACE, { recursive: true });
+  await purgeStaleWorkspaceArtifacts(workspaceDir, taskRow);
+  await mkdir(defaultAgentWorkspace(), { recursive: true });
   const entries = await readdir(workspaceDir, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
     if (
@@ -396,7 +571,7 @@ export async function syncEditableCodingFiles(workspaceDir, taskRow) {
       continue;
     }
     const chainPath = join(workspaceDir, entry.name);
-    const defaultPath = join(DEFAULT_AGENT_WORKSPACE, entry.name);
+    const defaultPath = join(defaultAgentWorkspace(), entry.name);
     const chainExists = existsSync(chainPath);
     const defaultExists = existsSync(defaultPath);
     if (chainExists && !defaultExists) {
@@ -420,7 +595,7 @@ export async function syncEditableCodingFiles(workspaceDir, taskRow) {
 
   if (taskAllowsMutableTests(taskRow)) {
     const chainTests = join(workspaceDir, "tests");
-    const defaultTests = join(DEFAULT_AGENT_WORKSPACE, "tests");
+    const defaultTests = join(defaultAgentWorkspace(), "tests");
     if (existsSync(chainTests) && !existsSync(defaultTests)) {
       await restoreTestsTree(chainTests, defaultTests);
     } else if (existsSync(defaultTests) && !existsSync(chainTests)) {
@@ -434,7 +609,7 @@ export async function syncEditableCodingFiles(workspaceDir, taskRow) {
       }
     }
     await fixNormalizerTestImports(workspaceDir);
-    await fixNormalizerTestImports(DEFAULT_AGENT_WORKSPACE);
+    await fixNormalizerTestImports(defaultAgentWorkspace());
   }
 }
 
@@ -463,7 +638,102 @@ export function setupClawbenchWorkspace({ taskId, assetPacks, runUid }) {
   return payload.workspace;
 }
 
-export function buildChainTranscript(taskBody, records, allSessionMessages = []) {
+export function normalizeTranscriptToolCall(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const name = String(raw.name ?? "").trim();
+  if (!name) {
+    return null;
+  }
+  return {
+    name,
+    input: raw.input && typeof raw.input === "object" ? raw.input : {},
+    output: typeof raw.output === "string" ? raw.output : "",
+    success: raw.success ?? null,
+  };
+}
+
+function toolCallSignature(call) {
+  return `${call.name}:${JSON.stringify(call.input ?? {})}`;
+}
+
+/** Collect sidecar-emitted tool calls in agent order (browser from Agent 0, etc.). */
+export function collectSidecarEmittedToolCalls(records = []) {
+  const sorted = [...records].sort((a, b) => (a.agent_index ?? 0) - (b.agent_index ?? 0));
+  const out = [];
+  const seen = new Set();
+  for (const record of sorted) {
+    for (const raw of record.sidecar_emitted_tool_calls ?? []) {
+      const call = normalizeTranscriptToolCall(raw);
+      if (!call) {
+        continue;
+      }
+      const sig = toolCallSignature(call);
+      if (seen.has(sig)) {
+        continue;
+      }
+      seen.add(sig);
+      out.push(call);
+    }
+  }
+  return out;
+}
+
+/** Fallback when gateway session omits browser explorer calls from Agent 0. */
+export function synthesizeBrowserExplorerCall(records = [], runtimeValues = {}) {
+  if (!records.some((row) => row.agent_index === 0)) {
+    return null;
+  }
+  const port = String(runtimeValues.form_app_port ?? "").trim();
+  if (!port) {
+    return null;
+  }
+  return normalizeTranscriptToolCall({
+    name: "browser",
+    input: { action: "open", target: "host", url: `http://127.0.0.1:${port}/` },
+    output: "Opened page",
+    success: true,
+  });
+}
+
+/** Merge sidecar + session tool calls; keep browser before edit for trajectory scoring. */
+export function mergeChainToolCalls({ sidecarCalls = [], sessionCalls = [], fallbackBrowserCall = null } = {}) {
+  const merged = [];
+  const seen = new Set();
+  const append = (call) => {
+    if (!call) {
+      return;
+    }
+    const sig = toolCallSignature(call);
+    if (seen.has(sig)) {
+      return;
+    }
+    seen.add(sig);
+    merged.push(call);
+  };
+
+  for (const call of sidecarCalls) {
+    append(call);
+  }
+  if (fallbackBrowserCall && !sidecarCalls.some((call) => call.name === "browser")) {
+    append(fallbackBrowserCall);
+  }
+  for (const call of sessionCalls) {
+    append(call);
+  }
+
+  const browserCalls = merged.filter((call) => call.name === "browser");
+  const otherCalls = merged.filter((call) => call.name !== "browser");
+  return [...browserCalls, ...otherCalls];
+}
+
+export function buildChainTranscript(
+  taskBody,
+  records,
+  allSessionMessages = [],
+  options = {},
+) {
   const messages = [{ role: "user", text: taskBody }];
   for (const record of records) {
     if (record.output_text) {
@@ -475,7 +745,7 @@ export function buildChainTranscript(taskBody, records, allSessionMessages = [])
     }
   }
 
-  const toolCalls = [];
+  const sessionCalls = [];
   for (const sessionMessages of allSessionMessages) {
     for (const message of sessionMessages) {
       if (message?.role !== "assistant" || !Array.isArray(message.content)) {
@@ -483,24 +753,41 @@ export function buildChainTranscript(taskBody, records, allSessionMessages = [])
       }
       for (const block of message.content) {
         if (block?.type === "toolCall" && block.name) {
-          toolCalls.push({
-            name: block.name,
-            input: block.arguments ?? block.input ?? {},
-            output: "",
-            success: null,
-          });
+          sessionCalls.push(
+            normalizeTranscriptToolCall({
+              name: block.name,
+              input: block.arguments ?? block.input ?? {},
+              output: "",
+              success: null,
+            }),
+          );
         }
         if (block?.type === "tool_use" && block.name) {
-          toolCalls.push({
-            name: block.name,
-            input: block.input ?? {},
-            output: "",
-            success: null,
-          });
+          sessionCalls.push(
+            normalizeTranscriptToolCall({
+              name: block.name,
+              input: block.input ?? {},
+              output: "",
+              success: null,
+            }),
+          );
         }
       }
     }
   }
+
+  const sidecarCalls = collectSidecarEmittedToolCalls(records);
+  const fallbackBrowserCall =
+    isBrowserFamilyTask(options.taskRow) &&
+    !sidecarCalls.some((call) => call.name === "browser") &&
+    !sessionCalls.some((call) => call.name === "browser")
+      ? synthesizeBrowserExplorerCall(records, options.runtimeValues ?? {})
+      : null;
+  const toolCalls = mergeChainToolCalls({
+    sidecarCalls,
+    sessionCalls: sessionCalls.filter(Boolean),
+    fallbackBrowserCall,
+  });
 
   const assistantText = records.at(-1)?.output_text ?? "";
   return {
@@ -521,7 +808,7 @@ export async function syncCapabilityWorkspaceArtifacts(workspaceDir, records, ta
     await syncEditableBrowserFiles(workspaceDir, taskRow);
     return;
   }
-  if (family === "coding") {
+  if (isCodingLikeTask(taskRow)) {
     await syncEditableCodingFiles(workspaceDir, taskRow);
     if (!taskAllowsMutableTests(taskRow)) {
       await restoreImmutableCodingFiles(workspaceDir, taskRow);
@@ -535,7 +822,7 @@ export async function syncCapabilityWorkspaceArtifacts(workspaceDir, records, ta
 
   const notesDir = join(workspaceDir, "notes");
   const targetNote = join(notesDir, "quick_note.md");
-  const defaultNote = join(process.env.HOME || "/root", ".openclaw/workspace/notes/quick_note.md");
+  const defaultNote = join(defaultAgentWorkspace(), "notes/quick_note.md");
   if (existsSync(defaultNote)) {
     await mkdir(notesDir, { recursive: true });
     await copyFile(defaultNote, targetNote);

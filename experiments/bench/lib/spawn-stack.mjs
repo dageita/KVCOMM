@@ -7,7 +7,7 @@ import {
 } from "./gateway-client.mjs";
 import { resolveCapabilitySubagentTools } from "./openclaw-config.mjs";
 import { fetchSidecarAgentMetrics, registerKvcommContext, shouldFetchSidecarMetrics } from "./sidecar-metrics.mjs";
-import { restoreImmutableCodingFiles, syncEditableBrowserFiles, syncEditableCodingFiles } from "./clawbench-chain.mjs";
+import { restoreImmutableCodingFiles, syncEditableBrowserFiles, syncEditableCodingFiles, isCodingLikeTask } from "./clawbench-chain.mjs";
 import { buildKvcommMetaPrefix, renderTemplateKvReuse, renderTemplateStrict, sha256Short } from "./template.mjs";
 
 const TOOL_JSON_PATTERN =
@@ -412,6 +412,7 @@ export async function runChainStackSpawn(client, params) {
       input_routing_mode: sidecarMetrics?.input_routing_mode ?? null,
       reuse_kv_text: sidecarMetrics?.reuse_kv_text ?? null,
       prefix_estimated_tokens: sidecarMetrics?.prefix_estimated_tokens ?? null,
+      sidecar_emitted_tool_calls: sidecarMetrics?.emitted_tool_calls ?? [],
       bench_no_think: sidecarMetrics?.bench_no_think ?? true,
       e2e_agent_ms: Date.now() - spawnStartedAt,
       timestamp: new Date().toISOString(),
@@ -424,7 +425,7 @@ export async function runChainStackSpawn(client, params) {
         await syncEditableBrowserFiles(workspaceDir, taskRow, {
           preferDefault: agentIndex === 1,
         });
-      } else {
+      } else if (isCodingLikeTask(taskRow)) {
         await syncEditableCodingFiles(workspaceDir, taskRow);
         await restoreImmutableCodingFiles(workspaceDir, taskRow);
       }
