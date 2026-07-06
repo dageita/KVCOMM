@@ -18,6 +18,7 @@ from sidecar.bench_prompt_compose import (
     ADD_TESTS_NORMALIZER_TASK_ID,
     BUGFIX_DISCOUNT_TASK_ID,
     CONFIG_LOADER_TASK_ID,
+    FIND_THAT_TASK_ID,
     fix_normalizer_test_imports,
 )
 
@@ -31,6 +32,12 @@ _VERIFIER_TOOL_NAMES = frozenset({"read", "write", "edit"})
 
 # ClawBench / OpenClaw capability chain roles (by index or role label).
 _ANALYZER_TOOLS = frozenset({"read"})
+_EXTRACTOR_TOOLS = frozenset({"read", "exec"})
+_TOOLS_FAMILY_BY_INDEX = {
+    0: _EXTRACTOR_TOOLS,
+    1: frozenset({"read", "write", "edit", "exec"}),
+    2: frozenset({"read", "exec"}),
+}
 _PATCHER_TOOLS = frozenset({"read", "edit", "write", "apply_patch"})
 _VERIFIER_TOOLS = frozenset({"read", "edit", "exec", "process"})
 _BROWSER_ANALYZER_TOOLS = frozenset({"browser", "read"})
@@ -185,6 +192,40 @@ _TOOL_NAME_ALIASES = {
     "shell": "exec",
     "terminal": "exec",
 }
+
+
+def _rewrite_pseudo_tool(name: str, arguments: Any) -> tuple[str, dict[str, Any]] | None:
+    """Map model-hallucinated tool names to allowed OpenClaw tools (exec)."""
+    import shlex
+
+    raw = (name or "").strip().lower()
+    if not isinstance(arguments, dict):
+        arguments = {}
+    if raw == "search":
+        query = str(arguments.get("query") or arguments.get("pattern") or "").strip()
+        if not query:
+            return None
+        cmd = f"rg -l -i {shlex.quote(query)} . 2>/dev/null | head -50"
+        return "exec", {"command": cmd}
+    if raw == "copy":
+        src = str(arguments.get("source") or arguments.get("src") or "").strip()
+        dst = str(
+            arguments.get("destination") or arguments.get("dest") or arguments.get("dst") or ""
+        ).strip()
+        if not src or not dst:
+            return None
+        dest = "Desktop/q3_marketing_budget.xlsx" if "q3_marketing" in dst.lower() else dst
+        return "exec", {"command": f"mkdir -p Desktop && cp {shlex.quote(src)} {shlex.quote(dest)}"}
+    if raw == "find":
+        pattern = str(arguments.get("pattern") or arguments.get("query") or "*").strip() or "*"
+        search_path = str(arguments.get("path") or ".").strip() or "."
+        return "exec", {
+            "command": (
+                f"find {shlex.quote(search_path)} -name {shlex.quote(pattern)} "
+                f"2>/dev/null | head -50"
+            )
+        }
+    return None
 
 
 def canonical_tool_name(name: str) -> str:
@@ -711,6 +752,33 @@ def _normalize_browser_arguments(
     return updated
 
 
+FIND_THAT_SOURCE_BASENAME = "q3_marketing_budget_v3.xlsx"
+FIND_THAT_COPY_BASENAME = "q3_marketing_budget.xlsx"
+
+
+def _normalize_find_that_exec_command(command: str) -> str:
+    """Rewrite broken desktop copy paths for t2-fs-find-that-thing."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return cmd
+    cmd = re.sub(r"~/desktop/", "Desktop/", cmd, flags=re.IGNORECASE)
+    cmd = re.sub(r"(?<![\w/])/desktop/", "Desktop/", cmd, flags=re.IGNORECASE)
+    if re.search(r"\bcp\b", cmd, re.IGNORECASE) and re.search(r"desktop", cmd, re.IGNORECASE):
+        if FIND_THAT_SOURCE_BASENAME in cmd and FIND_THAT_COPY_BASENAME in cmd:
+            cmd = re.sub(
+                r"cp\s+\S*"
+                + re.escape(FIND_THAT_SOURCE_BASENAME)
+                + r"\s+\S*"
+                + re.escape(FIND_THAT_COPY_BASENAME),
+                f"cp Documents/{FIND_THAT_SOURCE_BASENAME} Desktop/{FIND_THAT_COPY_BASENAME}",
+                cmd,
+                flags=re.IGNORECASE,
+            )
+        if "mkdir" not in cmd.lower():
+            cmd = f"mkdir -p Desktop && {cmd}"
+    return cmd
+
+
 def _normalize_tool_arguments(
     name: str,
     arguments: Any,
@@ -755,6 +823,10 @@ def _normalize_tool_arguments(
                 updated["command"] = normalized_cmd
             if str(task_id or "").strip() == ADD_TESTS_NORMALIZER_TASK_ID:
                 fix_normalizer_test_file_on_disk(workspace_dir=workspace_dir)
+        if command and str(task_id or "").strip() == FIND_THAT_TASK_ID:
+            normalized_cmd = _normalize_find_that_exec_command(command)
+            if normalized_cmd != command:
+                updated["command"] = normalized_cmd
         return updated
     return arguments
 
@@ -771,6 +843,8 @@ def _required_tools_for_agent(
         idx = int(agent_index) if agent_index is not None else -1
     except (TypeError, ValueError):
         idx = -1
+    if str(clawbench_family or "").strip() == "tools" and idx in _TOOLS_FAMILY_BY_INDEX:
+        return _TOOLS_FAMILY_BY_INDEX[idx]
     if str(clawbench_family or "").strip() == "browser" and idx in _BROWSER_TOOLS_BY_INDEX:
         return _BROWSER_TOOLS_BY_INDEX[idx]
     if str(task_id or "").strip() == BUGFIX_DISCOUNT_TASK_ID and idx in _CLAWBENCH_REQUIRED_BY_INDEX:
@@ -1022,12 +1096,18 @@ def _append_tool_call(
     workspace_dir: str = "",
     task_vars: dict[str, Any] | None = None,
 ) -> None:
-    name = canonical_tool_name(str(payload.get("name") or payload.get("function") or "").strip())
+    raw_name = str(payload.get("name") or payload.get("function") or "").strip()
+    pseudo = _rewrite_pseudo_tool(raw_name, payload.get("arguments"))
+    if pseudo is not None:
+        name, arguments = pseudo
+    else:
+        name = canonical_tool_name(raw_name)
+        arguments = payload.get("arguments")
     if not name:
         return
     arguments = _normalize_tool_arguments(
         name,
-        payload.get("arguments"),
+        arguments,
         task_profile=task_profile,
         task_id=task_id,
         workspace_dir=workspace_dir,

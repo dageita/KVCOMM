@@ -1240,6 +1240,127 @@ def config_loader_verifier_should_force_edit(messages: list[dict[str, Any]]) -> 
     return True
 
 
+FIND_THAT_SOURCE_BASENAME = "q3_marketing_budget_v3.xlsx"
+FIND_THAT_COPY_BASENAME = "q3_marketing_budget.xlsx"
+
+
+def _exec_tool_body_succeeded(body: str) -> bool:
+    text = (body or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith("{") and '"status": "error"' in lowered.replace(" ", ""):
+        return False
+    if "cannot create regular file" in lowered:
+        return False
+    if "no such file or directory" in lowered and "cp:" in lowered:
+        return False
+    if "(command exited with code 1)" in lowered or "exit code 1" in lowered:
+        return False
+    return True
+
+
+def find_that_source_located(messages: list[dict[str, Any]]) -> bool:
+    """True when exploration located Documents/q3_marketing_budget_v3.xlsx."""
+    needle = FIND_THAT_SOURCE_BASENAME
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        if needle in _message_content(msg):
+            return True
+    return False
+
+
+def find_that_copy_satisfied(messages: list[dict[str, Any]]) -> bool:
+    """True when q3_marketing_budget_v3.xlsx was copied to Desktop/q3_marketing_budget.xlsx."""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        pending = False
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                command = _parse_exec_command_from_call(call)
+                if not command:
+                    continue
+                lowered = command.lower()
+                if "cp" not in lowered:
+                    continue
+                if FIND_THAT_SOURCE_BASENAME not in command:
+                    continue
+                if FIND_THAT_COPY_BASENAME not in command:
+                    continue
+                pending = True
+                break
+        if not pending:
+            i += 1
+            continue
+        j = i + 1
+        if j < len(messages):
+            nxt = messages[j]
+            if isinstance(nxt, dict) and nxt.get("role") == "tool":
+                if _exec_tool_body_succeeded(_message_content(nxt)):
+                    return True
+        i += 1
+    return False
+
+
+def find_that_verifier_exec_done(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        "verify_correct_file.py" in command
+        for command in _iter_exec_calls_from_messages(messages)
+    )
+
+
+def find_that_verifier_passed(messages: list[dict[str, Any]]) -> bool:
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            i += 1
+            continue
+        pending = False
+        for call in msg.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            command = _parse_exec_command_from_call(call)
+            if command and "verify_correct_file.py" in command:
+                pending = True
+                break
+        if not pending:
+            i += 1
+            continue
+        j = i + 1
+        if j < len(messages):
+            nxt = messages[j]
+            if isinstance(nxt, dict) and nxt.get("role") == "tool":
+                if "pass:" in _message_content(nxt).lower():
+                    return True
+        i += 1
+    return False
+
+
+def build_find_that_writer_copy_hint() -> str:
+    return (
+        "\nCopy the located spreadsheet with one exec call: "
+        "mkdir -p Desktop && cp Documents/q3_marketing_budget_v3.xlsx "
+        "Desktop/q3_marketing_budget.xlsx\n"
+        "Do not output analysis text — only an exec tool call.\n"
+    )
+
+
+def build_find_that_verifier_exec_hint() -> str:
+    return (
+        "\nRun python3 verify_correct_file.py via exec to confirm the deliverable. "
+        "Do not call read on xlsx files.\n"
+    )
+
+
 def _first_user_text(messages: list[dict[str, Any]]) -> str:
     for msg in messages:
         if isinstance(msg, dict) and msg.get("role") == "user":

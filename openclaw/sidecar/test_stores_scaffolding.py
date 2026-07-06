@@ -10,7 +10,6 @@ if str(SIDECAR_ROOT) not in sys.path:
     sys.path.insert(0, str(SIDECAR_ROOT))
 
 from sidecar.stores.agent_anchor_pool import AgentAnchorPool
-from sidecar.stores.asst_anchor_pool import AsstAnchorPool
 from sidecar.stores.hashing import static_template_hash, topology_id
 from sidecar.stores.prefix_topology import plan_prefix_update, write_topology
 from sidecar.stores.registry import reset_store_registry, get_store_registry
@@ -185,24 +184,28 @@ def test_purge_turn_downstream_preserves_tool_kv() -> None:
     assert stores.tool_kv.get(entry.kv_ref) is not None
 
 
-def test_asst_anchor_pool_left_fingerprint() -> None:
-    pool = AsstAnchorPool()
+def test_agent_anchor_pool_topology_key_includes_content_hash() -> None:
+    pool = AgentAnchorPool()
+    static = static_template_hash("base")
+    topo = topology_id(static_hash=static, turn_count=1)
+    key = DeltaAnchorKey(
+        static_template_hash=static,
+        topology_id=topo,
+        ph_id="turn_0_assistant",
+        ph_token_start=10,
+        ph_token_end=15,
+        pf_span_id="T0",
+        content_hash="content-abc",
+    )
     pool.put(
-        node_id="2",
-        message_key="m",
+        node_id="1",
+        message_key="msg",
         ph_id="turn_0_assistant",
-        content_hash="c",
-        left_parts=["static", "0"],
-        static_template_hash="static",
+        static_template_hash=static,
+        upstream_hash="msg",
         ph_delta={"d": 1},
+        delta_key=key,
     )
-    hit = pool.get(
-        node_id="2",
-        message_key="m",
-        ph_id="turn_0_assistant",
-        content_hash="c",
-        left_parts=["static", "0"],
-        static_template_hash="static",
-    )
+    hit = pool.get_by_topology_key(node_id="1", message_key="msg", delta_key=key)
     assert hit is not None
-    assert hit.ph_delta == {"d": 1}
+    assert hit.content_hash == "content-abc"

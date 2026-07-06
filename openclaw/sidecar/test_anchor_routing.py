@@ -179,8 +179,10 @@ def test_kv_reuse_anchors_skip_isolated_turn_and_upstream() -> None:
 
     chat = object.__new__(LLMChat)
     chat.node_id = "2"
-    slot = SimpleNamespace(absolute_kv=_fake_cache(5), kv_ref=None, slot_kind="tool")
+    slot = SimpleNamespace(absolute_kv=_fake_cache(5), kv_ref=None, slot_kind="tool", content_hash="h1")
     chat.resolve_turn_ph_slot = lambda ph_id, _msg: slot if ph_id == "turn_1_tool" else None
+    chat.resolve_tool_consumer_slot = lambda _ph_id, _msg: None
+    chat.resolve_llm_branch_slot = lambda _ph_id, _msg: None
     chat.resolve_upstream_agent_slot = lambda _ph_id, _msg: None
 
     LLMChat._shared_kv_cache_memory["1"] = {
@@ -192,6 +194,90 @@ def test_kv_reuse_anchors_skip_isolated_turn_and_upstream() -> None:
     assert chat._kv_reuse_anchors_for_ph("turn_1_tool", "msg", anchors) == []
     assert chat._kv_reuse_anchors_for_ph("agent_1_current", "msg", anchors) == []
     assert len(chat._kv_reuse_anchors_for_ph("agent_2_current", "msg", anchors)) == 1
+
+
+@pytest.mark.skipif(torch is None, reason="torch not installed")
+def test_turn_tool_dual_lock_allows_delta_only_after_contextual_materialize() -> None:
+    from KVCOMM.llm.gpt_chat import LLMChat
+    from sidecar.stores.agent_anchor_pool import AgentAnchorPool
+    from sidecar.stores.hashing import static_template_hash, topology_id
+    from sidecar.stores.registry import reset_store_registry, get_store_registry
+    from sidecar.stores.topology_anchor import DeltaAnchorKey
+
+    reset_store_registry()
+    chat = object.__new__(LLMChat)
+    chat.node_id = "1"
+    chat.resolve_turn_ph_slot = lambda _ph, _msg: type(
+        "S", (), {"content_hash": "content-abc"}
+    )()
+    chat.resolve_tool_consumer_slot = lambda _ph, _msg: None
+    chat.resolve_llm_branch_slot = lambda _ph, _msg: None
+
+    static = static_template_hash("task\n{turn_0_assistant}\n")
+    topo = topology_id(static_hash=static, turn_count=1)
+    LLMChat._shared_kv_cache_memory["1"] = {
+        "static_template_hash": static,
+        "topology_id": topo,
+        "placeholder_info": {"turn_0_assistant": {"start": 10, "end": 15, "pf_span_id": "T0"}},
+    }
+
+    pool = get_store_registry().agent_anchors
+    delta_key = DeltaAnchorKey(
+        static_template_hash=static,
+        topology_id=topo,
+        ph_id="turn_0_assistant",
+        ph_token_start=10,
+        ph_token_end=15,
+        pf_span_id="T0",
+        content_hash="content-abc",
+    )
+    pool.put(
+        node_id="1",
+        message_key="msg",
+        ph_id="turn_0_assistant",
+        static_template_hash=static,
+        upstream_hash="msg",
+        ph_key_embedding=torch.zeros(1, 1, 20, 1),
+        ph_value_embedding=torch.zeros(1, 1, 20, 1),
+        ph_delta=torch.zeros(1, 1, 20, 1),
+        ph_value_delta=torch.zeros(1, 1, 20, 1),
+        pf_delta=torch.zeros(1, 1, 50, 1),
+        pf_value_delta=torch.zeros(1, 1, 50, 1),
+        delta_key=delta_key,
+    )
+
+    assert chat._kv_reuse_anchors_for_ph("turn_0_assistant", "msg", {}) == []
+
+    chat._mark_turn_tool_delta_retry_eligible(
+        node_id="1",
+        message_key="msg",
+        ph_id="turn_0_assistant",
+        content_hash="content-abc",
+    )
+    anchored = chat._kv_reuse_anchors_for_ph("turn_0_assistant", "msg", {})
+    assert len(anchored) == 1
+    assert "1_ph_key_delta" in anchored[0]
+
+
+@pytest.mark.skipif(torch is None, reason="torch not installed")
+def test_turn_tool_passes_through_when_consumer_slot_present() -> None:
+    from KVCOMM.llm.gpt_chat import LLMChat
+
+    chat = object.__new__(LLMChat)
+    chat.node_id = "1"
+    chat.resolve_turn_ph_slot = lambda _ph, _msg: type(
+        "S", (), {"content_hash": "content-abc"}
+    )()
+    chat.resolve_llm_branch_slot = lambda _ph, _msg: type("S", (), {})()
+    chat.resolve_tool_consumer_slot = lambda _ph, _msg: None
+    chat._mark_turn_tool_delta_retry_eligible(
+        node_id="1",
+        message_key="msg",
+        ph_id="turn_0_assistant",
+        content_hash="content-abc",
+    )
+
+    assert chat._kv_reuse_anchors_for_ph("turn_0_assistant", "msg", {}) == []
 
 
 @pytest.mark.skipif(torch is None, reason="torch not installed")

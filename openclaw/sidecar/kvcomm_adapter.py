@@ -20,6 +20,7 @@ from sidecar.bench_prompt_compose import (
     is_browser_family_task,
     is_bugfix_discount_task,
     is_config_loader_task,
+    is_find_that_task,
     is_quick_note_task,
     tool_constraints_for_context,
 )
@@ -42,6 +43,8 @@ from sidecar.openclaw_prefix import (
     browser_verifier_exec_passed,
     build_browser_appjs_edit_hint,
     build_browser_verifier_exec_hint,
+    build_find_that_verifier_exec_hint,
+    build_find_that_writer_copy_hint,
     config_loader_analyzer_reads_satisfied,
     config_loader_missing_analyzer_reads,
     config_loader_patcher_fix_satisfied,
@@ -49,6 +52,10 @@ from sidecar.openclaw_prefix import (
     config_loader_verifier_should_force_edit,
     config_loader_verifier_should_force_exec,
     config_loader_verifier_should_force_read,
+    find_that_copy_satisfied,
+    find_that_source_located,
+    find_that_verifier_exec_done,
+    find_that_verifier_passed,
     normalizer_analyzer_read_satisfied,
     normalizer_patcher_read_satisfied,
     normalizer_tests_ready,
@@ -737,7 +744,6 @@ def _purge_node_anchor_deltas(node_id: str) -> None:
     stores = get_store_registry()
     stores.segment_cache.purge_node(node_id)
     stores.agent_anchors.purge_node(node_id)
-    stores.asst_anchors.purge_node(node_id)
     stores.turn_slots.purge_node(node_id)
     stores.upstream_agent_slots.purge_node(node_id)
     stores.template_ph_base.purge_node(node_id)
@@ -751,7 +757,7 @@ def _purge_node_anchor_deltas(node_id: str) -> None:
 
 
 def _purge_node_turn_state(node_id: str, *, message_key: str | None = None) -> None:
-    """Drop turn-slot / asst state without clearing global tool KV backend."""
+    """Drop turn-slot state without clearing global tool KV backend."""
     stores = get_store_registry()
     from KVCOMM.llm.gpt_chat import LLMChat
 
@@ -765,14 +771,12 @@ def _purge_node_turn_state(node_id: str, *, message_key: str | None = None) -> N
             message_key=str(message_key),
             turn_index=0,
         )
-        stores.asst_anchors.purge_message(node_id=str(node_id), message_key=str(message_key))
         stores.agent_anchors.invalidate_pf_for_message(
             node_id=str(node_id),
             message_key=str(message_key),
         )
         return
 
-    stores.asst_anchors.purge_node(node_id)
     stores.turn_slots.purge_node(node_id)
 
 
@@ -998,7 +1002,6 @@ def _clear_turn_cache_only(node_id: str) -> None:
     bucket.pop("static_template_hash", None)
     bucket.pop("topology_id", None)
     get_store_registry().turn_slots.purge_node(node_id)
-    get_store_registry().asst_anchors.purge_node(node_id)
 
 
 async def _rebuild_static_prefix_only(llm, node_id: str) -> None:
@@ -1016,7 +1019,6 @@ async def _rebuild_static_prefix_only(llm, node_id: str) -> None:
     bucket.pop("static_template_hash", None)
     bucket.pop("topology_id", None)
     get_store_registry().turn_slots.purge_node(node_id)
-    get_store_registry().asst_anchors.purge_node(node_id)
     if stored_system and stored_user:
         await llm.prepare_prefix_kv_segments(node_id, stored_system, stored_user)
         return
@@ -2150,6 +2152,7 @@ class KvcommEngineAdapter:
         quick_note_bridge = ctx.task_profile == "clawbench" and is_quick_note_task(ctx)
         normalizer_bridge = ctx.task_profile == "clawbench" and is_add_tests_normalizer_task(ctx)
         config_loader_bridge = ctx.task_profile == "clawbench" and is_config_loader_task(ctx)
+        find_that_bridge = ctx.task_profile == "clawbench" and is_find_that_task(ctx)
         browser_bridge = ctx.task_profile == "clawbench" and is_browser_family_task(ctx)
         chain_workspace = str((ctx.vars or {}).get("workspace_dir") or "")
         if browser_bridge and chain_workspace:
@@ -2251,6 +2254,32 @@ class KvcommEngineAdapter:
             config_loader_bridge
             and agent_idx == 2
             and config_loader_verifier_should_force_read(messages)
+        )
+        force_find_that_extractor_done = (
+            find_that_bridge
+            and agent_idx == 0
+            and find_that_source_located(messages)
+        )
+        force_find_that_writer_copy = (
+            find_that_bridge
+            and agent_idx == 1
+            and find_that_source_located(messages)
+            and not find_that_copy_satisfied(messages)
+        )
+        force_find_that_writer_done = (
+            find_that_bridge
+            and agent_idx == 1
+            and find_that_copy_satisfied(messages)
+        )
+        force_find_that_verifier_exec = (
+            find_that_bridge
+            and agent_idx == 2
+            and not find_that_verifier_exec_done(messages)
+        )
+        force_find_that_verifier_done = (
+            find_that_bridge
+            and agent_idx == 2
+            and find_that_verifier_passed(messages)
         )
         force_text_only = (
             bugfix_bridge
@@ -2817,6 +2846,89 @@ class KvcommEngineAdapter:
             )
             logger.debug(
                 "[tool-bridge] run_id={} agent=2 pytest passed — forcing text-only PASS",
+                ctx.run_id,
+            )
+        elif force_find_that_extractor_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nDocuments/q3_marketing_budget_v3.xlsx is already in context above. "
+                "Summarize the deliverable: source path, target copy path "
+                "(Desktop/q3_marketing_budget.xlsx), and what the user asked for. "
+                "Do not call exec, read, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 find-that source located — forcing text-only",
+                ctx.run_id,
+            )
+        elif force_find_that_writer_copy:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_find_that_writer_copy_hint()
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 find-that copy pending — forcing exec-only",
+                ctx.run_id,
+            )
+        elif force_find_that_writer_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nDesktop/q3_marketing_budget.xlsx was copied successfully and is shown "
+                "in context above. Reply DONE in plain text summarizing the copy. "
+                "Do not call exec, read, write, edit, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 find-that copy satisfied — forcing text-only DONE",
+                ctx.run_id,
+            )
+        elif force_find_that_verifier_exec:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_find_that_verifier_exec_hint()
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 find-that verify pending — forcing exec-only",
+                ctx.run_id,
+            )
+        elif force_find_that_verifier_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nverify_correct_file.py passed and is shown in context above. "
+                "Reply PASS in plain text summarizing verification. "
+                "Do not call exec, read, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 find-that verify passed — forcing text-only PASS",
                 ctx.run_id,
             )
         elif force_quick_note_writer_done:

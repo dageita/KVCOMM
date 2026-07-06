@@ -68,3 +68,27 @@ def test_required_tools_use_role_for_non_bugfix_tasks() -> None:
         task_id=BUGFIX_DISCOUNT_TASK_ID,
     )
     assert "read" in bugfix_tools
+
+
+def test_required_tools_tools_family_includes_exec() -> None:
+    extractor = _required_tools_for_agent(
+        agent_index=0,
+        agent_role="Extractor",
+        task_id="t2-fs-find-that-thing",
+        clawbench_family="tools",
+    )
+    assert extractor == frozenset({"read", "exec"})
+    writer = _required_tools_for_agent(
+        agent_index=1,
+        agent_role="Writer",
+        task_id="t2-fs-find-that-thing",
+        clawbench_family="tools",
+    )
+    assert writer == frozenset({"read", "write", "edit", "exec"})
+    verifier = _required_tools_for_agent(
+        agent_index=2,
+        agent_role="Verifier",
+        task_id="t2-fs-find-that-thing",
+        clawbench_family="tools",
+    )
+    assert verifier == frozenset({"read", "exec"})

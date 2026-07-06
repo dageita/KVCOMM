@@ -24,8 +24,8 @@ FAMILY_ROLES = {
 FAMILY_AGENT_0_JOB = {
     "tools": (
         "Your job (Agent 0 - Extractor): Read the user request and explore the workspace "
-        "with read/search tools. Summarize what must be delivered and which files or data matter. "
-        "Do not write or edit files yet."
+        "with read and exec (rg/find/grep). Summarize what must be delivered and which files "
+        "or data matter. Do not write or edit files yet."
     ),
     "coding": (
         "Your job (Agent 0 - Analyzer): Read relevant source and test files. "
@@ -175,7 +175,9 @@ def build_tool_constraints(task: dict, agent_index: int, roles: list[str]) -> st
         if "browser" in required or family == "browser":
             lines.append("Use the browser tool (target: host) to reproduce the issue before editing files.")
         if "search" in required:
-            lines.append("Use read and search tools to explore the workspace before making changes.")
+            lines.append(
+                "Use read and exec (rg/find/grep) to search the workspace before making changes."
+            )
         elif "read" in required:
             lines.append("Use read tools on relevant files before making changes.")
         lines.append("Do NOT edit, write, or exec unless your role requires it.")

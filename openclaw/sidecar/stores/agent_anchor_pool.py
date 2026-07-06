@@ -22,6 +22,8 @@ class AgentAnchorEntry:
     ph_token_end: int = 0
     pf_span_id: str | None = None
     content_hash: str = ""
+    ph_key_embedding: Any | None = None
+    ph_value_embedding: Any | None = None
     ph_delta: Any = None
     ph_value_delta: Any | None = None
     pf_delta: Any | None = None
@@ -72,6 +74,8 @@ class AgentAnchorPool:
         pf_segment_len: int | None = None,
         ph_value_delta: Any | None = None,
         pf_value_delta: Any | None = None,
+        ph_key_embedding: Any | None = None,
+        ph_value_embedding: Any | None = None,
         delta_key: DeltaAnchorKey | None = None,
     ) -> AgentAnchorEntry:
         if delta_key is not None:
@@ -106,6 +110,8 @@ class AgentAnchorPool:
             ph_token_end=int(ph_token_end),
             pf_span_id=pf_span_id,
             content_hash=str(content_hash),
+            ph_key_embedding=ph_key_embedding,
+            ph_value_embedding=ph_value_embedding,
             ph_delta=ph_delta,
             ph_value_delta=ph_value_delta,
             pf_delta=pf_delta,
@@ -195,6 +201,11 @@ class AgentAnchorPool:
                 or str(entry.pf_span_id or "") != str(current.pf_span_id or "")
                 or entry.static_template_hash != current.static_template_hash
                 or entry.topology_id != current.topology_id
+                or (
+                    entry.content_hash
+                    and current.content_hash
+                    and entry.content_hash != current.content_hash
+                )
             ):
                 self._entries.pop(key, None)
                 removed.append(entry.ph_id)

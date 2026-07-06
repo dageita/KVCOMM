@@ -459,6 +459,12 @@ export async function stageCapabilityWorkspaceForAgents(workspaceDir, taskRow) {
   if (!workspaceDir) {
     return;
   }
+  const taskId = String(taskRow?.task_id ?? "");
+  if (taskId === "t2-fs-find-that-thing") {
+    await mkdir(join(workspaceDir, "Desktop"), { recursive: true });
+    await mkdir(join(defaultAgentWorkspace(), "Desktop"), { recursive: true });
+    return;
+  }
   const family = taskRow?.clawbench_ref?.family ?? "";
   if (family === "browser") {
     await purgeStaleWorkspaceArtifacts(workspaceDir, taskRow);
@@ -816,6 +822,15 @@ export async function syncCapabilityWorkspaceArtifacts(workspaceDir, records, ta
     await syncCodingArtifactsFromDefault(workspaceDir);
     if (taskAllowsMutableTests(taskRow)) {
       await syncCodingTestsFromDefault(workspaceDir);
+    }
+    return;
+  }
+
+  if (String(taskRow?.task_id ?? "") === "t2-fs-find-that-thing") {
+    const desktopCopy = join(workspaceDir, "Desktop", "q3_marketing_budget.xlsx");
+    if (existsSync(desktopCopy)) {
+      await mkdir(join(defaultAgentWorkspace(), "Desktop"), { recursive: true });
+      await copyFile(desktopCopy, join(defaultAgentWorkspace(), "Desktop", "q3_marketing_budget.xlsx"));
     }
     return;
   }

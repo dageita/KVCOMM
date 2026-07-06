@@ -738,6 +738,224 @@ class LLMChat(LLM):
             return False
         return bool(resp.get(message_key))
 
+    def _mark_turn_tool_delta_retry_eligible(
+        self,
+        *,
+        node_id: str,
+        message_key: str,
+        ph_id: str,
+        content_hash: str,
+    ) -> None:
+        """Mark ph as eligible for topology-locked delta blend after contextual materialize."""
+        bucket = LLMChat._shared_kv_cache_memory.setdefault(str(node_id), {})
+        retry = bucket.setdefault("_turn_delta_retry_eligible", {})
+        msg_bucket = retry.setdefault(str(message_key), {})
+        msg_bucket[str(ph_id)] = str(content_hash)
+
+    def _turn_tool_delta_retry_allowed(self, ph_id: str, message: str, content_hash: str) -> bool:
+        bucket = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
+        retry = bucket.get("_turn_delta_retry_eligible") or {}
+        msg_bucket = retry.get(str(message)) or {}
+        return str(msg_bucket.get(str(ph_id), "")) == str(content_hash)
+
+    def _clear_turn_tool_delta_retry_eligible(
+        self,
+        *,
+        node_id: str,
+        message_key: str,
+        ph_id: str,
+    ) -> None:
+        bucket = LLMChat._shared_kv_cache_memory.get(str(node_id)) or {}
+        if not isinstance(bucket, dict):
+            return
+        retry = bucket.get("_turn_delta_retry_eligible")
+        if not isinstance(retry, dict):
+            return
+        msg_bucket = retry.get(str(message_key))
+        if isinstance(msg_bucket, dict):
+            msg_bucket.pop(str(ph_id), None)
+
+    def _has_turn_tool_consumer_slot(self, ph_id: str, message: str) -> bool:
+        if str(ph_id).endswith("_tool"):
+            return self.resolve_tool_consumer_slot(str(ph_id), str(message)) is not None
+        if str(ph_id).endswith("_assistant"):
+            return self.resolve_llm_branch_slot(str(ph_id), str(message)) is not None
+        return False
+
+    def _turn_content_hash_for_ph(self, ph_id: str, message: str) -> str:
+        slot = self.resolve_turn_ph_slot(str(ph_id), str(message))
+        if slot is not None and slot.content_hash:
+            return str(slot.content_hash)
+        return ""
+
+    def _delta_key_for_ph(self, ph_id: str, message: str, *, content_hash: str = ""):
+        from sidecar.stores.prefix_spans import normalize_placeholder_info
+        from sidecar.stores.topology_anchor import delta_key_from_ph_rec
+
+        prefix_store = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
+        ph_info = normalize_placeholder_info(prefix_store.get("placeholder_info"))
+        ph_rec = ph_info.get(str(ph_id))
+        if not isinstance(ph_rec, dict):
+            return None
+        if not content_hash:
+            if _TURN_PLACEHOLDER_RE.match(str(ph_id)):
+                content_hash = self._turn_content_hash_for_ph(str(ph_id), str(message))
+            else:
+                content_hash = self._upstream_agent_content_hash(str(ph_id), str(message)) or ""
+        return delta_key_from_ph_rec(
+            ph_id=str(ph_id),
+            ph_rec=ph_rec,
+            static_template_hash=str(prefix_store.get("static_template_hash") or ""),
+            topology_id=str(prefix_store.get("topology_id") or ""),
+            content_hash=str(content_hash or ""),
+        )
+
+    def _anchor_dict_from_pool_entry(
+        self,
+        pool_entry,
+        *,
+        delta_key,
+    ) -> list:
+        from sidecar.stores.topology_anchor import serialize_anchor_key
+
+        if pool_entry is None or pool_entry.ph_delta is None:
+            return []
+        if pool_entry.ph_key_embedding is None or pool_entry.ph_value_embedding is None:
+            return []
+        topo_blob = serialize_anchor_key(delta_key)
+        pf_key_delta = pool_entry.pf_delta
+        pf_value_delta = pool_entry.pf_value_delta
+        if pf_key_delta is None or pf_value_delta is None:
+            return []
+        return [
+            {
+                "ph_key_embedding": pool_entry.ph_key_embedding,
+                "ph_value_embedding": pool_entry.ph_value_embedding,
+                f"{self.node_id}_ph_key_delta": pool_entry.ph_delta,
+                f"{self.node_id}_ph_value_delta": pool_entry.ph_value_delta,
+                f"{self.node_id}_pf_key_delta": pf_key_delta,
+                f"{self.node_id}_pf_value_delta": pf_value_delta,
+                "anchor_topology_key": topo_blob,
+            }
+        ]
+
+    def _topology_locked_turn_tool_anchors(self, ph_id: str, message: str) -> list:
+        """Dual-lock delta reuse for turn_* / tool: topology + content_hash must match exactly."""
+        from sidecar.stores.topology_anchor import stored_key_matches
+
+        content_hash = self._turn_content_hash_for_ph(str(ph_id), str(message))
+        if not content_hash:
+            return []
+        delta_key = self._delta_key_for_ph(str(ph_id), str(message), content_hash=content_hash)
+        if delta_key is None:
+            return []
+        pool_entry = self._get_store_registry().agent_anchors.get_by_topology_key(
+            node_id=str(self.node_id),
+            message_key=str(message),
+            delta_key=delta_key,
+        )
+        if pool_entry is None:
+            return []
+        stored = {
+            "static_template_hash": pool_entry.static_template_hash,
+            "topology_id": pool_entry.topology_id,
+            "ph_token_start": pool_entry.ph_token_start,
+            "ph_token_end": pool_entry.ph_token_end,
+            "pf_span_id": pool_entry.pf_span_id,
+            "content_hash": pool_entry.content_hash,
+        }
+        if not stored_key_matches(stored, delta_key):
+            return []
+        if not self._turn_tool_delta_retry_allowed(str(ph_id), str(message), content_hash):
+            return []
+        return self._anchor_dict_from_pool_entry(pool_entry, delta_key=delta_key)
+
+    def _sync_contextual_materialize_delta_to_pool(
+        self,
+        *,
+        consumer_node_id: str,
+        message_key: str,
+        ph_id: str,
+        content_hash: str,
+        contextual_kv: Any,
+    ) -> None:
+        """Persist contextual ph/pf deltas under topology+content_hash keys for same-run retry."""
+        from sidecar.stores.prefix_spans import normalize_placeholder_info
+        from sidecar.stores.topology_anchor import delta_key_from_ph_rec
+
+        prefix_store = LLMChat._shared_kv_cache_memory.get(str(consumer_node_id)) or {}
+        ph_info = normalize_placeholder_info(prefix_store.get("placeholder_info"))
+        ph_rec = ph_info.get(str(ph_id))
+        if not isinstance(ph_rec, dict):
+            return
+        template_rec = self._get_store_registry().template_ph_base.get_for_ph(
+            str(consumer_node_id),
+            str(ph_id),
+        )
+        if template_rec is None or template_rec.absolute_kv is None:
+            return
+
+        ph_key_real, ph_val_real = self.kv_engine._stack_cache_tensors(contextual_kv)
+        ph_key_base, ph_val_base = self.kv_engine._stack_cache_tensors(template_rec.absolute_kv)
+        real_len = int(ph_key_real.shape[-2])
+        base_len = int(ph_key_base.shape[-2])
+        if real_len > base_len:
+            pad_shape = (*ph_key_base.shape[:-2], real_len - base_len, ph_key_base.shape[-1])
+            pad_k = torch.zeros(pad_shape, device=ph_key_base.device, dtype=ph_key_base.dtype)
+            pad_v = torch.zeros_like(pad_k)
+            ph_key_base = torch.cat([ph_key_base, pad_k], dim=-2)
+            ph_val_base = torch.cat([ph_val_base, pad_v], dim=-2)
+        elif real_len < base_len:
+            ph_key_base = ph_key_base[..., :real_len, :]
+            ph_val_base = ph_val_base[..., :real_len, :]
+
+        ph_key_delta = ph_key_real - ph_key_base
+        ph_val_delta = ph_val_real - ph_val_base
+
+        prefix_kv_list = prefix_store.get("prefix") or []
+        pf_kv, _ = self._resolve_pf_for_ph(
+            str(consumer_node_id),
+            str(ph_id),
+            prefix_store=prefix_store,
+            prefix_kv_list=prefix_kv_list,
+        )
+        pf_key, pf_val = self.kv_engine._stack_cache_tensors(pf_kv)
+        pf_key_delta = torch.zeros_like(pf_key)
+        pf_val_delta = torch.zeros_like(pf_val)
+        pf_len = self._prefix_segment_len_for_placeholder(str(ph_id))
+
+        static_hash = str(prefix_store.get("static_template_hash") or "")
+        topo = str(prefix_store.get("topology_id") or "")
+        delta_key = delta_key_from_ph_rec(
+            ph_id=str(ph_id),
+            ph_rec=ph_rec,
+            static_template_hash=static_hash,
+            topology_id=topo,
+            content_hash=str(content_hash),
+        )
+        self._get_store_registry().agent_anchors.put(
+            node_id=str(consumer_node_id),
+            message_key=str(message_key),
+            ph_id=str(ph_id),
+            static_template_hash=static_hash,
+            upstream_hash=str(message_key),
+            ph_key_embedding=ph_key_base,
+            ph_value_embedding=ph_val_base,
+            ph_delta=ph_key_delta,
+            ph_value_delta=ph_val_delta,
+            pf_delta=pf_key_delta,
+            pf_value_delta=pf_val_delta,
+            pf_segment_len=pf_len,
+            delta_key=delta_key,
+        )
+        if _TURN_PLACEHOLDER_RE.match(str(ph_id)):
+            self._mark_turn_tool_delta_retry_eligible(
+                node_id=str(consumer_node_id),
+                message_key=str(message_key),
+                ph_id=str(ph_id),
+                content_hash=str(content_hash),
+            )
+
     def _kv_reuse_anchors_for_ph(
         self,
         ph_id: str,
@@ -747,14 +965,9 @@ class LLMChat(LLM):
         """Return anchor list for kv_reuse blend; empty list = pass-through rotate only."""
         ph_id = str(ph_id)
         if _TURN_PLACEHOLDER_RE.match(ph_id):
-            if ph_id.endswith("_tool"):
-                if self.resolve_tool_consumer_slot(ph_id, message) is not None:
-                    return []
-            elif self.resolve_llm_branch_slot(ph_id, message) is not None:
+            if self._has_turn_tool_consumer_slot(ph_id, message):
                 return []
-            slot = self.resolve_turn_ph_slot(ph_id, message)
-            if slot is not None and (slot.kv_ref or slot.absolute_kv is not None):
-                return []
+            return self._topology_locked_turn_tool_anchors(ph_id, message)
         upstream_idx = self._upstream_agent_index(ph_id)
         if upstream_idx is not None:
             try:
@@ -770,42 +983,17 @@ class LLMChat(LLM):
         if not isinstance(bucket, dict):
             bucket = {}
 
-        prefix_store = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
-        from sidecar.stores.prefix_spans import normalize_placeholder_info
-        from sidecar.stores.topology_anchor import (
-            delta_key_from_ph_rec,
-            serialize_anchor_key,
-        )
-
-        ph_info = normalize_placeholder_info(prefix_store.get("placeholder_info"))
-        ph_rec = ph_info.get(ph_id)
-        if isinstance(ph_rec, dict):
-            static_hash = str(prefix_store.get("static_template_hash") or "")
-            topo = str(prefix_store.get("topology_id") or "")
-            content_hash = self._upstream_agent_content_hash(ph_id, message) or ""
-            delta_key = delta_key_from_ph_rec(
-                ph_id=ph_id,
-                ph_rec=ph_rec,
-                static_template_hash=static_hash,
-                topology_id=topo,
-                content_hash=content_hash,
-            )
+        delta_key = self._delta_key_for_ph(ph_id, message)
+        if delta_key is not None:
             pool_entry = self._get_store_registry().agent_anchors.get_by_topology_key(
                 node_id=str(self.node_id),
                 message_key=str(message),
                 delta_key=delta_key,
             )
             if pool_entry is not None and pool_entry.ph_delta is not None:
-                topo_blob = serialize_anchor_key(delta_key)
-                return [
-                    {
-                        f"{self.node_id}_ph_key_delta": pool_entry.ph_delta,
-                        f"{self.node_id}_ph_value_delta": pool_entry.ph_value_delta,
-                        f"{self.node_id}_pf_key_delta": pool_entry.pf_delta,
-                        f"{self.node_id}_pf_value_delta": pool_entry.pf_value_delta,
-                        "anchor_topology_key": topo_blob,
-                    }
-                ]
+                anchored = self._anchor_dict_from_pool_entry(pool_entry, delta_key=delta_key)
+                if anchored:
+                    return anchored
 
         if not bucket:
             return []
@@ -2078,6 +2266,13 @@ class LLMChat(LLM):
             slot_token_start=slot_start,
             drop_num=0,
         )
+        self._sync_contextual_materialize_delta_to_pool(
+            consumer_node_id=str(consumer_node_id),
+            message_key=str(message_key),
+            ph_id=str(ph_id),
+            content_hash=str(content_hash),
+            contextual_kv=ctx_relative,
+        )
         return True
 
     def _turn_index_from_ph_id(self, ph_id: str) -> int:
@@ -2158,6 +2353,13 @@ class LLMChat(LLM):
             tool_call_hash=str(tool_call_hash or ""),
             drop_num=0,
         )
+        self._sync_contextual_materialize_delta_to_pool(
+            consumer_node_id=str(consumer_node_id),
+            message_key=str(message_key),
+            ph_id=str(ph_id),
+            content_hash=str(content_hash),
+            contextual_kv=ctx_relative,
+        )
         return True
 
     def _materialize_llm_branch_slot_sync(
@@ -2222,6 +2424,13 @@ class LLMChat(LLM):
             slot_token_start=slot_start,
             turn_index=int(turn_index),
             drop_num=0,
+        )
+        self._sync_contextual_materialize_delta_to_pool(
+            consumer_node_id=str(consumer_node_id),
+            message_key=str(message_key),
+            ph_id=str(ph_id),
+            content_hash=str(content_hash),
+            contextual_kv=ctx_relative,
         )
         return True
 
@@ -2523,6 +2732,8 @@ class LLMChat(LLM):
                 ph_id=str(ph_id),
                 static_template_hash=static_hash,
                 upstream_hash=str(message),
+                ph_key_embedding=entry.get("ph_key_embedding"),
+                ph_value_embedding=entry.get("ph_value_embedding"),
                 ph_delta=entry.get(delta_ph),
                 ph_value_delta=entry.get(f"{self.node_id}_ph_value_delta"),
                 pf_delta=entry.get(delta_pf),
@@ -2696,6 +2907,12 @@ class LLMChat(LLM):
             existing_slot = stores.turn_slots.get(node_id, message_key, ph_id)
             if existing_slot is not None and existing_slot.content_hash == content_hash:
                 continue
+            if existing_slot is not None:
+                self._clear_turn_tool_delta_retry_eligible(
+                    node_id=str(node_id),
+                    message_key=str(message_key),
+                    ph_id=str(ph_id),
+                )
 
             is_tool = ph_id.endswith("_tool")
             if is_tool:
