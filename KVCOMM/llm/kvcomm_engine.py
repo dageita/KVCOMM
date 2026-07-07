@@ -1317,6 +1317,18 @@ class KVCOMMEngine:
         type_str, node_id, *rest = ph_id.split("_")
         is_current = (rest and rest[0] == "current")
         if type_str in ("agent", "condition") and is_current:
+            consumer_slot = self.llm._resolve_upstream_consumer_slot(ph_id, message)
+            if consumer_slot is not None and consumer_slot.absolute_kv is not None:
+                token_ids = (
+                    consumer_slot.token_ids
+                    if isinstance(consumer_slot.token_ids, dict)
+                    else {}
+                )
+                return (
+                    consumer_slot.absolute_kv,
+                    token_ids,
+                    int(consumer_slot.drop_num),
+                )
             upstream_slot = self.llm.resolve_upstream_agent_slot(ph_id, message)
             if upstream_slot is not None and upstream_slot.absolute_kv is not None:
                 token_ids = upstream_slot.token_ids if isinstance(upstream_slot.token_ids, dict) else {}

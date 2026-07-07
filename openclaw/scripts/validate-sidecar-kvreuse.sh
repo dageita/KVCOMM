@@ -30,7 +30,12 @@ body = {
 ctx = parse_kvcomm_context(body, {}, "dense_prefill")
 assert ctx.agent_index == "2" and ctx.mode == "kv_reuse"
 register_pending_context({"run_id": "run-a", "agent_index": 0, "mode": "dense_prefill", "message_key": "warm"})
+from KVCOMM.llm.gpt_chat import LLMChat
+LLMChat._ensure_shared_kv_memory()
+LLMChat._shared_kv_cache_memory["1"] = {"_consumer_tool_schema_stable": {"warm": True}}
 register_pending_context({"run_id": "run-b", "agent_index": 0, "mode": "kv_reuse", "message_key": "meas"})
+assert not (LLMChat._shared_kv_cache_memory.get("1") or {}).get("_consumer_tool_schema_stable")
+assert LLMChat.consumer_first_measure_dense_pending()
 meta_body = {
     "messages": [
         {"role": "user", "content": '<!--KVCOMM_META:{"run_id":"run-b","agent_index":0,"mode":"kv_reuse"}-->\ntask'},

@@ -52,7 +52,7 @@ def test_topology_plan_append_vs_regression() -> None:
         },
         initialized=True,
     )
-    assert regression.action == "static_rebuild"
+    assert regression.action == "rewind_turns"
     assert regression.reason == "turn_count_regression_new_run"
 
 
@@ -209,3 +209,36 @@ def test_agent_anchor_pool_topology_key_includes_content_hash() -> None:
     hit = pool.get_by_topology_key(node_id="1", message_key="msg", delta_key=key)
     assert hit is not None
     assert hit.content_hash == "content-abc"
+
+
+def test_apply_pooled_placeholder_anchor_uses_node_delta_key() -> None:
+    from types import SimpleNamespace
+
+    from sidecar.kvcomm_adapter import _apply_pooled_placeholder_anchor
+
+    state = SimpleNamespace(
+        anchors={},
+        anchor_dict={},
+        anchor_len_dict={},
+        anchor_info_dict={},
+        global_anchor_info={},
+    )
+    llm = SimpleNamespace(kv_engine=SimpleNamespace(resolve_request_state=lambda _uid: state))
+    delta = {"tensor": "payload"}
+    snapshot = {
+        "anchors": {
+            "agent_0_current": {
+                "msg-key": {"2_ph_key_delta": delta},
+            }
+        }
+    }
+    assert _apply_pooled_placeholder_anchor(
+        llm,
+        "run-1",
+        snapshot,
+        ph_id="agent_0_current",
+        message="msg-key",
+        delta_key="2_ph_key_delta",
+    )
+    assert state.anchors["agent_0_current"]["msg-key"]["2_ph_key_delta"] == delta
+

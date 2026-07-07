@@ -340,6 +340,7 @@ class LLMChat(LLM):
     _THREAD_POOL_WORKERS: int | None = None
     _shared_kv_cache_memory = None
     _initialization = {}
+    _consumer_first_measure_dense_pending: bool = False
     anchors = KVCOMMEngine.anchors
     anchor_dict = KVCOMMEngine.anchor_dict
     anchor_len_dict = KVCOMMEngine.anchor_len_dict
@@ -729,6 +730,164 @@ class LLMChat(LLM):
         except (TypeError, ValueError):
             return None
 
+    def _has_upstream_agent_placeholder(self) -> bool:
+        """True when this node's prefix includes an upstream ``agent_*_current`` slot."""
+        bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        ph_info = bucket.get("placeholder_info") if isinstance(bucket, dict) else None
+        if not isinstance(ph_info, dict):
+            return False
+        try:
+            node_idx = int(self.node_id)
+        except (TypeError, ValueError):
+            return False
+        for ph_id in ph_info:
+            upstream_idx = self._upstream_agent_index(str(ph_id))
+            if upstream_idx is not None and upstream_idx < node_idx:
+                return True
+        return False
+
+    def _requires_dense_for_tool_injection(self) -> bool:
+        """Tool-schema turns on consumer nodes must dense-prefill (kv_reuse KV misaligns)."""
+        return self._has_upstream_agent_placeholder()
+
+    def _should_force_dense_consumer_tool_schema(
+        self,
+        *,
+        message: str,
+        request_uid: str,
+        full_tool_schema: bool = True,
+        tool_schema_hash: str | None = None,
+        deliverable_hash: str | None = None,
+    ) -> bool:
+        """Dense when consumer full tool-schema KV is not yet stable for this message."""
+        if not self._has_upstream_agent_placeholder():
+            return False
+        if LLMChat.consumer_first_measure_dense_pending():
+            return True
+        if full_tool_schema and tool_schema_hash:
+            branch = self.resolve_tool_schema_branch(
+                str(message),
+                str(tool_schema_hash),
+                str(deliverable_hash or ""),
+            )
+            if branch is not None:
+                return False
+        if self.consumer_tool_schema_stable(message):
+            return False
+        if not full_tool_schema:
+            # Exec-only / single-tool hints can attempt kv_reuse before dense fallback.
+            missing = self.placeholders_missing_anchor_delta(request_uid, message)
+            return bool(missing)
+        return True
+
+    def resolve_tool_schema_branch(
+        self,
+        message_key: str,
+        schema_hash: str,
+        deliverable_hash: str,
+    ):
+        """Lookup pooled schema branch by schema+deliverable hash (exact, then schema-only)."""
+        stores = self._get_store_registry()
+        hit = stores.tool_schema_branches.get(
+            str(self.node_id),
+            str(message_key),
+            str(schema_hash),
+            str(deliverable_hash),
+        )
+        if hit is not None:
+            return hit
+        return stores.tool_schema_branches.find_for_schema(
+            str(self.node_id),
+            str(message_key),
+            str(schema_hash),
+        )
+
+    def _pool_tool_schema_branch_after_dense(
+        self,
+        *,
+        message: str,
+        full_kv_cache,
+        prefix_token_length: int,
+        generation_prompt_length: int,
+        tool_injection_text: str,
+        deliverable_hash: str,
+        tool_call_hash: str = "",
+    ):
+        """Pool schema-segment KV (rotary-relative to prefix boundary) after dense tool turn."""
+        from sidecar.stores.hashing import tool_schema_hash
+
+        schema_hash = tool_schema_hash(tool_injection_text)
+        schema_token_len = int(generation_prompt_length) - int(prefix_token_length)
+        if schema_token_len <= 0:
+            return None
+
+        schema_kv = full_kv_cache.slice_(start=int(prefix_token_length), end=int(generation_prompt_length))
+        schema_relative = self.kv_engine.apply_rotary_pos_emb(
+            schema_kv,
+            offset=-int(prefix_token_length),
+            drop_num=0,
+        )
+        token_dict = self.tokenizer(
+            tool_injection_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )
+        token_dict = {
+            key: value.to(self.model.device) if isinstance(value, torch.Tensor) else value
+            for key, value in token_dict.items()
+        }
+        slot = self._get_store_registry().tool_schema_branches.put(
+            consumer_node_id=str(self.node_id),
+            message_key=str(message),
+            schema_hash=str(schema_hash),
+            deliverable_hash=str(deliverable_hash or ""),
+            prefix_boundary_len=int(prefix_token_length),
+            schema_token_len=int(schema_token_len),
+            absolute_kv=schema_relative,
+            token_ids=token_dict,
+            tool_call_hash=str(tool_call_hash or ""),
+        )
+        logger.debug(
+            "pooled tool schema branch node_id={} message_key={} schema={} deliverable={} "
+            "boundary={} schema_tokens={}",
+            self.node_id,
+            _short_message_key(message),
+            schema_hash[:12],
+            str(deliverable_hash or "")[:12],
+            prefix_token_length,
+            schema_token_len,
+        )
+        return slot
+
+    @classmethod
+    def set_consumer_first_measure_dense_pending(cls, value: bool) -> None:
+        cls._consumer_first_measure_dense_pending = bool(value)
+
+    @classmethod
+    def consumer_first_measure_dense_pending(cls) -> bool:
+        return bool(cls._consumer_first_measure_dense_pending)
+
+    @staticmethod
+    def clear_consumer_tool_schema_stable_all() -> None:
+        shared = LLMChat._ensure_shared_kv_memory()
+        for key in list(shared.keys()):
+            if not str(key).isdigit() or int(key) <= 0:
+                continue
+            bucket = shared.get(key)
+            if isinstance(bucket, dict):
+                bucket.pop("_consumer_tool_schema_stable", None)
+
+    def consumer_tool_schema_stable(self, message: str) -> bool:
+        bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        stable = bucket.get("_consumer_tool_schema_stable") if isinstance(bucket, dict) else None
+        return bool((stable or {}).get(str(message)))
+
+    def mark_consumer_tool_schema_stable(self, message: str) -> None:
+        bucket = LLMChat._ensure_shared_kv_memory().setdefault(str(self.node_id), {})
+        stable = bucket.setdefault("_consumer_tool_schema_stable", {})
+        stable[str(message)] = True
+        LLMChat.set_consumer_first_measure_dense_pending(False)
+
     def _upstream_response_kv_available(self, upstream_node: str, message_key: str) -> bool:
         bucket = LLMChat._shared_kv_cache_memory.get(str(upstream_node)) or {}
         if not isinstance(bucket, dict):
@@ -974,11 +1133,13 @@ class LLMChat(LLM):
                 node_idx = int(self.node_id)
             except (TypeError, ValueError):
                 node_idx = -1
-            slot = self.resolve_upstream_agent_slot(ph_id, message)
-            if slot is not None and slot.materialization in ("consumer_contextual", "producer_contextual"):
-                return []
-            if upstream_idx < node_idx and self._upstream_response_kv_available(str(upstream_idx), message):
-                return []
+            if upstream_idx < node_idx:
+                if self._resolve_upstream_consumer_slot(ph_id, message) is not None:
+                    return []
+            else:
+                slot = self.resolve_upstream_agent_slot(ph_id, message)
+                if slot is not None and slot.materialization == "producer_contextual":
+                    return []
         bucket = anchors_for_node.get(ph_id)
         if not isinstance(bucket, dict):
             bucket = {}
@@ -1586,6 +1747,48 @@ class LLMChat(LLM):
         latency_target = output_dir or kwargs.get("output_dir")
         missing_delta = self.placeholders_missing_anchor_delta(request_uid, message)
         mode = self.resolve_generation_mode(request_uid, message, preferred_mode)
+        tool_injection = kwargs.get("tool_injection_text")
+        tool_schema_injection = bool(kwargs.get("tool_schema_injection"))
+        full_tool_schema = bool(kwargs.get("full_tool_schema", True))
+        tool_schema_hash_val: str | None = None
+        deliverable_hash = str(kwargs.get("tool_deliverable_fingerprint") or "")
+        if isinstance(tool_injection, str) and tool_injection.strip():
+            try:
+                from sidecar.stores.hashing import tool_schema_hash
+
+                tool_schema_hash_val = tool_schema_hash(tool_injection)
+            except ImportError:
+                pass
+        force_dense_tool = False
+        if (
+            tool_schema_injection
+            and isinstance(tool_injection, str)
+            and tool_injection.strip()
+            and mode == "kv_reuse"
+        ):
+            if self._should_force_dense_consumer_tool_schema(
+                message=message,
+                request_uid=request_uid,
+                full_tool_schema=full_tool_schema,
+                tool_schema_hash=tool_schema_hash_val,
+                deliverable_hash=deliverable_hash,
+            ):
+                force_dense_tool = True
+        if force_dense_tool:
+            logger.debug(
+                "consumer tool-schema turn node_id={} missing_delta={} stable={} pending={} "
+                "full_schema={} schema_branch={} -> dense_prefill",
+                self.node_id,
+                missing_delta,
+                self.consumer_tool_schema_stable(message),
+                LLMChat.consumer_first_measure_dense_pending(),
+                full_tool_schema,
+                bool(
+                    tool_schema_hash_val
+                    and self.resolve_tool_schema_branch(message, tool_schema_hash_val, deliverable_hash)
+                ),
+            )
+            mode = "dense_prefill"
         logger.debug(
             "generate_for_agent routing: preferred_mode={} active_anchor={} missing_delta={} "
             "chosen_mode={} request_uid={} node_id={} message_key={}",
@@ -1613,8 +1816,8 @@ class LLMChat(LLM):
                 output_dir=latency_target,
                 **stream_kwargs,
             )
-        return await self.generate_with_kv_reuse(
-            message,
+        return await self._generate_with_optional_tool_dense_retry(
+            message=message,
             max_tokens=max_tokens,
             temperature=temperature,
             request_uid=request_uid,
@@ -1622,8 +1825,123 @@ class LLMChat(LLM):
             agent_name=agent_name,
             agent_role=agent_role,
             output_dir=latency_target,
+            stream_kwargs=stream_kwargs,
+        )
+
+    async def _generate_with_optional_tool_dense_retry(
+        self,
+        *,
+        message: str,
+        max_tokens: Optional[int],
+        temperature: Optional[float],
+        request_uid: str,
+        agent_id: Optional[str],
+        agent_name: Optional[str],
+        agent_role: Optional[str],
+        output_dir: Optional[Union[str, Path]],
+        stream_kwargs: dict[str, Any],
+    ) -> GenerationResult:
+        """Run kv_reuse; on tool-turn instruction spam, rematerialize slots and retry once."""
+        tool_injection = stream_kwargs.get("tool_injection_text")
+        tool_schema_injection = bool(stream_kwargs.get("tool_schema_injection"))
+        result = await self.generate_with_kv_reuse(
+            message,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            request_uid=request_uid,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_role=agent_role,
+            output_dir=output_dir,
             **stream_kwargs,
         )
+        if not (
+            tool_schema_injection
+            and isinstance(tool_injection, str)
+            and tool_injection.strip()
+            and result.mode == "kv_reuse"
+        ):
+            return result
+        try:
+            from sidecar.tool_bridge import (
+                is_degenerate_tool_guideline_spam,
+                tool_guideline_spam_without_tool_call,
+            )
+        except ImportError:
+            return result
+
+        def _raw_text(res: GenerationResult) -> str:
+            return str(res.metadata.get("raw_response_text") or res.text or "")
+
+        def _is_spam(res: GenerationResult) -> bool:
+            return is_degenerate_tool_guideline_spam(_raw_text(res))
+
+        def _spam_without_tool_call(res: GenerationResult) -> bool:
+            return tool_guideline_spam_without_tool_call(_raw_text(res))
+
+        async def _dense_prefill_fallback(reason: str) -> GenerationResult:
+            logger.warning(
+                "kv_reuse tool turn {} node_id={} message_key={}; dense_prefill",
+                reason,
+                self.node_id,
+                _short_message_key(message),
+            )
+            bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+            if isinstance(bucket, dict):
+                bucket.pop("_upstream_materialized", None)
+                bucket.pop("_tool_consumer_materialized", None)
+                for store_key in ("response", "response_ids", "response_drop_num"):
+                    store = bucket.get(store_key)
+                    if isinstance(store, dict):
+                        entries = store.get(message)
+                        if isinstance(entries, list) and entries:
+                            entries.pop()
+            return await self.generate_with_dense_prefill(
+                message,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                max_anchor_num=stream_kwargs.get("max_anchor_num", self.config.max_anchor_num),
+                window_length=stream_kwargs.get("window_length", self.config.window_size),
+                request_uid=request_uid,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                agent_role=agent_role,
+                output_dir=output_dir,
+                **stream_kwargs,
+            )
+
+        if not _is_spam(result):
+            return result
+        if _spam_without_tool_call(result):
+            return await _dense_prefill_fallback("guideline spam without tool_call")
+        logger.warning(
+            "kv_reuse tool turn produced preamble spam with tool_call node_id={} message_key={}; rematerialize + retry kv_reuse",
+            self.node_id,
+            _short_message_key(message),
+        )
+        await self._rematerialize_tool_turn_slots(message)
+        retry = await self.generate_with_kv_reuse(
+            message,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            request_uid=request_uid,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_role=agent_role,
+            output_dir=output_dir,
+            **stream_kwargs,
+        )
+        if not _is_spam(retry):
+            return retry
+        return await _dense_prefill_fallback("still spam after rematerialize")
+
+    async def _rematerialize_tool_turn_slots(self, message: str) -> None:
+        """Drop cached consumer materialization so tool-turn kv_reuse rebuilds slots."""
+        bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        if isinstance(bucket, dict):
+            bucket.pop("_upstream_materialized", None)
+            bucket.pop("_tool_consumer_materialized", None)
+        await self.prepare_consumer_upstream_slots(message)
 
     def _map_in_pool(self, fn, iterable, timeout=None):
         pool = LLMChat._THREAD_POOL
@@ -1951,18 +2269,122 @@ class LLMChat(LLM):
         if suffix_ids.shape[-1] <= 0:
             return past_kv
         attn = token_ids.get("attention_mask")
+        attn_len = int(past_len) + int(suffix_ids.shape[-1])
         if attn is None:
-            attn = torch.ones_like(token_ids["input_ids"])
+            attention_mask = torch.ones(
+                suffix_ids.shape[0],
+                attn_len,
+                dtype=torch.long,
+                device=suffix_ids.device,
+            )
+        else:
+            attention_mask = attn[:, :attn_len]
         with torch.no_grad():
             with LLMChat._model_lock:
                 output = self.model(
                     input_ids=suffix_ids,
-                    attention_mask=attn,
+                    attention_mask=attention_mask,
                     past_key_values=past_kv,
                     use_cache=True,
                     return_dict=True,
                 )
         return output.past_key_values
+
+    def _build_kv_reuse_generation_inputs(
+        self,
+        *,
+        merged_prefix_kv,
+        merged_prefix_token_ids: dict[str, torch.Tensor],
+        prefix_token_length: int,
+        tool_suffix_appended: bool,
+        tool_schema_branch=None,
+    ) -> tuple[Any, dict[str, torch.Tensor], int]:
+        """Prepare past_key_values + input_ids for kv_reuse generate.
+
+        When tool schema tokens were appended at the generation boundary, prefill
+        them into the cache and decode from the last prompt token only.
+
+        With a pooled ``ToolSchemaBranchSlot``, splice absolute schema KV instead
+        of suffix prefill (matched by schema_hash + deliverable_hash, not similarity).
+
+        ``prefix_token_length`` is the merged prefix token count *before* tool
+        suffix tokens were concatenated.  KV must be sliced to this boundary so
+        tool-suffix prefill aligns with visible ``input_ids``.
+        """
+        prefix_token_length = int(prefix_token_length)
+        if prefix_token_length <= 0:
+            raise RuntimeError("kv_reuse prefix_token_length must be positive")
+
+        kv_len = int(merged_prefix_kv.get_seq_length())
+        gen_ids = merged_prefix_token_ids
+        gen_prompt_len = int(gen_ids["input_ids"].shape[-1])
+
+        if kv_len < prefix_token_length:
+            raise RuntimeError(
+                f"kv_reuse prefix KV shorter than tokens (kv={kv_len} tokens={prefix_token_length})"
+            )
+
+        past_end = prefix_token_length - 1
+        past_kv = merged_prefix_kv.slice_(start=0, end=past_end)
+        if kv_len > prefix_token_length:
+            logger.debug(
+                "kv_reuse tool boundary: slice prefix KV {}→{} tokens",
+                kv_len,
+                prefix_token_length,
+            )
+
+        if tool_suffix_appended:
+            if gen_prompt_len <= prefix_token_length:
+                raise RuntimeError(
+                    f"kv_reuse tool suffix missing (full_len={gen_prompt_len} prefix={prefix_token_length})"
+                )
+            suffix_token_len = gen_prompt_len - prefix_token_length
+            if tool_schema_branch is not None:
+                branch = tool_schema_branch
+                boundary_drift = abs(int(branch.prefix_boundary_len) - prefix_token_length)
+                len_ok = int(branch.schema_token_len) == int(suffix_token_len)
+                if boundary_drift <= _MAX_PREFIX_LENGTH_DRIFT and len_ok:
+                    schema_kv = branch.absolute_kv
+                    if hasattr(schema_kv, "copy"):
+                        schema_kv = schema_kv.copy()
+                    schema_kv = self.kv_engine.apply_rotary_pos_emb(
+                        schema_kv,
+                        offset=int(prefix_token_length),
+                        drop_num=0,
+                    )
+                    past_kv.concat_(schema_kv)
+                    full_len = prefix_token_length + int(branch.schema_token_len)
+                    past_for_gen = past_kv.slice_(start=0, end=full_len - 1)
+                    if int(past_for_gen.get_seq_length()) <= 0:
+                        raise RuntimeError(
+                            f"kv_reuse schema branch splice empty (full_len={full_len})"
+                        )
+                    logger.debug(
+                        "kv_reuse tool schema branch splice boundary={} schema_tokens={}",
+                        prefix_token_length,
+                        branch.schema_token_len,
+                    )
+                    return past_for_gen, merged_prefix_token_ids, full_len
+                logger.debug(
+                    "tool schema branch mismatch boundary={}/{} schema_len={}/{} -> suffix prefill",
+                    branch.prefix_boundary_len,
+                    prefix_token_length,
+                    branch.schema_token_len,
+                    suffix_token_len,
+                )
+            past_kv = self._prefill_suffix_on_past_sync(past_kv, merged_prefix_token_ids, past_end)
+            full_len = int(merged_prefix_token_ids["input_ids"].shape[-1])
+            if full_len <= 0:
+                raise RuntimeError("kv_reuse tool prefill produced empty prompt")
+            past_for_gen = past_kv.slice_(start=0, end=full_len - 1)
+            if int(past_for_gen.get_seq_length()) <= 0:
+                raise RuntimeError(
+                    f"kv_reuse tool prefill past KV empty (full_len={full_len} prefix={prefix_token_length})"
+                )
+            gen_prompt_len = full_len
+            return past_for_gen, merged_prefix_token_ids, gen_prompt_len
+
+        return past_kv, gen_ids, gen_prompt_len
 
     async def append_prefix_segment_incremental(
         self,
@@ -2098,6 +2520,87 @@ class LLMChat(LLM):
         )
         self._initialization[node_id] = LLMChat._initialization[node_id] = True
 
+    async def rewind_prefix_to_turn_count(
+        self,
+        node_id: str,
+        *,
+        system_prompt: str,
+        user_template: str,
+        turn_count: int,
+    ) -> bool:
+        """Truncate prefix KV to a lower turn count without full static rebuild."""
+        from sidecar.stores.prefix_spans import build_layout_from_segments, frozen_span_count
+
+        bucket = LLMChat._shared_kv_cache_memory.get(node_id) or {}
+        old_prefix = bucket.get("prefix") or []
+        base_kv_full = bucket.get("base_kv_full")
+        if not old_prefix or base_kv_full is None:
+            return False
+
+        stored_system = str(bucket.get("system_prompt") or system_prompt or "").strip()
+        target_user = str(user_template or "").strip()
+        if not stored_system or not target_user:
+            return False
+
+        messages = self._render_base_messages(stored_system, target_user)
+        _, prompt_text, _ = self._build_chat_inputs(messages, add_generation_prompt=True)
+        _, token_ids, segments = self.locate_placeholder(prompt_text, return_segments=True)
+        layout = build_layout_from_segments(segments)
+
+        old_registry = dict(bucket.get("span_registry") or {})
+        old_span_order = list(bucket.get("prefix_span_order") or [])
+        old_token_len = int(bucket.get("prompt_token_len") or 0)
+        from_turn = int(bucket.get("turn_count") or 0)
+
+        frozen = frozen_span_count(old_registry, old_span_order, layout)
+        new_prompt_len = int(token_ids["input_ids"].shape[-1])
+        if new_prompt_len <= 0 or new_prompt_len >= old_token_len or frozen <= 0:
+            return False
+
+        try:
+            new_base_kv = base_kv_full.slice_(start=0, end=new_prompt_len)
+        except Exception:
+            return False
+
+        segment_kv_list, token_id_list, ph_info, span_registry, span_order = (
+            self._materialize_prefix_segments(
+                layout,
+                new_base_kv,
+                segments,
+                old_bucket=bucket,
+                frozen_count=frozen,
+                extend_placeholders_only=False,
+            )
+        )
+        self._commit_prefix_bucket(
+            node_id,
+            segment_kv_list=segment_kv_list,
+            token_id_list=token_id_list,
+            placeholder_info=ph_info,
+            span_registry=span_registry,
+            prefix_span_order=span_order,
+            prompt_token_len=new_prompt_len,
+            prompt_input_ids=token_ids["input_ids"].detach().clone(),
+            base_kv_full=new_base_kv,
+            system_prompt=stored_system,
+            user_template=target_user,
+            turn_count=int(turn_count),
+            segments=segments,
+            prompt_text=prompt_text,
+        )
+        self._initialization[node_id] = LLMChat._initialization[node_id] = True
+        logger.info(
+            "Rewind prefix node {} turns {}→{} (tokens {}→{} frozen_spans={}/{})",
+            node_id,
+            from_turn,
+            turn_count,
+            old_token_len,
+            new_prompt_len,
+            frozen,
+            len(old_span_order),
+        )
+        return True
+
     def resolve_turn_ph_slot(self, ph_id: str, message_key: str):
         return self._get_store_registry().turn_slots.get(
             str(self.node_id),
@@ -2105,36 +2608,125 @@ class LLMChat(LLM):
             str(ph_id),
         )
 
-    def resolve_upstream_agent_slot(self, ph_id: str, message_key: str):
-        """Resolve consumer- or producer-contextual slot for ``agent_*_current``."""
-        from sidecar.stores.hashing import sha256_text
+    def _resolve_upstream_consumer_slot(self, ph_id: str, message_key: str):
+        """Consumer-contextual slot on this node for an upstream ``agent_*_current`` ph."""
+        from sidecar.stores.prefix_spans import normalize_placeholder_info
 
         stores = self._get_store_registry()
         ph_id = str(ph_id)
         message_key = str(message_key)
-
         content_hash = self._upstream_agent_content_hash(ph_id, message_key)
-        if content_hash:
-            consumer = stores.upstream_agent_slots.get_consumer(
-                str(self.node_id),
-                message_key,
-                ph_id,
-                content_hash,
-            )
-            if consumer is not None:
-                return consumer
+        if not content_hash:
+            return None
+        slot = stores.upstream_agent_slots.get_consumer(
+            str(self.node_id),
+            message_key,
+            ph_id,
+            content_hash,
+        )
+        if slot is None:
+            return None
+        bucket = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        ph_info = normalize_placeholder_info(bucket.get("placeholder_info"))
+        ph_rec = ph_info.get(ph_id)
+        if isinstance(ph_rec, dict):
+            expected_start = int(ph_rec.get("start", -1))
+            if int(getattr(slot, "slot_token_start", -2)) != expected_start:
+                return None
+        return slot
 
-        upstream_idx = self._upstream_agent_index(ph_id)
-        if upstream_idx is not None and content_hash:
-            producer = stores.upstream_agent_slots.get_producer(
-                str(upstream_idx),
-                message_key,
+    def resolve_upstream_agent_slot(self, ph_id: str, message_key: str):
+        """Resolve consumer-contextual slot on this node for ``agent_*_current``."""
+        consumer = self._resolve_upstream_consumer_slot(ph_id, message_key)
+        if consumer is not None:
+            return consumer
+        upstream_idx = self._upstream_agent_index(str(ph_id))
+        if upstream_idx is None:
+            return None
+        try:
+            node_idx = int(self.node_id)
+        except (TypeError, ValueError):
+            return None
+        if upstream_idx < node_idx:
+            return None
+        from sidecar.stores.hashing import sha256_text
+
+        stores = self._get_store_registry()
+        content_hash = self._upstream_agent_content_hash(str(ph_id), str(message_key))
+        if not content_hash:
+            return None
+        return stores.upstream_agent_slots.get_producer(
+            str(upstream_idx),
+            str(message_key),
+            str(ph_id),
+            content_hash,
+        )
+
+    def _missing_consumer_upstream_slots(self, message: str, meta: List[Dict[str, Any]]) -> List[str]:
+        """Upstream agent placeholders that still lack consumer-contextual KV on this node."""
+        missing: List[str] = []
+        try:
+            node_idx = int(self.node_id)
+        except (TypeError, ValueError):
+            return missing
+        for m in meta:
+            ph_id = str(m["ph_id"])
+            upstream_idx = self._upstream_agent_index(ph_id)
+            if upstream_idx is None or upstream_idx >= node_idx:
+                continue
+            if self._resolve_upstream_consumer_slot(ph_id, message) is None:
+                missing.append(ph_id)
+        return missing
+
+    async def prepare_consumer_upstream_slots(self, message: str) -> None:
+        """Materialize consumer-contextual KV for upstream agent placeholders on this node."""
+        from sidecar.stores.prefix_spans import normalize_placeholder_info, ordered_placeholders
+
+        prefix_store = LLMChat._shared_kv_cache_memory.get(str(self.node_id)) or {}
+        prefix_kv_list = prefix_store.get("prefix") or []
+        prefix_token_ids = prefix_store.get("token_ids") or []
+        if not prefix_kv_list:
+            return
+
+        placeholder_info_norm = normalize_placeholder_info(prefix_store.get("placeholder_info"))
+        meta: List[Dict[str, Any]] = []
+        cum_offset = 0
+        ph_cum_len = 0
+        for idx, (ph_id, ph_rec) in enumerate(ordered_placeholders(placeholder_info_norm)):
+            start = int(ph_rec["start"])
+            end = int(ph_rec["end"])
+            pf_kv, pf_token_id = self._resolve_pf_for_ph(
+                self.node_id,
                 ph_id,
-                content_hash,
+                prefix_store=prefix_store,
+                prefix_kv_list=prefix_kv_list,
+                prefix_token_ids=prefix_token_ids,
             )
-            if producer is not None:
-                return producer
-        return None
+            ph_cache, ph_cache_ids, drop_num = self.kv_engine.fetch_shared_cache(ph_id, message)
+            real_len = ph_cache._seen_tokens - drop_num
+            templ_len = end - start
+            delta_len = real_len - templ_len
+            meta.append(
+                {
+                    "idx": idx,
+                    "ph_id": ph_id,
+                    "start": start,
+                    "end": end,
+                    "drop_num": drop_num,
+                    "delta": delta_len,
+                    "offset_before": cum_offset,
+                    "offset_after": cum_offset + delta_len,
+                    "ph_cache": ph_cache,
+                    "ph_cache_ids": ph_cache_ids,
+                    "pf_kv": pf_kv,
+                    "pf_ids": pf_token_id,
+                    "cum_len": ph_cum_len,
+                }
+            )
+            cum_offset += delta_len
+            ph_cum_len += real_len
+
+        await self._ensure_consumer_upstream_agent_slots(message, meta, tail_only_ph_ids=None)
 
     def _upstream_agent_content_hash(self, ph_id: str, message_key: str) -> str | None:
         """Content hash for upstream agent output referenced by ``ph_id``."""
@@ -2161,6 +2753,29 @@ class LLMChat(LLM):
         text = self.tokenizer.decode(entry["input_ids"][0], skip_special_tokens=True)
         text = str(text).strip() or " "
         return sha256_text(text)
+
+    def _upstream_response_token_ids(
+        self,
+        upstream_node_id: str,
+        message_key: str,
+    ) -> Dict[str, torch.Tensor] | None:
+        """Latest response token ids stored on an upstream producer node."""
+        bucket = LLMChat._shared_kv_cache_memory.get(str(upstream_node_id)) or {}
+        if not isinstance(bucket, dict):
+            return None
+        ids_bucket = bucket.get("response_ids") or {}
+        if not isinstance(ids_bucket, dict):
+            return None
+        values = ids_bucket.get(message_key)
+        if not values:
+            return None
+        try:
+            entry = values[-1]
+        except (TypeError, IndexError):
+            return None
+        if not isinstance(entry, dict) or entry.get("input_ids") is None:
+            return None
+        return entry
 
     def _export_producer_contextual_response_kv(
         self,
@@ -2285,6 +2900,28 @@ class LLMChat(LLM):
         if str(ph_id).endswith("_tool"):
             return str(ph_id).replace("_tool", "_assistant")
         return None
+
+    @staticmethod
+    def _resolve_tool_kv_from_semantic_lookup(
+        stores,
+        lookup,
+        *,
+        content_hash: str,
+    ):
+        """Materialize-layer guard: semantic fallback must still match tool-result hash."""
+        if not lookup.hit or not lookup.kv_ref:
+            return None
+        entry = stores.tool_kv.get(str(lookup.kv_ref))
+        if entry is None or str(entry.content_hash) != str(content_hash):
+            if lookup.hit and lookup.match_mode != "exact_hash":
+                logger.debug(
+                    "tool semantic {} hit rejected: expected content_hash={} got={}",
+                    lookup.match_mode,
+                    content_hash[:12],
+                    (entry.content_hash[:12] if entry is not None else "missing"),
+                )
+            return None
+        return entry
 
     def _materialize_tool_consumer_slot_sync(
         self,
@@ -2763,8 +3400,6 @@ class LLMChat(LLM):
 
         for m in meta:
             ph_id = str(m["ph_id"])
-            if tail_only_ph_ids is not None and ph_id not in tail_only_ph_ids and ph_id in materialized:
-                continue
             upstream_idx = self._upstream_agent_index(ph_id)
             if upstream_idx is None:
                 continue
@@ -2776,10 +3411,19 @@ class LLMChat(LLM):
                 continue
 
             ph_cache_ids = m.get("ph_cache_ids")
-            if not isinstance(ph_cache_ids, dict) or ph_cache_ids.get("input_ids") is None:
-                continue
-            text = self.tokenizer.decode(ph_cache_ids["input_ids"][0], skip_special_tokens=True)
-            content_hash = sha256_text(str(text).strip() or " ")
+            drop_num = int(m.get("drop_num") or 0)
+            upstream_hash = self._upstream_agent_content_hash(ph_id, message)
+            upstream_ids = self._upstream_response_token_ids(str(upstream_idx), message)
+            if upstream_hash and isinstance(upstream_ids, dict) and upstream_ids.get("input_ids") is not None:
+                ph_cache_ids = upstream_ids
+                drop_num = 0
+                content_hash = upstream_hash
+            else:
+                if not isinstance(ph_cache_ids, dict) or ph_cache_ids.get("input_ids") is None:
+                    continue
+                text = self.tokenizer.decode(ph_cache_ids["input_ids"][0], skip_special_tokens=True)
+                content_hash = sha256_text(str(text).strip() or " ")
+
             existing = stores.upstream_agent_slots.get_consumer(
                 str(self.node_id),
                 str(message),
@@ -2787,9 +3431,19 @@ class LLMChat(LLM):
                 content_hash,
             )
             if existing is not None:
+                materialized.add(ph_id)
+                continue
+            if (
+                tail_only_ph_ids is not None
+                and ph_id not in tail_only_ph_ids
+                and ph_id in materialized
+            ):
+                materialized.discard(ph_id)
+
+            if not isinstance(ph_cache_ids, dict) or ph_cache_ids.get("input_ids") is None:
                 continue
 
-            drop_num = int(m.get("drop_num") or 0)
+            drop_num = int(drop_num)
             tasks.append(
                 (
                     str(self.node_id),
@@ -2833,16 +3487,14 @@ class LLMChat(LLM):
         ph_cum_len = 0
         for m in meta:
             ph_id = str(m["ph_id"])
+            slot = None
             if ph_id.startswith("turn_") and ph_id.endswith("_tool"):
                 slot = self.resolve_tool_consumer_slot(ph_id, message)
             elif ph_id.startswith("turn_") and ph_id.endswith("_assistant"):
                 slot = self.resolve_llm_branch_slot(ph_id, message)
             else:
-                slot = self.resolve_upstream_agent_slot(ph_id, message)
-            if slot is not None and getattr(slot, "materialization", "") in (
-                "consumer_contextual",
-                "producer_contextual",
-            ):
+                slot = self._resolve_upstream_consumer_slot(ph_id, message)
+            if slot is not None and getattr(slot, "materialization", "") == "consumer_contextual":
                 m["ph_cache"] = slot.absolute_kv
                 m["ph_cache_ids"] = slot.token_ids
                 m["drop_num"] = int(getattr(slot, "drop_num", 0))
@@ -2922,9 +3574,11 @@ class LLMChat(LLM):
                     asst_text or content_str,
                     content_hash=content_hash,
                 )
-                tool_entry = None
-                if lookup.hit and lookup.kv_ref:
-                    tool_entry = stores.tool_kv.get(str(lookup.kv_ref))
+                tool_entry = self._resolve_tool_kv_from_semantic_lookup(
+                    stores,
+                    lookup,
+                    content_hash=content_hash,
+                )
                 if tool_entry is None:
                     tool_entry = stores.tool_kv.get_or_create(
                         content_str,
@@ -3765,6 +4419,15 @@ class LLMChat(LLM):
         )
         self._refresh_meta_from_upstream_slots(message, meta)
 
+        missing_upstream_consumer = self._missing_consumer_upstream_slots(message, meta)
+        if mode == "kv_reuse" and missing_upstream_consumer:
+            logger.debug(
+                "kv_reuse guard node_id={} missing_upstream={} -> dense_prefill",
+                self.node_id,
+                missing_upstream_consumer,
+            )
+            mode = "dense_prefill"
+
         reuse_kv_segments: List[Dict[str, Any]] = []
         if mode == "kv_reuse":
             for m in meta:
@@ -3838,28 +4501,30 @@ class LLMChat(LLM):
         seg_ids_list = [r[2] for r in results_sorted]
         merged_prefix_token_ids = concat_(merged_prefix_token_ids, seg_ids_list)
 
-        cached_prefix_token_length, generation_prompt_length = _reconcile_prefix_kv_and_tokens(
+        cached_prefix_kv_length, prefix_token_length = _reconcile_prefix_kv_and_tokens(
             merged_prefix_kv,
             merged_prefix_token_ids,
         )
+        generation_prompt_length = int(prefix_token_length)
 
         if "position_ids" in merged_prefix_token_ids:
             merged_prefix_token_ids["position_ids"] = (
-                torch.arange(generation_prompt_length).unsqueeze(0).to(self.model.device)
+                torch.arange(prefix_token_length).unsqueeze(0).to(self.model.device)
             )
 
         tool_injection_text = kwargs.get("tool_injection_text")
+        tool_suffix_tokens: Dict[str, torch.Tensor] | None = None
         if isinstance(tool_injection_text, str) and tool_injection_text.strip():
-            suffix_tokens = self.tokenizer(
+            tool_suffix_tokens = self.tokenizer(
                 tool_injection_text,
                 add_special_tokens=False,
                 return_tensors="pt",
             )
-            suffix_tokens = {
+            tool_suffix_tokens = {
                 key: value.to(self.model.device) if isinstance(value, torch.Tensor) else value
-                for key, value in suffix_tokens.items()
+                for key, value in tool_suffix_tokens.items()
             }
-            merged_prefix_token_ids = concat_(merged_prefix_token_ids, suffix_tokens)
+            merged_prefix_token_ids = concat_(merged_prefix_token_ids, tool_suffix_tokens)
             generation_prompt_length = int(merged_prefix_token_ids["input_ids"].shape[-1])
             if "position_ids" in merged_prefix_token_ids:
                 merged_prefix_token_ids["position_ids"] = (
@@ -3874,11 +4539,120 @@ class LLMChat(LLM):
             "return_dict_in_generate": True,
         }
         if isinstance(tool_injection_text, str) and tool_injection_text.strip():
-            generation_kwargs["repetition_penalty"] = 1.08
+            generation_kwargs["repetition_penalty"] = 1.12 if mode == "kv_reuse" else 1.08
+
+        tool_suffix_appended = tool_suffix_tokens is not None
+        tool_schema_branch = None
+        deliverable_hash = str(kwargs.get("tool_deliverable_fingerprint") or "")
+        if mode == "kv_reuse" and tool_suffix_appended:
+            schema_hash = kwargs.get("tool_schema_hash")
+            if not schema_hash and isinstance(tool_injection_text, str) and tool_injection_text.strip():
+                try:
+                    from sidecar.stores.hashing import tool_schema_hash
+
+                    schema_hash = tool_schema_hash(tool_injection_text)
+                except ImportError:
+                    schema_hash = None
+            if schema_hash:
+                tool_schema_branch = self.resolve_tool_schema_branch(
+                    str(message),
+                    str(schema_hash),
+                    deliverable_hash,
+                )
+                if tool_schema_branch is not None:
+                    logger.debug(
+                        "tool schema branch hit node_id={} schema={} deliverable={} boundary={}",
+                        self.node_id,
+                        str(schema_hash)[:12],
+                        deliverable_hash[:12],
+                        tool_schema_branch.prefix_boundary_len,
+                    )
+        if mode == "kv_reuse" and tool_suffix_appended and tool_schema_branch is None:
+            kv_len = int(merged_prefix_kv.get_seq_length())
+            drift = abs(kv_len - int(prefix_token_length))
+            if kv_len < int(prefix_token_length) or drift > _MAX_PREFIX_LENGTH_DRIFT:
+                logger.debug(
+                    "kv_reuse tool injection KV/token drift kv={} tokens={} drift={} -> dense_prefill",
+                    kv_len,
+                    prefix_token_length,
+                    drift,
+                )
+                mode = "dense_prefill"
+                results = list(
+                    self._map_in_pool(
+                        self.kv_engine.process_anchor,
+                        [(message, m) for m in meta],
+                        timeout=30,
+                    )
+                )
+                results_sorted = sorted(results, key=lambda x: x[0])
+                merged_prefix_kv = prefix_kv_list[0].copy()
+                merged_prefix_token_ids = prefix_token_ids[0].copy()
+                seg_cache_list = [r[1] for r in results_sorted]
+                merged_prefix_kv.concat_(seg_cache_list)
+                seg_ids_list = [r[2] for r in results_sorted]
+                merged_prefix_token_ids = concat_(merged_prefix_token_ids, seg_ids_list)
+                cached_prefix_kv_length, prefix_token_length = _reconcile_prefix_kv_and_tokens(
+                    merged_prefix_kv,
+                    merged_prefix_token_ids,
+                )
+                if tool_suffix_tokens is not None:
+                    merged_prefix_token_ids = concat_(merged_prefix_token_ids, tool_suffix_tokens)
+                    generation_prompt_length = int(merged_prefix_token_ids["input_ids"].shape[-1])
+                    if "position_ids" in merged_prefix_token_ids:
+                        merged_prefix_token_ids["position_ids"] = (
+                            torch.arange(generation_prompt_length)
+                            .unsqueeze(0)
+                            .to(self.model.device)
+                        )
+                blend_fallback = True
 
         if mode == "kv_reuse":
-            merged_prefix_kv = merged_prefix_kv.slice_(start=0, end=cached_prefix_token_length - 1)
-            generation_kwargs["past_key_values"] = merged_prefix_kv
+            try:
+                past_kv, merged_prefix_token_ids, generation_prompt_length = await asyncio.to_thread(
+                    self._build_kv_reuse_generation_inputs,
+                    merged_prefix_kv=merged_prefix_kv,
+                    merged_prefix_token_ids=merged_prefix_token_ids,
+                    prefix_token_length=int(prefix_token_length),
+                    tool_suffix_appended=tool_suffix_appended,
+                    tool_schema_branch=tool_schema_branch,
+                )
+            except RuntimeError as exc:
+                logger.debug(
+                    "kv_reuse tool prefill failed node_id={} err={} -> dense_prefill",
+                    self.node_id,
+                    exc,
+                )
+                mode = "dense_prefill"
+                blend_fallback = True
+                results = list(
+                    self._map_in_pool(
+                        self.kv_engine.process_anchor,
+                        [(message, m) for m in meta],
+                        timeout=30,
+                    )
+                )
+                results_sorted = sorted(results, key=lambda x: x[0])
+                merged_prefix_kv = prefix_kv_list[0].copy()
+                merged_prefix_token_ids = prefix_token_ids[0].copy()
+                seg_cache_list = [r[1] for r in results_sorted]
+                merged_prefix_kv.concat_(seg_cache_list)
+                seg_ids_list = [r[2] for r in results_sorted]
+                merged_prefix_token_ids = concat_(merged_prefix_token_ids, seg_ids_list)
+                cached_prefix_kv_length, prefix_token_length = _reconcile_prefix_kv_and_tokens(
+                    merged_prefix_kv,
+                    merged_prefix_token_ids,
+                )
+                generation_prompt_length = int(prefix_token_length)
+                if tool_suffix_tokens is not None:
+                    merged_prefix_token_ids = concat_(merged_prefix_token_ids, tool_suffix_tokens)
+                    generation_prompt_length = int(merged_prefix_token_ids["input_ids"].shape[-1])
+                if "position_ids" in merged_prefix_token_ids:
+                    merged_prefix_token_ids["position_ids"] = (
+                        torch.arange(generation_prompt_length).unsqueeze(0).to(self.model.device)
+                    )
+            else:
+                generation_kwargs["past_key_values"] = past_kv
 
         ttft_tracer = _TTFTTracer(generation_prompt_length)
         ttft_tracer.reset(generation_prompt_length)
@@ -3910,7 +4684,7 @@ class LLMChat(LLM):
 
         if mode == "dense_prefill":
             base_cache = merged_prefix_kv
-            real_cache = full_kv_cache.slice(start=0, end=cached_prefix_token_length)
+            real_cache = full_kv_cache.slice(start=0, end=prefix_token_length)
             real_placeholder_cache, real_prefix_cache = real_cache.split_cache_by_placeholders(
                 placeholder_indices
             )
@@ -3950,10 +4724,34 @@ class LLMChat(LLM):
         if not stored_text and raw_response_text.strip():
             stored_text = _sanitize_chat_template_leaks(raw_response_text)
 
+        if (
+            mode == "dense_prefill"
+            and tool_suffix_appended
+            and isinstance(tool_injection_text, str)
+            and tool_injection_text.strip()
+            and "<tool_call>" in (raw_response_text or stored_text or "")
+        ):
+            try:
+                from sidecar.stores.hashing import sha256_text
+
+                tool_call_hash = sha256_text(raw_response_text or stored_text or "")
+            except ImportError:
+                tool_call_hash = ""
+            await asyncio.to_thread(
+                self._pool_tool_schema_branch_after_dense,
+                message=str(message),
+                full_kv_cache=full_kv_cache,
+                prefix_token_length=int(prefix_token_length),
+                generation_prompt_length=int(generation_prompt_length),
+                tool_injection_text=tool_injection_text,
+                deliverable_hash=deliverable_hash,
+                tool_call_hash=tool_call_hash,
+            )
+
         response_tokens = generated_ids.unsqueeze(0)
         response_kv_cache, token_dict = self._export_producer_contextual_response_kv(
             full_kv_cache=full_kv_cache,
-            prefix_token_len=int(cached_prefix_token_length),
+            prefix_token_len=int(prefix_token_length),
             response_token_ids=generated_ids,
             message=message,
             stored_text=stored_text or " ",
@@ -4052,6 +4850,7 @@ class LLMChat(LLM):
             ),
             "blend_fallback": blend_fallback,
             "routed_mode": initial_mode,
+            "raw_response_text": raw_response_text,
         }
         if reuse_kv_segments:
             joined_reuse = " | ".join(
@@ -4065,7 +4864,7 @@ class LLMChat(LLM):
         if isinstance(tool_injection_text, str) and tool_injection_text.strip():
             metadata["tool_injection_tokens"] = max(
                 0,
-                generation_prompt_length - cached_prefix_token_length,
+                generation_prompt_length - prefix_token_length,
             )
         metadata["preprocess_latency"] = preprocess_latency
         metadata["generation_ttft"] = generation_ttft
@@ -4230,6 +5029,15 @@ class LLMChat(LLM):
             tail_only_ph_ids=tail_ph_ids if tail_ph_ids else None,
         )
         self._refresh_meta_from_upstream_slots(message, meta)
+
+        missing_upstream_consumer = self._missing_consumer_upstream_slots(message, meta)
+        if mode == "kv_reuse" and missing_upstream_consumer:
+            logger.debug(
+                "kv_reuse missing consumer upstream slots node_id={} placeholders={} -> dense_prefill",
+                self.node_id,
+                missing_upstream_consumer,
+            )
+            mode = "dense_prefill"
 
         reuse_kv_segments: List[Dict[str, Any]] = []
         if mode == "kv_reuse":

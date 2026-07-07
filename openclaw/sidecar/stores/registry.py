@@ -7,6 +7,7 @@ from sidecar.stores.llm_branch_slot import LlmBranchSlotRegistry
 from sidecar.stores.segment_cache import SegmentCacheRegistry
 from sidecar.stores.tool_consumer_slot import ToolConsumerSlotRegistry
 from sidecar.stores.tool_kv_backend import ToolKVBackend
+from sidecar.stores.tool_schema_branch import ToolSchemaBranchRegistry
 from sidecar.stores.tool_semantic_index import ToolSemanticIndex
 from sidecar.stores.template_ph_base import TemplatePhBaseStore
 from sidecar.stores.turn_slot_registry import TurnSlotRegistry
@@ -20,6 +21,7 @@ class KvcommStoreRegistry:
         self.segment_cache = SegmentCacheRegistry()
         self.agent_anchors = AgentAnchorPool()
         self.tool_kv = ToolKVBackend()
+        self.tool_schema_branches = ToolSchemaBranchRegistry()
         self.tool_semantic = ToolSemanticIndex()
         self.tool_consumer_slots = ToolConsumerSlotRegistry()
         self.llm_branch_slots = LlmBranchSlotRegistry()
@@ -32,6 +34,7 @@ class KvcommStoreRegistry:
             self.agent_anchors.purge_message(node_id=node_id, message_key=message_key)
             self.turn_slots.purge_message(node_id=node_id, message_key=message_key)
             self.tool_consumer_slots.purge_message(node_id=node_id, message_key=message_key)
+            self.tool_schema_branches.purge_message(node_id=node_id, message_key=message_key)
             self.llm_branch_slots.purge_message(node_id=node_id, message_key=message_key)
             self.upstream_agent_slots.purge_message(node_id=node_id, message_key=message_key)
             return
@@ -39,6 +42,7 @@ class KvcommStoreRegistry:
         self.agent_anchors.purge_node(node_id)
         self.turn_slots.purge_node(node_id)
         self.tool_consumer_slots.purge_node(node_id)
+        self.tool_schema_branches.purge_node(node_id)
         self.llm_branch_slots.purge_node(node_id)
         self.upstream_agent_slots.purge_node(node_id)
         self.template_ph_base.purge_node(node_id)
@@ -67,6 +71,7 @@ class KvcommStoreRegistry:
         self.tool_kv.clear()
         self.tool_semantic.clear()
         self.tool_consumer_slots.clear()
+        self.tool_schema_branches.clear()
         self.llm_branch_slots.clear()
         self.turn_slots.clear()
         self.upstream_agent_slots.clear()

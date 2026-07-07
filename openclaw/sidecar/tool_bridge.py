@@ -277,9 +277,14 @@ _RESPONSE_BLOCK_LEAK_RE = re.compile(
     re.IGNORECASE,
 )
 _NOW_PROCEED_LEAK_RE = re.compile(
-    r"^Now proceed to solve the problem\.\s*\n?",
+    r"^Now proceed (?:to solve the problem|with your response)[^\n]*\.\s*\n?",
     re.MULTILINE | re.IGNORECASE,
 )
+_NOW_PROCEED_LINE_RE = re.compile(r"^Now proceed with your response\b", re.IGNORECASE)
+_ONLY_USE_FUNCTIONS_LINE_RE = re.compile(r"^Only use the functions listed\b", re.IGNORECASE)
+_NEVER_MARKDOWN_LINE_RE = re.compile(r"^Never use markdown\b", re.IGNORECASE)
+_ALWAYS_JSON_LINE_RE = re.compile(r"^Always use JSON format for tool calls\b", re.IGNORECASE)
+_IF_NO_ACTION_EMPTY_LINE_RE = re.compile(r"^If no action is needed, respond with an empty string\b", re.IGNORECASE)
 _TOOL_PREAMBLE_LEAK_RE = re.compile(
     r"^(?:If multiple actions are needed.*?\n)?(?:Never call a function.*?\n){3,}",
     re.DOTALL | re.IGNORECASE,
@@ -313,11 +318,115 @@ def _collapse_never_call_spam(text: str, *, min_lines: int = 3) -> str:
     return text
 
 
+_TOOL_IF_NO_TOOL_SPAM_RE = re.compile(
+    r"^(?:If no tool call is needed[^\n]*\n)"
+    r"(?:(?:If (?:multiple|you're|an error|the task)|Do not|If the task)[^\n]*\n){3,}",
+    re.MULTILINE | re.IGNORECASE,
+)
+_MAKE_SURE_CORRECT_LINE_RE = re.compile(r"^Make sure to (?:use the correct|follow)\b", re.IGNORECASE)
+_MAKE_SURE_LINE_RE = re.compile(r"^Make sure to \b", re.IGNORECASE)
+_IF_YOU_NEED_LINE_RE = re.compile(r"^If you need to \b", re.IGNORECASE)
+_GUIDELINE_PREAMBLE_LINE_RES = (
+    _MAKE_SURE_LINE_RE,
+    _IF_YOU_NEED_LINE_RE,
+    _NOW_PROCEED_LINE_RE,
+    _ONLY_USE_FUNCTIONS_LINE_RE,
+    _NEVER_MARKDOWN_LINE_RE,
+    _ALWAYS_JSON_LINE_RE,
+    re.compile(r"^If no tool call is needed\b", re.IGNORECASE),
+    re.compile(r"^If multiple steps are needed\b", re.IGNORECASE),
+    re.compile(r"^Double-check that the path parameter\b", re.IGNORECASE),
+    re.compile(r"^Verify that any edits\b", re.IGNORECASE),
+    re.compile(r"^Confirm that exec commands\b", re.IGNORECASE),
+    re.compile(r"^Validate that the JSON\b", re.IGNORECASE),
+    re.compile(r"^Review your entire response carefully\b", re.IGNORECASE),
+    _IF_NO_ACTION_EMPTY_LINE_RE,
+)
+
+
+def _guideline_preamble_line_count(text: str) -> int:
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    return sum(1 for ln in lines if any(pat.match(ln) for pat in _GUIDELINE_PREAMBLE_LINE_RES))
+
+
+def is_tool_guideline_preamble(text: str) -> bool:
+    """True when text is an instruction loop without a usable direct tool call."""
+    if not text or not str(text).strip():
+        return False
+    if _TOOL_IF_NO_TOOL_SPAM_RE.search(text):
+        return True
+    if _TOOL_GUIDELINE_PREAMBLE_RE.search(text):
+        return True
+    if _TOOL_MULTI_STEP_SPAM_RE.search(text):
+        return True
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    make_sure = sum(1 for ln in lines if _MAKE_SURE_LINE_RE.match(ln))
+    if make_sure >= 3:
+        return True
+    if_you_need = sum(1 for ln in lines if _IF_YOU_NEED_LINE_RE.match(ln))
+    if if_you_need >= 5:
+        return True
+    first = lines[0].lower()
+    if first.startswith("if no tool call is needed") and len(lines) >= 3:
+        return True
+    if _IF_NO_ACTION_EMPTY_LINE_RE.match(lines[0]):
+        return True
+    if len(lines) >= 6:
+        if first.startswith("if no tool call is needed") or first.startswith("if multiple steps are needed"):
+            similar = sum(1 for ln in lines[1:6] if ln.startswith("If "))
+            if similar >= 4:
+                return True
+    if _guideline_preamble_line_count(text) >= 3:
+        return True
+    return False
+
+
+def is_degenerate_tool_guideline_spam(text: str) -> bool:
+    """True when HF output is an instruction loop, including long preambles before tool_call."""
+    if not text or not str(text).strip():
+        return False
+    lowered = str(text).lower()
+    tool_idx = lowered.find("<tool_call>")
+    if tool_idx >= 0:
+        prefix = text[:tool_idx]
+        if prefix.strip() and is_tool_guideline_preamble(prefix):
+            return True
+        return False
+    return is_tool_guideline_preamble(text)
+
+
+def tool_guideline_spam_without_tool_call(text: str) -> bool:
+    """True when output is degenerate guideline text and has no parseable tool_call block."""
+    if not is_degenerate_tool_guideline_spam(text):
+        return False
+    return "<tool_call>" not in str(text or "").lower()
+
+
+def strip_tool_call_preamble(text: str) -> str:
+    """Remove degenerate guideline lines that precede the first <tool_call> block."""
+    if not text:
+        return ""
+    lowered = str(text).lower()
+    idx = lowered.find("<tool_call>")
+    if idx < 0:
+        return text
+    prefix = text[:idx]
+    suffix = text[idx:]
+    if not prefix.strip():
+        return text
+    if is_tool_guideline_preamble(prefix) or _guideline_preamble_line_count(prefix) >= 2:
+        return suffix.lstrip()
+    return text
+
+
 def sanitize_generation_text(text: str) -> str:
     """Normalize HF assistant output before OpenClaw delivery or upstream KV storage."""
     if not text:
         return ""
     cleaned = sanitize_chat_template_leaks(text)
+    cleaned = strip_tool_call_preamble(cleaned)
     cleaned = _RESPONSE_BLOCK_LEAK_RE.sub("", cleaned)
     cleaned = _NOW_PROCEED_LEAK_RE.sub("", cleaned)
     cleaned = _THINKING_BLOCK_RE.sub("", cleaned)
@@ -327,6 +436,14 @@ def sanitize_generation_text(text: str) -> str:
     cleaned = _TOOL_MULTI_STEP_SPAM_RE.sub("", cleaned)
     cleaned = _TOOL_SAME_TOOL_SPAM_RE.sub("", cleaned)
     cleaned = _TOOL_GUIDELINE_PREAMBLE_RE.sub("", cleaned)
+    cleaned = _TOOL_IF_NO_TOOL_SPAM_RE.sub("", cleaned)
+    if _MAKE_SURE_CORRECT_LINE_RE.search(cleaned) or _MAKE_SURE_LINE_RE.search(cleaned):
+        kept = []
+        for ln in cleaned.splitlines():
+            if _MAKE_SURE_LINE_RE.match(ln.strip()):
+                break
+            kept.append(ln)
+        cleaned = "\n".join(kept)
     cleaned = _collapse_line_repetition(cleaned)
     cleaned = _collapse_never_call_spam(cleaned)
     if _NEVER_CALL_LINE_RE.match(cleaned.strip()):
@@ -1201,8 +1318,10 @@ def openai_message_from_generation(
     task_vars: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Convert raw HF assistant text into an OpenAI chat completion message."""
+    sanitized = sanitize_generation_text(raw or "")
+    sanitized = strip_tool_call_preamble(sanitized)
     content, tool_calls = parse_qwen_tool_calls(
-        sanitize_generation_text(raw or ""),
+        sanitized,
         task_profile=task_profile,
         task_id=task_id,
         workspace_dir=workspace_dir,

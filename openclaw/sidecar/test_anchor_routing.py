@@ -184,6 +184,11 @@ def test_kv_reuse_anchors_skip_isolated_turn_and_upstream() -> None:
     chat.resolve_tool_consumer_slot = lambda _ph_id, _msg: None
     chat.resolve_llm_branch_slot = lambda _ph_id, _msg: None
     chat.resolve_upstream_agent_slot = lambda _ph_id, _msg: None
+    chat._resolve_upstream_consumer_slot = lambda ph_id, _msg: (
+        type("S", (), {"materialization": "consumer_contextual"})()
+        if ph_id == "agent_1_current"
+        else None
+    )
 
     LLMChat._shared_kv_cache_memory["1"] = {
         "response": {"msg": [_fake_cache(40)]},
@@ -300,3 +305,137 @@ def test_offset_kv_cache_pair_passes_through_without_anchors() -> None:
         [],
     )
     assert blended is True
+
+
+def test_requires_dense_for_tool_injection_on_consumer_node() -> None:
+    from KVCOMM.llm.gpt_chat import LLMChat
+
+    chat = object.__new__(LLMChat)
+    chat.node_id = "1"
+    LLMChat._shared_kv_cache_memory["1"] = {
+        "placeholder_info": {"agent_0_current": {"start": 10, "end": 20}},
+    }
+    assert chat._requires_dense_for_tool_injection()
+
+    chat.node_id = "0"
+    LLMChat._shared_kv_cache_memory["0"] = {
+        "placeholder_info": {"user_question": {"start": 0, "end": 5}},
+    }
+    assert not chat._requires_dense_for_tool_injection()
+
+
+def test_should_force_dense_when_unstable_or_pending() -> None:
+    from KVCOMM.llm.gpt_chat import LLMChat
+
+    chat = object.__new__(LLMChat)
+    chat.node_id = "1"
+    LLMChat._shared_kv_cache_memory["1"] = {
+        "placeholder_info": {"agent_0_current": {"start": 10, "end": 20}},
+        "_consumer_tool_schema_stable": {"msg": True},
+    }
+    LLMChat.set_consumer_first_measure_dense_pending(False)
+    chat.placeholders_missing_anchor_delta = lambda _uid, _msg: []
+    assert not chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-stable",
+        full_tool_schema=True,
+    )
+
+    LLMChat.set_consumer_first_measure_dense_pending(True)
+    assert chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-pending",
+        full_tool_schema=True,
+    )
+    LLMChat.set_consumer_first_measure_dense_pending(False)
+
+    LLMChat._shared_kv_cache_memory["1"].pop("_consumer_tool_schema_stable", None)
+    assert chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-full-unstable",
+        full_tool_schema=True,
+    )
+
+    chat.placeholders_missing_anchor_delta = lambda _uid, _msg: ["agent_0_current"]
+    assert chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-exec-missing",
+        full_tool_schema=False,
+    )
+    chat.placeholders_missing_anchor_delta = lambda _uid, _msg: []
+    assert not chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-exec-ok",
+        full_tool_schema=False,
+    )
+    LLMChat._shared_kv_cache_memory.pop("1", None)
+
+
+def test_should_force_dense_only_when_anchor_delta_missing() -> None:
+    from KVCOMM.llm.gpt_chat import LLMChat
+
+    chat = object.__new__(LLMChat)
+    chat.node_id = "1"
+    LLMChat._shared_kv_cache_memory["1"] = {
+        "placeholder_info": {"agent_0_current": {"start": 10, "end": 20}},
+    }
+    chat.get_request_state = lambda _uid: type("S", (), {"anchor_dict": {}})()
+    chat.placeholders_missing_anchor_delta = lambda _uid, _msg: ["agent_0_current"]
+    LLMChat._shared_kv_cache_memory["1"]["_consumer_tool_schema_stable"] = {"msg": True}
+    LLMChat.set_consumer_first_measure_dense_pending(False)
+    assert chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-1",
+        full_tool_schema=False,
+    )
+
+    chat.placeholders_missing_anchor_delta = lambda _uid, _msg: []
+    assert not chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-2",
+        full_tool_schema=False,
+    )
+    LLMChat._shared_kv_cache_memory["1"].pop("_consumer_tool_schema_stable", None)
+    assert chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-3",
+        full_tool_schema=True,
+    )
+    LLMChat._shared_kv_cache_memory.pop("1", None)
+
+
+def test_should_not_force_dense_when_schema_branch_pooled() -> None:
+    from KVCOMM.llm.gpt_chat import LLMChat
+    from sidecar.stores.registry import get_store_registry, reset_store_registry
+
+    reset_store_registry()
+    chat = object.__new__(LLMChat)
+    chat.node_id = "1"
+    LLMChat._shared_kv_cache_memory["1"] = {
+        "placeholder_info": {"agent_0_current": {"start": 10, "end": 20}},
+    }
+    chat.placeholders_missing_anchor_delta = lambda _uid, _msg: []
+    LLMChat.set_consumer_first_measure_dense_pending(False)
+
+    schema_hash = "abc123"
+    deliverable = "deliv456"
+    stores = get_store_registry()
+    stores.tool_schema_branches.put(
+        consumer_node_id="1",
+        message_key="msg",
+        schema_hash=schema_hash,
+        deliverable_hash=deliverable,
+        prefix_boundary_len=50,
+        schema_token_len=10,
+        absolute_kv=None,
+        token_ids={},
+    )
+
+    assert not chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-branch",
+        full_tool_schema=True,
+        tool_schema_hash=schema_hash,
+        deliverable_hash=deliverable,
+    )
+    LLMChat._shared_kv_cache_memory.pop("1", None)

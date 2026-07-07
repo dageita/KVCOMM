@@ -16,7 +16,7 @@ class PrefixTopologyState:
 
 @dataclass
 class PrefixRebuildPlan:
-    action: str  # "noop" | "append_turn" | "static_rebuild" | "full_rebuild"
+    action: str  # "noop" | "append_turn" | "rewind_turns" | "static_rebuild" | "full_rebuild"
     reason: str
     from_turn_count: int = 0
     to_turn_count: int = 0
@@ -59,7 +59,7 @@ def plan_prefix_update(
 
     if desired < stored.turn_count:
         return PrefixRebuildPlan(
-            action="static_rebuild",
+            action="rewind_turns",
             reason="turn_count_regression_new_run",
             from_turn_count=stored.turn_count,
             to_turn_count=desired,

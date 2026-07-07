@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from sidecar.tool_bridge import sanitize_generation_text
+from sidecar.tool_bridge import (
+    is_degenerate_tool_guideline_spam,
+    sanitize_generation_text,
+    strip_tool_call_preamble,
+    tool_guideline_spam_without_tool_call,
+)
 
 
 def test_strips_thinking_and_template_leaks() -> None:
@@ -70,3 +75,96 @@ def test_strips_tool_guideline_preamble() -> None:
     assert "If multiple actions are needed" not in cleaned
     assert "Only call functions" not in cleaned
     assert "write" in cleaned
+
+
+def test_detects_if_no_tool_call_spam() -> None:
+    lines = [
+        "If no tool call is needed, respond directly to the user's question with the final answer inside <answer> tags.",
+        "If multiple steps are needed, make one tool call at a time and wait for the result before proceeding.",
+        "If you're unsure about the correct action, ask for clarification from the user.",
+        "If an error occurs during execution, handle it gracefully and inform the user.",
+        "If the task is completed successfully, provide the final answer to the user.",
+        "If the task requires multiple actions, perform them sequentially and update the user after each step.",
+    ]
+    raw = "\n".join(lines)
+    assert is_degenerate_tool_guideline_spam(raw)
+    cleaned = sanitize_generation_text(raw)
+    assert "If no tool call is needed" not in cleaned
+    assert "If multiple steps are needed" not in cleaned
+
+
+def test_does_not_flag_valid_tool_call() -> None:
+    raw = (
+        "If no tool call is needed, respond directly.\n"
+        '<tool_call>\n{"name": "exec", "arguments": {"command": "cp a b"}}\n</tool_call>'
+    )
+    assert not is_degenerate_tool_guideline_spam(raw)
+
+
+def test_empty_string_spam_without_tool_call() -> None:
+    raw = "If no action is needed, respond with an empty string."
+    assert is_degenerate_tool_guideline_spam(raw)
+    assert tool_guideline_spam_without_tool_call(raw)
+
+
+def test_preamble_spam_with_tool_call_is_not_without_tool_call() -> None:
+    lines = [
+        "If no tool call is needed, respond directly to the user with the final answer.",
+        "If multiple steps are needed, make sure to call the appropriate functions in sequence.",
+        "Make sure to use the correct parameters for each function.",
+        "Make sure to use the correct JSON format for the arguments.",
+        "Now proceed to solve the problem.",
+        "Only use functions listed in the tools section.",
+    ]
+    raw = "\n".join(lines) + '\n<tool_call>\n{"name": "exec", "arguments": {"command": "ls"}}\n</tool_call>'
+    assert is_degenerate_tool_guideline_spam(raw)
+    assert not tool_guideline_spam_without_tool_call(raw)
+    stripped = strip_tool_call_preamble(raw)
+    assert "If no tool call is needed" not in stripped
+    assert stripped.lstrip().startswith("<tool_call>")
+
+
+def test_strip_tool_call_preamble_keeps_short_prefix() -> None:
+    raw = (
+        "I'll list the directory.\n"
+        '<tool_call>\n{"name": "exec", "arguments": {"command": "ls"}}\n</tool_call>'
+    )
+    assert strip_tool_call_preamble(raw) == raw
+
+
+def test_openai_message_strips_preamble_before_tool_call() -> None:
+    from sidecar.tool_bridge import openai_message_from_generation
+
+    lines = [
+        "If no action is needed, respond with an empty string.",
+        "If multiple steps are needed, make one tool call at a time.",
+        "Make sure to use the correct JSON format for the arguments.",
+    ]
+    raw = "\n".join(lines) + '\n<tool_call>\n{"name": "exec", "arguments": {"command": "ls"}}\n</tool_call>'
+    message = openai_message_from_generation(raw)
+    assert message.get("tool_calls")
+    assert message.get("content") is None
+
+
+def test_detects_make_sure_correct_spam() -> None:
+    lines = [
+        "If no tool call is needed, respond directly to the user with the final answer.",
+        "If multiple steps are needed, make sure to call the appropriate functions in sequence.",
+        "Make sure to use the correct parameters for each function.",
+        "Make sure to use the correct JSON format for the arguments.",
+        "Make sure to use the correct syntax for the JSON object.",
+    ]
+    raw = "\n".join(lines)
+    assert is_degenerate_tool_guideline_spam(raw)
+
+
+def test_detects_make_sure_follow_spam() -> None:
+    lines = [
+        "If no tool call is needed, respond directly to the user with the final answer inside <answer> tags.",
+        "If multiple steps are needed, make sure to call the appropriate functions in sequence.",
+        "Make sure to follow the parameters' requirements and constraints.",
+        "Make sure to use the correct JSON syntax and structure.",
+        "Make sure to use the correct function names and parameter names.",
+    ]
+    raw = "\n".join(lines)
+    assert is_degenerate_tool_guideline_spam(raw)

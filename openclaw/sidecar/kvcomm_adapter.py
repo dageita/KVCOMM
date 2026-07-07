@@ -95,7 +95,7 @@ from sidecar.tool_bridge import (
 
 KVCOMM_META_RE = re.compile(r"<!--KVCOMM_META:(\{.*?\})-->", re.DOTALL)
 SIDECAR_VERSION = "0.2.0-kvcomm-engine"
-_CLAWBENCH_TEXT_ONLY_MAX_TOKENS = 96
+_CLAWBENCH_TEXT_ONLY_MAX_TOKENS = 160
 _CLAWBENCH_TOOL_CONTINUATION_MAX_TOKENS = 128
 _CONFIG_LOADER_PYTEST_CMD = "PYTHONPATH=. python -m pytest -q tests/test_config_loader.py"
 
@@ -176,6 +176,51 @@ _run_task_profiles: dict[str, str] = {}
 _node_task_profiles: dict[str, str] = {}
 # Browser tasks: count browser tool_calls emitted per agent when gateway never returns tool results.
 _browser_tool_emit_count: dict[str, int] = {}
+_last_agent0_run_id: str | None = None
+_consumer_stable_cleared_for_measure: bool = False
+
+
+def _note_agent0_bench_register(run_id: str | None, register_mode: str) -> None:
+    """Track agent-0 bench registers; clear warmup tool stability on first kv_reuse measure run."""
+    global _last_agent0_run_id, _consumer_stable_cleared_for_measure
+    from KVCOMM.llm.gpt_chat import LLMChat
+
+    rid = str(run_id or "").strip()
+    if not rid:
+        return
+
+    prev = _last_agent0_run_id
+    _last_agent0_run_id = rid
+
+    if register_mode != "kv_reuse":
+        logger.debug(
+            "[kvcomm-bench] agent=0 register run_id={} mode={} prev={}",
+            rid,
+            register_mode,
+            prev,
+        )
+        return
+
+    if prev and prev != rid:
+        LLMChat.clear_consumer_tool_schema_stable_all()
+        logger.info(
+            "[kvcomm-bench] measure run {} — cleared consumer tool-schema stable (prev register {})",
+            rid,
+            prev,
+        )
+        if not _consumer_stable_cleared_for_measure:
+            LLMChat.set_consumer_first_measure_dense_pending(True)
+            _consumer_stable_cleared_for_measure = True
+        else:
+            LLMChat.set_consumer_first_measure_dense_pending(False)
+        return
+
+    logger.debug(
+        "[kvcomm-bench] agent=0 register run_id={} mode=kv_reuse prev={} cleared={}",
+        rid,
+        prev,
+        _consumer_stable_cleared_for_measure,
+    )
 
 
 def _browser_emit_key(run_id: str, agent_index: str) -> str:
@@ -378,10 +423,12 @@ def register_pending_context(payload: dict[str, Any]) -> KvcommContext:
         agent_index_int = 0
     register_mode = str(payload.get("mode") or "dense_prefill")
     if agent_index_int == 0:
+        run_id = str(payload.get("run_id") or "").strip() or None
         reset_bench_run_state(
-            run_id=str(payload.get("run_id") or "").strip() or None,
+            run_id=run_id,
             preserve_shared_kv=register_mode == "kv_reuse",
         )
+        _note_agent0_bench_register(run_id, register_mode)
     registered_system = str(payload.get("system_prompt") or "")
     ctx = KvcommContext(
         run_id=str(payload.get("run_id") or uuid.uuid4()),
@@ -1042,6 +1089,51 @@ def _upstream_response_kv_available(upstream_node: str, message_key: str) -> boo
     return bool(values)
 
 
+def _tool_deliverable_fingerprint_for_generation(
+    llm,
+    ctx: "KvcommContext",
+    body: dict[str, Any],
+) -> str:
+    """Hash upstream deliverable context for tool schema branch lookup."""
+    from sidecar.stores.hashing import tool_deliverable_fingerprint
+
+    upstream_text = ""
+    try:
+        agent_idx = int(ctx.agent_index)
+    except (TypeError, ValueError):
+        agent_idx = 0
+    if agent_idx > 0:
+        ph_id = f"agent_{agent_idx - 1}_current"
+        slot = llm.resolve_upstream_agent_slot(ph_id, ctx.message_key)
+        if slot is not None and isinstance(getattr(slot, "token_ids", None), dict):
+            ids = slot.token_ids.get("input_ids")
+            tokenizer = getattr(llm, "tokenizer", None)
+            if ids is not None and tokenizer is not None:
+                try:
+                    upstream_text = tokenizer.decode(ids[0], skip_special_tokens=True)
+                except Exception:
+                    upstream_text = ""
+    if not upstream_text.strip():
+        for msg in reversed(body.get("messages") or []):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content") or ""
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(str(block.get("text") or ""))
+                content = "\n".join(parts)
+            content = str(content)
+            if content.strip():
+                upstream_text = content
+                break
+    return tool_deliverable_fingerprint(
+        task_id=str(ctx.task_id or ""),
+        upstream_text=upstream_text,
+    )
+
+
 def _apply_pooled_placeholder_anchor(
     llm,
     request_uid: str,
@@ -1499,6 +1591,20 @@ class KvcommEngineAdapter:
                     if isinstance(target, dict):
                         target.update(copy.deepcopy(bucket))
 
+    async def _rematerialize_consumer_slots_for_kv_reuse(
+        self,
+        llm,
+        ctx: "KvcommContext",
+        bucket: dict,
+        agent_idx: int,
+    ) -> None:
+        if ctx.mode != "kv_reuse" or agent_idx <= 0:
+            return
+        bucket.pop("_upstream_materialized", None)
+        bucket.pop("_tool_consumer_materialized", None)
+        self._seed_cross_run_placeholder_anchors(llm, ctx)
+        await llm.prepare_consumer_upstream_slots(str(ctx.message_key))
+
     def _seed_cross_run_placeholder_anchors(self, llm, ctx: "KvcommContext") -> None:
         """Restore agent_K_current ph_key_delta from typed anchor pool across measure runs."""
         from KVCOMM.llm.gpt_chat import LLMChat
@@ -1516,15 +1622,15 @@ class KvcommEngineAdapter:
             return
 
         state = llm.kv_engine.resolve_request_state(ctx.run_id)
-        delta_key = f"{node_id}_ph_key_delta"
         bucket = LLMChat._ensure_shared_kv_memory().get(str(node_id)) or {}
         static_hash = str(bucket.get("static_template_hash") or "")
         stores = get_store_registry()
 
         for upstream in range(agent_idx):
             ph_id = f"agent_{upstream}_current"
+            node_delta_key = f"{node_id}_ph_key_delta"
             existing = (state.anchors.get(ph_id) or {}).get(message)
-            if isinstance(existing, dict) and delta_key in existing:
+            if isinstance(existing, dict) and node_delta_key in existing:
                 continue
 
             seeded = False
@@ -1537,7 +1643,7 @@ class KvcommEngineAdapter:
                 rec = normalize_placeholder_info(ph_info).get(ph_id)
                 if isinstance(rec, dict) and static_hash:
                     topo = str(bucket.get("topology_id") or "")
-                    delta_key = delta_key_from_ph_rec(
+                    topology_delta_key = delta_key_from_ph_rec(
                         ph_id=ph_id,
                         ph_rec=rec,
                         static_template_hash=static_hash,
@@ -1546,7 +1652,7 @@ class KvcommEngineAdapter:
                     typed = stores.agent_anchors.get_by_topology_key(
                         node_id=str(node_id),
                         message_key=str(message),
-                        delta_key=delta_key,
+                        delta_key=topology_delta_key,
                     )
             if typed is None:
                 typed = stores.agent_anchors.get_any_for_ph(
@@ -1557,7 +1663,7 @@ class KvcommEngineAdapter:
             if typed is not None and typed.ph_delta is not None and static_hash:
                 if typed.static_template_hash == static_hash or not typed.static_template_hash:
                     state.anchors.setdefault(ph_id, {})[message] = {
-                        delta_key: typed.ph_delta,
+                        node_delta_key: typed.ph_delta,
                         f"{node_id}_ph_value_delta": getattr(typed, "ph_value_delta", None),
                         f"{node_id}_pf_key_delta": typed.pf_delta,
                         f"{node_id}_pf_value_delta": getattr(typed, "pf_value_delta", None),
@@ -1588,7 +1694,7 @@ class KvcommEngineAdapter:
                     snapshot,
                     ph_id=ph_id,
                     message=message,
-                    delta_key=delta_key,
+                    delta_key=node_delta_key,
                 ):
                     seeded = True
                     logger.debug(
@@ -1610,7 +1716,7 @@ class KvcommEngineAdapter:
                         snapshot,
                         ph_id=ph_id,
                         message=message,
-                        delta_key=delta_key,
+                        delta_key=node_delta_key,
                     ):
                         seeded = True
                         logger.debug(
@@ -1627,7 +1733,7 @@ class KvcommEngineAdapter:
                         ctx.run_id,
                         node_id,
                         upstream,
-                        delta_key,
+                        node_delta_key,
                     )
 
             if not seeded:
@@ -1642,6 +1748,23 @@ class KvcommEngineAdapter:
         from KVCOMM.llm.gpt_chat import LLMChat
 
         state = llm.kv_engine.resolve_request_state(request_uid)
+        stores = get_store_registry()
+        node_delta_key = f"{node_id}_ph_key_delta"
+        pf_key = f"{node_id}_pf_key_delta"
+        for entry in stores.agent_anchors.list_for_message(
+            node_id=str(node_id),
+            message_key=str(message_key),
+        ):
+            if not str(entry.ph_id).startswith("agent_"):
+                continue
+            if entry.ph_delta is None:
+                continue
+            state.anchors.setdefault(entry.ph_id, {})[message_key] = {
+                node_delta_key: entry.ph_delta,
+                f"{node_id}_ph_value_delta": entry.ph_value_delta,
+                pf_key: entry.pf_delta,
+                f"{node_id}_pf_value_delta": entry.pf_value_delta,
+            }
         self._anchor_pool[_anchor_pool_key(node_id, message_key)] = {
             "anchors": {k: dict(v) for k, v in state.anchors.items()},
             "anchor_dict": {k: dict(v) for k, v in state.anchor_dict.items()},
@@ -1653,9 +1776,6 @@ class KvcommEngineAdapter:
         bucket = LLMChat._ensure_shared_kv_memory().get(str(node_id)) or {}
         static_hash = str(bucket.get("static_template_hash") or "")
         upstream_hash = str(message_key)
-        stores = get_store_registry()
-        delta_key = f"{node_id}_ph_key_delta"
-        pf_key = f"{node_id}_pf_key_delta"
         from sidecar.stores.prefix_spans import normalize_placeholder_info
         from sidecar.stores.topology_anchor import delta_key_from_ph_rec
 
@@ -1665,7 +1785,7 @@ class KvcommEngineAdapter:
             if not str(ph_id).startswith("agent_"):
                 continue
             entry = (msg_bucket or {}).get(message_key)
-            if not isinstance(entry, dict) or delta_key not in entry:
+            if not isinstance(entry, dict) or node_delta_key not in entry:
                 continue
             ph_rec = ph_info.get(str(ph_id)) or {}
             anchor_delta_key = delta_key_from_ph_rec(
@@ -1680,7 +1800,7 @@ class KvcommEngineAdapter:
                 ph_id=str(ph_id),
                 static_template_hash=static_hash,
                 upstream_hash=upstream_hash,
-                ph_delta=entry.get(delta_key),
+                ph_delta=entry.get(node_delta_key),
                 ph_value_delta=entry.get(f"{node_id}_ph_value_delta"),
                 pf_delta=entry.get(pf_key),
                 pf_value_delta=entry.get(f"{node_id}_pf_value_delta"),
@@ -1770,7 +1890,7 @@ class KvcommEngineAdapter:
             ph_info = bucket.get("placeholder_info") if isinstance(bucket, dict) else {}
             if isinstance(ph_info, dict) and any(str(k).startswith("turn_") for k in ph_info):
                 plan = PrefixRebuildPlan(
-                    action="static_rebuild",
+                    action="rewind_turns",
                     reason="stale_turn_placeholders_in_static_prefix",
                     from_turn_count=plan.from_turn_count,
                     to_turn_count=prefix_build.turn_count,
@@ -1795,7 +1915,10 @@ class KvcommEngineAdapter:
         )
 
         if plan.action == "noop":
-            pass
+            if ctx.mode == "kv_reuse" and agent_idx > 0 and prefix_build.turn_count == 0:
+                await self._rematerialize_consumer_slots_for_kv_reuse(
+                    llm, ctx, bucket if isinstance(bucket, dict) else {}, agent_idx
+                )
         elif plan.action == "append_turn":
             bucket = LLMChat._shared_kv_cache_memory.get(node_id) or {}
             if use_openclaw_prefix(ctx.task_profile):
@@ -1831,6 +1954,68 @@ class KvcommEngineAdapter:
                 bucket if isinstance(bucket, dict) else {},
                 purge_all=False,
             )
+        elif plan.action == "rewind_turns":
+            _purge_node_turn_state(node_id, message_key=ctx.message_key)
+            stores.purge_turn_downstream(
+                node_id=str(node_id),
+                message_key=str(ctx.message_key),
+                turn_index=max(0, plan.to_turn_count),
+            )
+            if plan.reason != "turn_count_regression_new_run":
+                _proactive_stale_topology_purge(
+                    str(node_id),
+                    str(ctx.message_key),
+                    bucket if isinstance(bucket, dict) else {},
+                    purge_all=False,
+                )
+            ok = await llm.rewind_prefix_to_turn_count(
+                node_id,
+                system_prompt=prefix_build.system_prompt,
+                user_template=prefix_build.user_template,
+                turn_count=prefix_build.turn_count,
+            )
+            if not ok:
+                logger.warning(
+                    "[kvcomm-prefix] run_id={} agent={} rewind_turns failed; static rebuild",
+                    ctx.run_id,
+                    node_id,
+                )
+                _proactive_stale_topology_purge(
+                    str(node_id),
+                    str(ctx.message_key),
+                    bucket if isinstance(bucket, dict) else {},
+                    purge_all=True,
+                )
+                _purge_node_turn_state(node_id, message_key=ctx.message_key)
+                LLMChat._initialization[node_id] = False
+                for key in ("prefix", "placeholder_info", "token_ids"):
+                    bucket.pop(key, None)
+                await llm.prepare_prefix_kv_segments(
+                    node_id,
+                    prefix_build.system_prompt,
+                    prefix_build.user_template,
+                )
+                llm.set_prefix_turn_count(node_id, prefix_build.turn_count)
+                write_topology(
+                    bucket,
+                    user_template=prefix_build.user_template,
+                    turn_count=prefix_build.turn_count,
+                )
+            else:
+                llm.set_prefix_turn_count(node_id, prefix_build.turn_count)
+                write_topology(
+                    bucket,
+                    user_template=prefix_build.user_template,
+                    turn_count=prefix_build.turn_count,
+                )
+                # Rewind preserves static prefix KV; rematerialize consumer slots from
+                # pooled anchors / upstream response KV instead of forcing dense tool turns.
+                await self._rematerialize_consumer_slots_for_kv_reuse(
+                    llm,
+                    ctx,
+                    bucket if isinstance(bucket, dict) else {},
+                    agent_idx,
+                )
         elif plan.action == "static_rebuild":
             _proactive_stale_topology_purge(
                 str(node_id),
@@ -2085,6 +2270,21 @@ class KvcommEngineAdapter:
                     ctx.agent_index,
                 )
             _note_browser_tool_emission(ctx.run_id, ctx.agent_index, message)
+            try:
+                agent_idx = int(ctx.agent_index)
+            except (TypeError, ValueError):
+                agent_idx = 0
+            if agent_idx > 0 and (message.get("tool_calls") or []):
+                reported_mode = str(getattr(result, "mode", None) or generation_mode)
+                if reported_mode == "kv_reuse":
+                    llm.mark_consumer_tool_schema_stable(ctx.message_key)
+                else:
+                    logger.debug(
+                        "[kvcomm-bench] skip tool-schema stable mark run_id={} agent={} mode={} (dense fallback)",
+                        ctx.run_id,
+                        ctx.agent_index,
+                        reported_mode,
+                    )
             request_metrics = dict(metrics)
             _append_emitted_tool_calls(request_metrics, message)
             metrics = _accumulate_agent_metrics(self._request_metrics.get(metric_key), request_metrics)
@@ -3312,6 +3512,13 @@ class KvcommEngineAdapter:
             agent_role=f"agent_{ctx.agent_index}",
             on_token=on_token,
             tool_injection_text=tool_injection_text,
+            tool_schema_injection=bool(openai_tools),
+            full_tool_schema=bool(openai_tools and len(openai_tools) > 1),
+            tool_deliverable_fingerprint=_tool_deliverable_fingerprint_for_generation(
+                llm,
+                ctx,
+                body,
+            ),
         )
         payload, resp_headers, _metrics = await self._finalize_generation(
             llm,

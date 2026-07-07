@@ -88,6 +88,55 @@ def test_semantic_lookup_reuses_tool_kv_across_turns() -> None:
     assert lookup.kv_ref == entry.kv_ref
 
 
+def test_semantic_fallback_rejects_mismatched_tool_result_hash() -> None:
+    """Same tool_asst query, different tool_result → must not reuse stale ToolKV."""
+    index = ToolSemanticIndex()
+    backend = ToolKVBackend()
+    asst_query = "please read the config file"
+    entry_a = backend.get_or_create(
+        "file contents version A",
+        lambda t: ({"kv": "a"}, {"input_ids": [[1]]}),
+    )
+    index.upsert(
+        query=asst_query,
+        kv_ref=entry_a.kv_ref,
+        content_hash=entry_a.content_hash,
+        token_len=1,
+    )
+
+    content_hash_b = sha256_text("file contents version B")
+    lookup = index.lookup(asst_query, content_hash=content_hash_b)
+    assert lookup.hit
+    assert lookup.match_mode != "exact_hash"
+
+    candidate = backend.get(str(lookup.kv_ref))
+    assert candidate is not None
+    assert candidate.content_hash != content_hash_b
+
+    from KVCOMM.llm.gpt_chat import LLMChat
+
+    resolved = LLMChat._resolve_tool_kv_from_semantic_lookup(
+        type("S", (), {"tool_kv": backend})(),
+        lookup,
+        content_hash=content_hash_b,
+    )
+    assert resolved is None
+
+    entry_b = backend.get_or_create(
+        "file contents version B",
+        lambda t: ({"kv": "b"}, {"input_ids": [[2]]}),
+    )
+    assert entry_b.kv_ref != entry_a.kv_ref
+
+    lookup_same = index.lookup(asst_query, content_hash=entry_a.content_hash)
+    resolved_same = LLMChat._resolve_tool_kv_from_semantic_lookup(
+        type("S", (), {"tool_kv": backend})(),
+        lookup_same,
+        content_hash=entry_a.content_hash,
+    )
+    assert resolved_same is entry_a
+
+
 def test_purge_turn_downstream_preserves_global_tool_pool() -> None:
     """Append-turn purge drops bindings but keeps ToolKV produce pool."""
     reset_store_registry()
