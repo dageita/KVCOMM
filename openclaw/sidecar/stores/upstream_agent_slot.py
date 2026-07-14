@@ -104,6 +104,16 @@ class UpstreamAgentSlotRegistry:
             self.producer_key(producer_node_id, message_key, ph_id, content_hash)
         )
 
+    def find_producer_for_ph(
+        self,
+        producer_node_id: str,
+        message_key: str,
+        ph_id: str,
+    ) -> UpstreamAgentSlot | None:
+        prefix = f"upprod:{producer_node_id}:{message_key}:{ph_id}:"
+        matches = [slot for key, slot in self._producer.items() if key.startswith(prefix)]
+        return matches[-1] if matches else None
+
     def get_consumer(
         self,
         consumer_node_id: str,

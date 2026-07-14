@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 _TURN_PH_RE = re.compile(r"\{turn_\d+_(?:assistant|tool)\}")
 
@@ -49,4 +49,35 @@ def tool_deliverable_fingerprint(*, task_id: str, upstream_text: str) -> str:
 
 def branch_fingerprint(*, schema_hash: str, deliverable_hash: str) -> str:
     return sha256_text(f"{schema_hash}|{deliverable_hash}")
+
+
+def producer_turn_branch_fingerprint(
+    *,
+    task_id: str,
+    turn_index: int,
+    tool_names: Iterable[str],
+) -> str:
+    """Stable branch key for producer (agent 0) tool turns keyed by turn + tool set."""
+    tools = ",".join(sorted(str(name).strip() for name in tool_names if str(name).strip()))
+    return sha256_text(f"producer:{task_id or 'task'}:turn:{int(turn_index)}:tools:{tools}")
+
+
+def prefix_boundary_token_fingerprint(token_ids: Any, prefix_len: int) -> str:
+    """Hash token ids up to the tool-schema boundary for branch splice validation."""
+    try:
+        import torch
+    except ImportError:
+        torch = None  # type: ignore[assignment]
+    if isinstance(token_ids, dict):
+        ids = token_ids.get("input_ids")
+    else:
+        ids = token_ids
+    if ids is None:
+        return ""
+    if torch is not None and isinstance(ids, torch.Tensor):
+        slice_ids = ids[0, : int(prefix_len)].detach().cpu().tolist()
+    else:
+        row = ids[0] if isinstance(ids, (list, tuple)) else ids
+        slice_ids = list(row[: int(prefix_len)])
+    return sha256_text(",".join(str(x) for x in slice_ids))
 

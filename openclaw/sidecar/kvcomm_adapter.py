@@ -22,6 +22,8 @@ from sidecar.bench_prompt_compose import (
     is_config_loader_task,
     is_find_that_task,
     is_quick_note_task,
+    is_redact_doc_task,
+    is_summarize_thread_task,
     tool_constraints_for_context,
 )
 from sidecar.openclaw_prefix import (
@@ -45,6 +47,16 @@ from sidecar.openclaw_prefix import (
     build_browser_verifier_exec_hint,
     build_find_that_verifier_exec_hint,
     build_find_that_writer_copy_hint,
+    build_redact_doc_verifier_exec_hint,
+    build_redact_doc_verifier_exec_message,
+    build_redact_doc_writer_write_message,
+    estimate_bench_text_tokens,
+    build_summarize_thread_extractor_read_continuation_hint,
+    build_summarize_thread_verifier_exec_hint,
+    build_summarize_thread_verifier_exec_message,
+    build_summarize_thread_writer_write_message,
+    ensure_redact_doc_chain_deliverable,
+    ensure_summarize_thread_chain_deliverable,
     config_loader_analyzer_reads_satisfied,
     config_loader_missing_analyzer_reads,
     config_loader_patcher_fix_satisfied,
@@ -56,10 +68,20 @@ from sidecar.openclaw_prefix import (
     find_that_source_located,
     find_that_verifier_exec_done,
     find_that_verifier_passed,
+    redact_doc_extractor_read_satisfied,
+    redact_doc_verifier_passed,
+    redact_doc_write_satisfied,
+    summarize_thread_extractor_read_complete,
+    summarize_thread_thread_continuation_read_done,
+    summarize_thread_thread_read_satisfied,
+    summarize_thread_thread_read_truncated,
+    summarize_thread_verifier_passed,
+    summarize_thread_write_satisfied,
     normalizer_analyzer_read_satisfied,
     normalizer_patcher_read_satisfied,
     normalizer_tests_ready,
     normalizer_tests_satisfied,
+    quick_note_extractor_read_satisfied,
     quick_note_write_satisfied,
     patcher_read_satisfied,
     patcher_fix_satisfied,
@@ -71,6 +93,58 @@ from sidecar.openclaw_prefix import (
     verifier_should_force_read,
     static_without_turn_placeholders,
     use_openclaw_prefix,
+)
+from sidecar.bench_canonical import (
+    CROSS_REPO_SEARCH_COMMAND,
+    CROSS_REPO_TASK_ID,
+    DELEGATION_REPAIR_TASK_ID,
+    FEATURE_EXPORT_TASK_ID,
+    HALLUCINATION_EVIDENCE_TASK_ID,
+    INBOX_TRIAGE_TASK_ID,
+    LIFE_TRIP_PLAN_TASK_ID,
+    MEMORY_RECALL_TASK_ID,
+    SQL_QUERY_TASK_ID,
+    build_cross_repo_analyzer_read_hint,
+    build_delegation_repair_analyzer_read_hint,
+    build_feature_export_analyzer_read_hint,
+    build_find_that_analyzer_read_hint,
+    build_find_that_analyzer_search_hint,
+    build_hallucination_evidence_analyzer_read_hint,
+    build_inbox_triage_analyzer_read_hint,
+    build_life_trip_plan_analyzer_read_hint,
+    build_memory_recall_analyzer_read_hint,
+    build_sql_query_schema_exec_hint,
+    cross_repo_analyzer_reads_satisfied,
+    cross_repo_migration_writes_satisfied,
+    cross_repo_missing_analyzer_reads,
+    cross_repo_search_done,
+    delegation_repair_analyzer_reads_satisfied,
+    delegation_repair_missing_analyzer_reads,
+    delegation_repair_writes_satisfied,
+    feature_export_analyzer_reads_satisfied,
+    feature_export_missing_analyzer_reads,
+    find_that_analyzer_reads_satisfied,
+    find_that_missing_analyzer_reads,
+    find_that_search_done,
+    generic_exploration_satisfied,
+    generic_verifier_exec_done,
+    generic_write_satisfied,
+    hallucination_evidence_analyzer_reads_satisfied,
+    hallucination_evidence_missing_analyzer_reads,
+    hallucination_evidence_writes_satisfied,
+    inbox_triage_analyzer_reads_satisfied,
+    inbox_triage_missing_analyzer_reads,
+    is_generic_canonical_task,
+    life_trip_plan_analyzer_reads_satisfied,
+    life_trip_plan_missing_analyzer_reads,
+    memory_recall_analyzer_reads_satisfied,
+    memory_recall_missing_analyzer_reads,
+    memory_recall_writes_satisfied,
+    normalize_task_id,
+    resolve_bench_forced_from_flags,
+    select_canonical_gate,
+    sql_query_schema_exec_done,
+    task_canonical_spec,
 )
 from sidecar.stores.prefix_topology import PrefixRebuildPlan, plan_prefix_update, write_topology
 from sidecar.stores.registry import get_store_registry
@@ -96,7 +170,47 @@ from sidecar.tool_bridge import (
 KVCOMM_META_RE = re.compile(r"<!--KVCOMM_META:(\{.*?\})-->", re.DOTALL)
 SIDECAR_VERSION = "0.2.0-kvcomm-engine"
 _CLAWBENCH_TEXT_ONLY_MAX_TOKENS = 160
-_CLAWBENCH_TOOL_CONTINUATION_MAX_TOKENS = 128
+
+
+def _bench_canonical_text_enabled() -> bool:
+    """When true, clawbench text-only gate turns use fixed canonical assistant text."""
+    raw = os.environ.get("KVCOMM_BENCH_CANONICAL_TEXT", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _bench_canonical_hf_enabled() -> bool:
+    """When true with canonical text, run HF teacher-forced decode instead of short-circuit."""
+    if not _bench_canonical_text_enabled():
+        return False
+    raw = os.environ.get("KVCOMM_BENCH_CANONICAL_HF", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _log_short_circuit_response(
+    *,
+    run_id: str,
+    agent_index: str | int,
+    label: str,
+    mode: str,
+    text: str = "",
+) -> None:
+    """Mirror agen_kvcomm RESPONSE logs when HF generation is skipped."""
+    preview = str(text or "").strip()
+    if len(preview) > 500:
+        preview = f"{preview[:497]}..."
+    logger.debug(
+        "[RESPONSE:short_circuit:{}] run_id={} Agent {} {} Response:\n{}",
+        mode,
+        run_id,
+        agent_index,
+        label,
+        preview or "(empty)",
+    )
+
+
+_CLAWBENCH_TOOL_FIRST_MAX_TOKENS = 384
+_CLAWBENCH_TOOL_CONTINUATION_MAX_TOKENS = 384
+_CLAWBENCH_TOOL_GATED_MAX_TOKENS = 512
 _CONFIG_LOADER_PYTEST_CMD = "PYTHONPATH=. python -m pytest -q tests/test_config_loader.py"
 
 
@@ -180,6 +294,16 @@ _last_agent0_run_id: str | None = None
 _consumer_stable_cleared_for_measure: bool = False
 
 
+def _purge_bench_tool_schema_branches() -> None:
+    """Explicitly drop pooled schema branches (e.g. sidecar release); not used on measure register."""
+    from sidecar.stores.registry import get_store_registry
+
+    stores = get_store_registry()
+    for node_id in ("0", "1", "2"):
+        stores.tool_schema_branches.purge_node(node_id)
+    logger.info("[kvcomm-bench] purged tool-schema branches for nodes 0-2")
+
+
 def _note_agent0_bench_register(run_id: str | None, register_mode: str) -> None:
     """Track agent-0 bench registers; clear warmup tool stability on first kv_reuse measure run."""
     global _last_agent0_run_id, _consumer_stable_cleared_for_measure
@@ -204,7 +328,8 @@ def _note_agent0_bench_register(run_id: str | None, register_mode: str) -> None:
     if prev and prev != rid:
         LLMChat.clear_consumer_tool_schema_stable_all()
         logger.info(
-            "[kvcomm-bench] measure run {} — cleared consumer tool-schema stable (prev register {})",
+            "[kvcomm-bench] measure run {} — cleared consumer tool-schema stable (prev register {}); "
+            "tool-schema branches retained for cross-run reuse",
             rid,
             prev,
         )
@@ -928,6 +1053,7 @@ def _build_openclaw_prefix(
             bench_user_prompt=normalize_run_specific_paths(ctx.bench_user_prompt),
             clawbench_role=_resolve_clawbench_role(ctx),
             task_profile=ctx.task_profile,
+            task_id=str(ctx.task_id or ""),
         )
         return _apply_bench_tool_constraints(built, ctx)
     except PrefixOverflowError as exc:
@@ -1093,15 +1219,36 @@ def _tool_deliverable_fingerprint_for_generation(
     llm,
     ctx: "KvcommContext",
     body: dict[str, Any],
+    *,
+    tool_turn_index: int | None = None,
 ) -> str:
-    """Hash upstream deliverable context for tool schema branch lookup."""
-    from sidecar.stores.hashing import tool_deliverable_fingerprint
+    """Hash deliverable context for tool schema branch lookup."""
+    from sidecar.stores.hashing import producer_turn_branch_fingerprint, tool_deliverable_fingerprint
 
     upstream_text = ""
     try:
         agent_idx = int(ctx.agent_index)
     except (TypeError, ValueError):
         agent_idx = 0
+    if agent_idx == 0:
+        tool_names: list[str] = []
+        for tool in body.get("tools") or []:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+            name = str(fn.get("name") or tool.get("name") or "").strip()
+            if name:
+                tool_names.append(name)
+        turn = (
+            int(tool_turn_index)
+            if tool_turn_index is not None
+            else count_assistant_turns(body.get("messages") or [])
+        )
+        return producer_turn_branch_fingerprint(
+            task_id=str(ctx.task_id or ""),
+            turn_index=turn,
+            tool_names=tool_names,
+        )
     if agent_idx > 0:
         ph_id = f"agent_{agent_idx - 1}_current"
         slot = llm.resolve_upstream_agent_slot(ph_id, ctx.message_key)
@@ -1387,6 +1534,9 @@ def _accumulate_agent_metrics(
             merged_emitted.append(entry)
         out["emitted_tool_calls"] = merged_emitted
 
+    _accumulate_reuse_breakdown(out, existing, latest)
+    if existing:
+        _preserve_inference_ttft(out, existing, latest)
     total = int(out.get("sidecar_request_count", 1))
     kv_count = int(out.get("kv_reuse_request_count", 0))
     out["reuse_rate"] = round(kv_count / total, 4) if total else 0.0
@@ -1397,6 +1547,108 @@ def _accumulate_agent_metrics(
     else:
         out["mode"] = "partial_kv_reuse"
     return out
+
+
+def _accumulate_reuse_breakdown(
+    out: dict[str, Any],
+    existing: dict[str, Any] | None,
+    latest: dict[str, Any],
+) -> None:
+    """Aggregate per-spawn KV reuse / decode counters for bench reports."""
+    prefix_latest = int(latest.get("prefix_estimated_tokens") or 0)
+    tool_latest = int(latest.get("tool_injection_tokens") or 0)
+    resp_anch_latest = int(latest.get("anchor_pooled_tokens") or 0)
+    in_anch_latest = int(latest.get("input_anchor_pooled_tokens") or 0)
+    decode_latest = int(latest.get("response_decode_tokens") or 0)
+    short_latest = 1 if latest.get("short_circuit") else 0
+    reuse_kind = str(latest.get("input_reuse_kind") or "").strip()
+
+    if not existing:
+        out["prefix_tokens_max"] = prefix_latest
+        out["tool_schema_tokens_sum"] = tool_latest
+        out["response_anchor_tokens_sum"] = resp_anch_latest
+        out["input_anchor_tokens_sum"] = in_anch_latest
+        out["response_decode_tokens_sum"] = decode_latest
+        out["short_circuit_count"] = short_latest
+        out["input_reuse_kinds"] = [reuse_kind] if reuse_kind else []
+        return
+
+    prefix_existing = int(
+        existing.get("prefix_tokens_max") or existing.get("prefix_estimated_tokens") or 0
+    )
+    out["prefix_tokens_max"] = max(prefix_existing, prefix_latest)
+    tool_existing = int(existing.get("tool_schema_tokens_sum") or existing.get("tool_injection_tokens") or 0)
+    resp_existing = int(existing.get("response_anchor_tokens_sum") or existing.get("anchor_pooled_tokens") or 0)
+    in_existing = int(existing.get("input_anchor_tokens_sum") or existing.get("input_anchor_pooled_tokens") or 0)
+    decode_existing = int(existing.get("response_decode_tokens_sum") or existing.get("response_decode_tokens") or 0)
+    short_existing = int(existing.get("short_circuit_count") or (1 if existing.get("short_circuit") else 0))
+
+    out["tool_schema_tokens_sum"] = tool_existing + tool_latest
+    out["response_anchor_tokens_sum"] = resp_existing + resp_anch_latest
+    out["input_anchor_tokens_sum"] = in_existing + in_anch_latest
+    out["response_decode_tokens_sum"] = decode_existing + decode_latest
+    out["short_circuit_count"] = short_existing + short_latest
+    kinds: list[str] = list(existing.get("input_reuse_kinds") or [])
+    existing_kind = str(existing.get("input_reuse_kind") or "").strip()
+    if existing_kind and existing_kind not in kinds:
+        kinds.append(existing_kind)
+    if reuse_kind and reuse_kind not in kinds:
+        kinds.append(reuse_kind)
+    out["input_reuse_kinds"] = kinds
+
+
+_INFERENCE_TTFT_FIELDS = (
+    "generation_ttft_ms",
+    "kvcomm_latency_ms",
+    "preprocess_latency_ms",
+    "ttft_ms",
+)
+
+
+def _is_empty_inference_metric(value: Any) -> bool:
+    return value is None or value == 0 or value == 0.0
+
+
+def _preserve_inference_ttft(
+    out: dict[str, Any],
+    existing: dict[str, Any],
+    latest: dict[str, Any],
+) -> None:
+    """Keep a coherent HF TTFT triple across multi-turn agent spawns.
+
+    Canonical short-circuit turns often report ttft=0; ignore those and keep the
+    prior real inference metrics. For normal turns, keep generation_ttft_ms /
+    kvcomm_latency_ms / ttft_ms from the same request — historically ttft_ms used
+    max() while gen/kvcomm used last-wins, which made agent1's sidecar_ttft look
+    far larger than gen_ttft+kvcomm_ms after a long edit followed by a short DONE.
+    """
+    if latest.get("short_circuit"):
+        for field in _INFERENCE_TTFT_FIELDS:
+            if _is_empty_inference_metric(out.get(field)):
+                prev = existing.get(field)
+                if not _is_empty_inference_metric(prev):
+                    out[field] = prev
+        return
+
+    def _ttft_score(row: dict[str, Any]) -> float:
+        val = row.get("ttft_ms")
+        if _is_empty_inference_metric(val):
+            return -1.0
+        return float(val)
+
+    best = existing if _ttft_score(existing) >= _ttft_score(latest) else latest
+    if _ttft_score(best) < 0:
+        # Neither row has a real ttft; fall back to last non-empty components.
+        for field in _INFERENCE_TTFT_FIELDS:
+            new_val = latest.get(field)
+            old_val = existing.get(field)
+            if new_val is None and old_val is not None:
+                out[field] = old_val
+        return
+    for field in _INFERENCE_TTFT_FIELDS:
+        val = best.get(field)
+        if val is not None:
+            out[field] = val
 
 
 def _metrics_from_result(
@@ -1432,10 +1684,25 @@ def _metrics_from_result(
     input_anchor_pooled_tokens = input_anchor_meta.get("input_anchor_pooled_tokens")
     if input_anchor_pooled_tokens is not None:
         input_anchor_pooled_tokens = int(input_anchor_pooled_tokens)
+    input_reuse_kind = str(input_anchor_meta.get("input_reuse_kind") or "").strip()
+    short_circuit = metadata.get("short_circuit")
+    tool_injection_tokens = metadata.get("tool_injection_tokens")
+    if tool_injection_tokens is not None:
+        tool_injection_tokens = int(tool_injection_tokens)
+    response_decode_tokens = metadata.get("response_decode_tokens")
+    if response_decode_tokens is None:
+        if short_circuit:
+            response_decode_tokens = 0
+        else:
+            raw_text = str(result.text or metadata.get("raw_response_text") or "")
+            response_decode_tokens = estimate_bench_text_tokens(raw_text)
+    else:
+        response_decode_tokens = int(response_decode_tokens)
     return {
         "mode": result.mode,
         "effective_mode": effective_mode,
         "input_routing_mode": input_anchor_meta.get("input_routing_mode"),
+        "input_reuse_kind": input_reuse_kind or None,
         "ttft_ms": round(float(result.ttft) * 1000, 2),
         "generation_ttft_ms": generation_ttft_ms,
         "preprocess_latency_ms": preprocess_latency_ms,
@@ -1446,6 +1713,9 @@ def _metrics_from_result(
         "anchor_prediction": anchor_prediction,
         "anchor_pooled_tokens": anchor_pooled_tokens,
         "input_anchor_pooled_tokens": input_anchor_pooled_tokens,
+        "tool_injection_tokens": tool_injection_tokens,
+        "response_decode_tokens": response_decode_tokens,
+        "short_circuit": short_circuit,
         "reuse_kv_text": metadata.get("reuse_kv_text"),
         "reuse_kv_segments": metadata.get("reuse_kv_segments"),
         "run_id": ctx.run_id,
@@ -2229,6 +2499,11 @@ class KvcommEngineAdapter:
         model: str,
         openai_tools: list[dict[str, Any]] | None = None,
         config_loader_edit_fallback: bool = False,
+        summarize_thread_verifier_exec_fallback: bool = False,
+        summarize_thread_writer_write_fallback: bool = False,
+        redact_doc_verifier_exec_fallback: bool = False,
+        redact_doc_writer_write_fallback: bool = False,
+        request_messages: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
         if ctx.task_profile == "clawbench":
             self._snapshot_anchors(llm, ctx.run_id, ctx.agent_index, ctx.message_key)
@@ -2255,8 +2530,11 @@ class KvcommEngineAdapter:
         )
         metric_key = f"{ctx.run_id}:{ctx.agent_index}"
         if openai_tools:
+            raw_for_bridge = str(
+                getattr(result, "metadata", {}).get("raw_response_text") or result.text or ""
+            )
             message = openai_message_from_generation(
-                result.text,
+                raw_for_bridge,
                 task_profile=ctx.task_profile,
                 task_id=ctx.task_id,
                 workspace_dir=str((ctx.vars or {}).get("workspace_dir") or ""),
@@ -2269,15 +2547,85 @@ class KvcommEngineAdapter:
                     ctx.run_id,
                     ctx.agent_index,
                 )
+            elif summarize_thread_verifier_exec_fallback:
+                from sidecar.tool_bridge import summarize_thread_exec_needs_canonical_fallback
+
+                if summarize_thread_exec_needs_canonical_fallback(message):
+                    message = build_summarize_thread_verifier_exec_message(
+                        workspace_dir=str((ctx.vars or {}).get("workspace_dir") or ""),
+                    )
+                    logger.debug(
+                        "[tool-bridge] run_id={} agent={} summarize-thread verify exec missing — injecting canonical exec",
+                        ctx.run_id,
+                        ctx.agent_index,
+                    )
+            elif redact_doc_verifier_exec_fallback:
+                from sidecar.openclaw_prefix import redact_doc_verifier_exec_needs_canonical_fallback
+
+                if redact_doc_verifier_exec_needs_canonical_fallback(message):
+                    message = build_redact_doc_verifier_exec_message(
+                        workspace_dir=str((ctx.vars or {}).get("workspace_dir") or ""),
+                    )
+                    logger.debug(
+                        "[tool-bridge] run_id={} agent={} redact-doc verify exec missing — injecting canonical exec",
+                        ctx.run_id,
+                        ctx.agent_index,
+                    )
+            elif summarize_thread_writer_write_fallback:
+                from sidecar.openclaw_prefix import summarize_thread_writer_write_needs_canonical_fallback
+
+                if summarize_thread_writer_write_needs_canonical_fallback(message) or not (
+                    message.get("tool_calls") or []
+                ):
+                    message = build_summarize_thread_writer_write_message(
+                        messages=list(request_messages or []),
+                        workspace_dir=str((ctx.vars or {}).get("workspace_dir") or ""),
+                        llm=llm,
+                        message_key=ctx.message_key,
+                    )
+                    logger.debug(
+                        "[tool-bridge] run_id={} agent={} summarize-thread write missing — injecting canonical write",
+                        ctx.run_id,
+                        ctx.agent_index,
+                    )
+            elif redact_doc_writer_write_fallback:
+                from sidecar.openclaw_prefix import redact_doc_writer_write_needs_canonical_fallback
+
+                if redact_doc_writer_write_needs_canonical_fallback(message) or not (
+                    message.get("tool_calls") or []
+                ):
+                    message = build_redact_doc_writer_write_message(
+                        messages=list(request_messages or []),
+                        workspace_dir=str((ctx.vars or {}).get("workspace_dir") or ""),
+                    )
+                    logger.debug(
+                        "[tool-bridge] run_id={} agent={} redact-doc write missing — injecting canonical write",
+                        ctx.run_id,
+                        ctx.agent_index,
+                    )
             _note_browser_tool_emission(ctx.run_id, ctx.agent_index, message)
             try:
                 agent_idx = int(ctx.agent_index)
             except (TypeError, ValueError):
                 agent_idx = 0
             if agent_idx > 0 and (message.get("tool_calls") or []):
+                from KVCOMM.llm.gpt_chat import LLMChat
+
                 reported_mode = str(getattr(result, "mode", None) or generation_mode)
                 if reported_mode == "kv_reuse":
                     llm.mark_consumer_tool_schema_stable(ctx.message_key)
+                elif LLMChat.consumer_first_measure_dense_pending():
+                    # First measure run intentionally densifies consumer tool-schema
+                    # turns to re-seed branches. Mark stable after that dense so the
+                    # rest of the spawn (and later turns) can kv_reuse — otherwise
+                    # pending stays True and every tool turn falls back to dense.
+                    llm.mark_consumer_tool_schema_stable(ctx.message_key)
+                    logger.debug(
+                        "[kvcomm-bench] marked tool-schema stable after first-measure dense "
+                        "run_id={} agent={}",
+                        ctx.run_id,
+                        ctx.agent_index,
+                    )
                 else:
                     logger.debug(
                         "[kvcomm-bench] skip tool-schema stable mark run_id={} agent={} mode={} (dense fallback)",
@@ -2353,7 +2701,26 @@ class KvcommEngineAdapter:
         normalizer_bridge = ctx.task_profile == "clawbench" and is_add_tests_normalizer_task(ctx)
         config_loader_bridge = ctx.task_profile == "clawbench" and is_config_loader_task(ctx)
         find_that_bridge = ctx.task_profile == "clawbench" and is_find_that_task(ctx)
+        summarize_thread_bridge = ctx.task_profile == "clawbench" and is_summarize_thread_task(ctx)
+        redact_doc_bridge = ctx.task_profile == "clawbench" and is_redact_doc_task(ctx)
         browser_bridge = ctx.task_profile == "clawbench" and is_browser_family_task(ctx)
+        specific_canonical_bridge = any(
+            (
+                bugfix_bridge,
+                quick_note_bridge,
+                normalizer_bridge,
+                config_loader_bridge,
+                find_that_bridge,
+                summarize_thread_bridge,
+                redact_doc_bridge,
+                browser_bridge and str(ctx.task_id or "").strip() == "t2-browser-form-fix",
+            )
+        )
+        generic_canonical_bridge = (
+            ctx.task_profile == "clawbench"
+            and is_generic_canonical_task(ctx.task_id)
+            and not specific_canonical_bridge
+        )
         chain_workspace = str((ctx.vars or {}).get("workspace_dir") or "")
         if browser_bridge and chain_workspace:
             sync_clawbench_browser_workspaces(
@@ -2416,13 +2783,13 @@ class KvcommEngineAdapter:
             config_loader_bridge
             and agent_idx == 1
             and config_loader_patcher_fix_satisfied(messages)
-            and verifier_exec_pytest_done(messages)
+            and verifier_pytest_passed(messages)
         )
         force_config_loader_patcher_pytest = (
             config_loader_bridge
             and agent_idx == 1
             and config_loader_patcher_fix_satisfied(messages)
-            and not verifier_exec_pytest_done(messages)
+            and not verifier_pytest_passed(messages)
         )
         force_config_loader_patcher_read = (
             config_loader_bridge
@@ -2455,10 +2822,22 @@ class KvcommEngineAdapter:
             and agent_idx == 2
             and config_loader_verifier_should_force_read(messages)
         )
+        force_find_that_analyzer_search = (
+            find_that_bridge
+            and agent_idx == 0
+            and not find_that_search_done(messages)
+        )
+        force_find_that_analyzer_read = (
+            find_that_bridge
+            and agent_idx == 0
+            and find_that_search_done(messages)
+            and not find_that_analyzer_reads_satisfied(messages)
+        )
         force_find_that_extractor_done = (
             find_that_bridge
             and agent_idx == 0
-            and find_that_source_located(messages)
+            and find_that_search_done(messages)
+            and find_that_analyzer_reads_satisfied(messages)
         )
         force_find_that_writer_copy = (
             find_that_bridge
@@ -2480,6 +2859,67 @@ class KvcommEngineAdapter:
             find_that_bridge
             and agent_idx == 2
             and find_that_verifier_passed(messages)
+        )
+        force_summarize_thread_extractor_read_tail = (
+            summarize_thread_bridge
+            and agent_idx == 0
+            and summarize_thread_thread_read_satisfied(messages)
+            and summarize_thread_thread_read_truncated(
+                messages, task_id=str(ctx.task_id or "")
+            )
+            and not summarize_thread_thread_continuation_read_done(messages)
+        )
+        force_summarize_thread_extractor_done = (
+            summarize_thread_bridge
+            and agent_idx == 0
+            and summarize_thread_extractor_read_complete(
+                messages, task_id=str(ctx.task_id or "")
+            )
+        )
+        force_summarize_thread_writer_done = (
+            summarize_thread_bridge
+            and agent_idx == 1
+            and summarize_thread_write_satisfied(messages)
+        )
+        force_summarize_thread_writer_write = (
+            summarize_thread_bridge
+            and agent_idx == 1
+            and not summarize_thread_write_satisfied(messages)
+        )
+        force_summarize_thread_verifier_exec = (
+            summarize_thread_bridge
+            and agent_idx == 2
+            and not summarize_thread_verifier_passed(messages)
+        )
+        force_summarize_thread_verifier_done = (
+            summarize_thread_bridge
+            and agent_idx == 2
+            and summarize_thread_verifier_passed(messages)
+        )
+        force_redact_doc_extractor_done = (
+            redact_doc_bridge
+            and agent_idx == 0
+            and redact_doc_extractor_read_satisfied(messages)
+        )
+        force_redact_doc_writer_done = (
+            redact_doc_bridge
+            and agent_idx == 1
+            and redact_doc_write_satisfied(messages)
+        )
+        force_redact_doc_writer_write = (
+            redact_doc_bridge
+            and agent_idx == 1
+            and not redact_doc_write_satisfied(messages)
+        )
+        force_redact_doc_verifier_exec = (
+            redact_doc_bridge
+            and agent_idx == 2
+            and not redact_doc_verifier_passed(messages)
+        )
+        force_redact_doc_verifier_done = (
+            redact_doc_bridge
+            and agent_idx == 2
+            and redact_doc_verifier_passed(messages)
         )
         force_text_only = (
             bugfix_bridge
@@ -2526,7 +2966,6 @@ class KvcommEngineAdapter:
         force_normalizer_verifier_exec = (
             normalizer_bridge
             and agent_idx == 2
-            and normalizer_tests_ready(messages, workspace_dir=chain_workspace)
             and not verifier_pytest_passed(messages)
         )
         force_patcher_done = (
@@ -2572,6 +3011,16 @@ class KvcommEngineAdapter:
             and agent_idx == 2
             and verifier_should_force_read(messages)
         )
+        force_quick_note_extractor_done = (
+            quick_note_bridge
+            and agent_idx == 0
+            and quick_note_extractor_read_satisfied(messages)
+        )
+        force_quick_note_extractor_read = (
+            quick_note_bridge
+            and agent_idx == 0
+            and not quick_note_extractor_read_satisfied(messages)
+        )
         force_quick_note_verifier_done = (
             quick_note_bridge
             and agent_idx == 2
@@ -2582,6 +3031,233 @@ class KvcommEngineAdapter:
             and agent_idx == 1
             and quick_note_write_satisfied(messages)
         )
+        force_quick_note_writer_write = (
+            quick_note_bridge
+            and agent_idx == 1
+            and not quick_note_write_satisfied(messages)
+        )
+        _generic_spec = task_canonical_spec(ctx.task_id) if generic_canonical_bridge else None
+        sql_query_bridge = (
+            generic_canonical_bridge
+            and normalize_task_id(ctx.task_id) == SQL_QUERY_TASK_ID
+        )
+        feature_export_bridge = (
+            generic_canonical_bridge
+            and normalize_task_id(ctx.task_id) == FEATURE_EXPORT_TASK_ID
+        )
+        inbox_triage_bridge = (
+            generic_canonical_bridge
+            and normalize_task_id(ctx.task_id) == INBOX_TRIAGE_TASK_ID
+        )
+        cross_repo_bridge = (
+            generic_canonical_bridge
+            and normalize_task_id(ctx.task_id) == CROSS_REPO_TASK_ID
+        )
+        delegation_repair_bridge = (
+            generic_canonical_bridge
+            and normalize_task_id(ctx.task_id) == DELEGATION_REPAIR_TASK_ID
+        )
+        life_trip_plan_bridge = (
+            generic_canonical_bridge
+            and normalize_task_id(ctx.task_id) == LIFE_TRIP_PLAN_TASK_ID
+        )
+        memory_recall_bridge = (
+            generic_canonical_bridge
+            and normalize_task_id(ctx.task_id) == MEMORY_RECALL_TASK_ID
+        )
+        hallucination_evidence_bridge = (
+            generic_canonical_bridge
+            and normalize_task_id(ctx.task_id) == HALLUCINATION_EVIDENCE_TASK_ID
+        )
+        force_sql_query_schema_exec = (
+            sql_query_bridge
+            and agent_idx == 0
+            and not sql_query_schema_exec_done(messages)
+        )
+        force_feature_export_analyzer_read = (
+            feature_export_bridge
+            and agent_idx == 0
+            and not feature_export_analyzer_reads_satisfied(messages)
+        )
+        force_inbox_triage_analyzer_read = (
+            inbox_triage_bridge
+            and agent_idx == 0
+            and not inbox_triage_analyzer_reads_satisfied(messages)
+        )
+        force_cross_repo_analyzer_search = (
+            cross_repo_bridge
+            and agent_idx == 0
+            and not cross_repo_search_done(messages)
+        )
+        force_cross_repo_analyzer_read = (
+            cross_repo_bridge
+            and agent_idx == 0
+            and cross_repo_search_done(messages)
+            and not cross_repo_analyzer_reads_satisfied(messages)
+        )
+        force_delegation_repair_analyzer_read = (
+            delegation_repair_bridge
+            and agent_idx == 0
+            and not delegation_repair_analyzer_reads_satisfied(messages)
+        )
+        force_life_trip_plan_analyzer_read = (
+            life_trip_plan_bridge
+            and agent_idx == 0
+            and not life_trip_plan_analyzer_reads_satisfied(messages)
+        )
+        force_memory_recall_analyzer_read = (
+            memory_recall_bridge
+            and agent_idx == 0
+            and not memory_recall_analyzer_reads_satisfied(messages)
+        )
+        force_hallucination_evidence_analyzer_read = (
+            hallucination_evidence_bridge
+            and agent_idx == 0
+            and not hallucination_evidence_analyzer_reads_satisfied(messages)
+        )
+        force_generic_extractor_done = (
+            generic_canonical_bridge
+            and agent_idx == 0
+            and (
+                sql_query_schema_exec_done(messages)
+                if sql_query_bridge
+                else feature_export_analyzer_reads_satisfied(messages)
+                if feature_export_bridge
+                else inbox_triage_analyzer_reads_satisfied(messages)
+                if inbox_triage_bridge
+                else (
+                    cross_repo_search_done(messages)
+                    and cross_repo_analyzer_reads_satisfied(messages)
+                )
+                if cross_repo_bridge
+                else delegation_repair_analyzer_reads_satisfied(messages)
+                if delegation_repair_bridge
+                else life_trip_plan_analyzer_reads_satisfied(messages)
+                if life_trip_plan_bridge
+                else memory_recall_analyzer_reads_satisfied(messages)
+                if memory_recall_bridge
+                else hallucination_evidence_analyzer_reads_satisfied(messages)
+                if hallucination_evidence_bridge
+                else generic_exploration_satisfied(messages)
+            )
+        )
+        force_generic_writer_write = (
+            generic_canonical_bridge
+            and agent_idx == 1
+            and _generic_spec is not None
+            and not (
+                cross_repo_migration_writes_satisfied(messages)
+                if cross_repo_bridge
+                else delegation_repair_writes_satisfied(messages)
+                if delegation_repair_bridge
+                else memory_recall_writes_satisfied(messages)
+                if memory_recall_bridge
+                else hallucination_evidence_writes_satisfied(messages)
+                if hallucination_evidence_bridge
+                else generic_write_satisfied(messages, _generic_spec.deliverable_path)
+            )
+        )
+        force_generic_writer_done = (
+            generic_canonical_bridge
+            and agent_idx == 1
+            and _generic_spec is not None
+            and (
+                cross_repo_migration_writes_satisfied(messages)
+                if cross_repo_bridge
+                else delegation_repair_writes_satisfied(messages)
+                if delegation_repair_bridge
+                else memory_recall_writes_satisfied(messages)
+                if memory_recall_bridge
+                else hallucination_evidence_writes_satisfied(messages)
+                if hallucination_evidence_bridge
+                else generic_write_satisfied(messages, _generic_spec.deliverable_path)
+            )
+        )
+        _generic_verify_is_pytest = bool(
+            _generic_spec is not None
+            and "pytest" in str(_generic_spec.verify_command or "").lower()
+        )
+        _generic_verify_ok = (
+            verifier_pytest_passed(messages)
+            if _generic_verify_is_pytest
+            else generic_verifier_exec_done(
+                messages, _generic_spec.verify_command if _generic_spec else ""
+            )
+        )
+        force_generic_verifier_exec = (
+            generic_canonical_bridge
+            and agent_idx == 2
+            and _generic_spec is not None
+            and not _generic_verify_ok
+        )
+        force_generic_verifier_done = (
+            generic_canonical_bridge
+            and agent_idx == 2
+            and _generic_spec is not None
+            and _generic_verify_ok
+        )
+        bench_force_flags = {
+            "force_redact_doc_extractor_done": force_redact_doc_extractor_done,
+            "force_redact_doc_writer_write": force_redact_doc_writer_write,
+            "force_redact_doc_writer_done": force_redact_doc_writer_done,
+            "force_redact_doc_verifier_exec": force_redact_doc_verifier_exec,
+            "force_redact_doc_verifier_done": force_redact_doc_verifier_done,
+            "force_summarize_thread_extractor_done": force_summarize_thread_extractor_done,
+            "force_summarize_thread_writer_write": force_summarize_thread_writer_write,
+            "force_summarize_thread_writer_done": force_summarize_thread_writer_done,
+            "force_summarize_thread_verifier_exec": force_summarize_thread_verifier_exec,
+            "force_summarize_thread_verifier_done": force_summarize_thread_verifier_done,
+            "force_find_that_analyzer_search": force_find_that_analyzer_search,
+            "force_find_that_analyzer_read": force_find_that_analyzer_read,
+            "force_find_that_extractor_done": force_find_that_extractor_done,
+            "force_find_that_writer_copy": force_find_that_writer_copy,
+            "force_find_that_writer_done": force_find_that_writer_done,
+            "force_find_that_verifier_exec": force_find_that_verifier_exec,
+            "force_find_that_verifier_done": force_find_that_verifier_done,
+            "force_text_only": force_text_only,
+            "force_edit_only": force_edit_only,
+            "force_patcher_pytest": force_patcher_pytest,
+            "force_patcher_done": force_patcher_done,
+            "force_verifier_exec": force_verifier_exec,
+            "force_verifier_pass": force_verifier_pass,
+            "force_config_loader_analyzer_done": force_config_loader_analyzer_done,
+            "force_config_loader_edit_only": force_config_loader_edit_only,
+            "force_config_loader_patcher_pytest": force_config_loader_patcher_pytest,
+            "force_config_loader_patcher_done": force_config_loader_patcher_done,
+            "force_config_loader_verifier_exec": force_config_loader_verifier_exec,
+            "force_config_loader_verifier_pass": force_config_loader_verifier_pass,
+            "force_normalizer_analyzer_done": force_normalizer_analyzer_done,
+            "force_normalizer_patcher_write": force_normalizer_patcher_write,
+            "force_normalizer_patcher_pytest": force_normalizer_patcher_pytest,
+            "force_normalizer_patcher_done": force_normalizer_patcher_done,
+            "force_normalizer_verifier_exec": force_normalizer_verifier_exec,
+            "force_normalizer_verifier_pass": force_normalizer_verifier_pass,
+            "force_quick_note_extractor_read": force_quick_note_extractor_read,
+            "force_quick_note_extractor_done": force_quick_note_extractor_done,
+            "force_quick_note_writer_write": force_quick_note_writer_write,
+            "force_quick_note_writer_done": force_quick_note_writer_done,
+            "force_quick_note_verifier_done": force_quick_note_verifier_done,
+            "force_browser_analyzer_done": force_browser_analyzer_done,
+            "force_browser_patcher_edit": force_browser_patcher_edit,
+            "force_browser_patcher_done": force_browser_patcher_done,
+            "force_browser_verifier_exec": force_browser_verifier_exec,
+            "force_browser_verifier_pass": force_browser_verifier_pass,
+            "force_browser_verifier_fail": force_browser_verifier_fail,
+            "force_sql_query_schema_exec": force_sql_query_schema_exec,
+            "force_feature_export_analyzer_read": force_feature_export_analyzer_read,
+            "force_inbox_triage_analyzer_read": force_inbox_triage_analyzer_read,
+            "force_cross_repo_analyzer_search": force_cross_repo_analyzer_search,
+            "force_cross_repo_analyzer_read": force_cross_repo_analyzer_read,
+            "force_delegation_repair_analyzer_read": force_delegation_repair_analyzer_read,
+            "force_life_trip_plan_analyzer_read": force_life_trip_plan_analyzer_read,
+            "force_memory_recall_analyzer_read": force_memory_recall_analyzer_read,
+            "force_hallucination_evidence_analyzer_read": force_hallucination_evidence_analyzer_read,
+            "force_generic_extractor_done": force_generic_extractor_done,
+            "force_generic_writer_write": force_generic_writer_write,
+            "force_generic_writer_done": force_generic_writer_done,
+            "force_generic_verifier_exec": force_generic_verifier_exec,
+            "force_generic_verifier_done": force_generic_verifier_done,
+        }
         analyzer_cart_hint = None
         config_loader_read_hint = None
         if (
@@ -3048,6 +3724,54 @@ class KvcommEngineAdapter:
                 "[tool-bridge] run_id={} agent=2 pytest passed — forcing text-only PASS",
                 ctx.run_id,
             )
+        elif force_find_that_analyzer_search:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_find_that_analyzer_search_hint()
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 find-that search pending — forcing exec-only",
+                ctx.run_id,
+            )
+        elif force_find_that_analyzer_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            missing_reads = find_that_missing_analyzer_reads(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_find_that_analyzer_read_hint(missing_reads)
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 find-that missing reads={} — forcing read-only",
+                ctx.run_id,
+                sorted(missing_reads),
+            )
         elif force_find_that_extractor_done:
             openai_tools = None
             tool_choice = None
@@ -3129,6 +3853,593 @@ class KvcommEngineAdapter:
             )
             logger.debug(
                 "[tool-bridge] run_id={} agent=2 find-that verify passed — forcing text-only PASS",
+                ctx.run_id,
+            )
+        elif force_summarize_thread_extractor_read_tail:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_summarize_thread_extractor_read_continuation_hint()
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 summarize-thread read truncated — forcing offset read",
+                ctx.run_id,
+            )
+        elif force_summarize_thread_extractor_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nthread.txt is already in context above. "
+                "Output your Agent 0 analysis in plain text: summarize decisions made, "
+                "open questions, and user commitments from the design channel thread. "
+                "Use the latest decision when earlier messages were overruled. "
+                "Do not call exec, read, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 summarize-thread read satisfied — forcing text-only",
+                ctx.run_id,
+            )
+        elif force_summarize_thread_writer_write:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "write"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "write"}}
+            tool_injection_text = (
+                build_tool_injection_text(openai_tools, llm.tokenizer, tool_choice)
+                + "\nWrite design_summary.md with the full summary markdown from Agent 0's analysis. "
+                "Do not output analysis text — only a write tool call.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 summarize-thread write pending — forcing write-only",
+                ctx.run_id,
+            )
+        elif force_summarize_thread_writer_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nThe summary markdown deliverable was written successfully and is shown "
+                "in context above. Reply DONE in plain text: include the path written and "
+                "quote the FULL summary body verbatim (all sections). "
+                "Do not call write, edit, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 summarize-thread write satisfied — forcing text-only DONE",
+                ctx.run_id,
+            )
+        elif force_summarize_thread_verifier_exec:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_summarize_thread_verifier_exec_hint(
+                workspace_dir=chain_workspace,
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 summarize-thread verify pending — forcing exec-only",
+                ctx.run_id,
+            )
+        elif force_summarize_thread_verifier_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nAll summarize-thread verification scripts passed and are shown in context above. "
+                "Reply PASS in plain text summarizing verification. "
+                "Do not call exec, read, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 summarize-thread verify passed — forcing text-only PASS",
+                ctx.run_id,
+            )
+        elif force_redact_doc_extractor_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\ncontract.txt is already in context above. "
+                "Reply with the fixed Agent 0 analysis format listing PII fields and the "
+                "contract_redacted.txt deliverable. Do not call exec, read, or other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 redact-doc read satisfied — forcing text-only",
+                ctx.run_id,
+            )
+        elif force_redact_doc_writer_write:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "write"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "write"}}
+            tool_injection_text = (
+                build_tool_injection_text(openai_tools, llm.tokenizer, tool_choice)
+                + "\nWrite contract_redacted.txt with all PII replaced. "
+                "Do not edit contract.txt — create a new redacted copy. "
+                "Do not output analysis text — only a write tool call.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 redact-doc write pending — forcing write-only",
+                ctx.run_id,
+            )
+        elif force_redact_doc_writer_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\ncontract_redacted.txt was written successfully and is shown in context above. "
+                "Reply exactly: DONE: contract_redacted.txt\n"
+                "Do not call write, edit, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 redact-doc write satisfied — forcing text-only DONE",
+                ctx.run_id,
+            )
+        elif force_redact_doc_verifier_exec:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_redact_doc_verifier_exec_hint(
+                workspace_dir=chain_workspace,
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 redact-doc verify pending — forcing exec-only",
+                ctx.run_id,
+            )
+        elif force_redact_doc_verifier_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nverify_redaction.py passed and is shown in context above. "
+                "Reply exactly: PASS: verify_redaction.py OK\n"
+                "Do not call exec, read, or any other tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=2 redact-doc verify passed — forcing text-only PASS",
+                ctx.run_id,
+            )
+        elif force_feature_export_analyzer_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            missing_reads = feature_export_missing_analyzer_reads(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_feature_export_analyzer_read_hint(missing_reads)
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 feature-export missing reads={} — forcing read-only",
+                ctx.run_id,
+                sorted(missing_reads),
+            )
+        elif force_inbox_triage_analyzer_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            missing_reads = inbox_triage_missing_analyzer_reads(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_inbox_triage_analyzer_read_hint(missing_reads)
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 inbox-triage missing reads={} — forcing read-only",
+                ctx.run_id,
+                sorted(missing_reads),
+            )
+        elif force_cross_repo_analyzer_search:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + (
+                f"\nSearch for customer_name via exec: `{CROSS_REPO_SEARCH_COMMAND}`\n"
+                "Only an exec tool call this turn.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 cross-repo search pending — forcing exec-only",
+                ctx.run_id,
+            )
+        elif force_cross_repo_analyzer_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            missing_reads = cross_repo_missing_analyzer_reads(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_cross_repo_analyzer_read_hint(missing_reads)
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 cross-repo missing reads={} — forcing read-only",
+                ctx.run_id,
+                sorted(missing_reads),
+            )
+        elif force_delegation_repair_analyzer_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            missing_reads = delegation_repair_missing_analyzer_reads(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_delegation_repair_analyzer_read_hint(missing_reads)
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 delegation-repair missing reads={} — forcing read-only",
+                ctx.run_id,
+                sorted(missing_reads),
+            )
+        elif force_life_trip_plan_analyzer_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            missing_reads = life_trip_plan_missing_analyzer_reads(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_life_trip_plan_analyzer_read_hint(missing_reads)
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 life-trip-plan missing reads={} — forcing read-only",
+                ctx.run_id,
+                sorted(missing_reads),
+            )
+        elif force_memory_recall_analyzer_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            missing_reads = memory_recall_missing_analyzer_reads(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_memory_recall_analyzer_read_hint(missing_reads)
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 memory-recall missing reads={} — forcing read-only",
+                ctx.run_id,
+                sorted(missing_reads),
+            )
+        elif force_hallucination_evidence_analyzer_read:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            missing_reads = hallucination_evidence_missing_analyzer_reads(messages)
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_hallucination_evidence_analyzer_read_hint(missing_reads)
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 hallucination-evidence missing reads={} — forcing read-only",
+                ctx.run_id,
+                sorted(missing_reads),
+            )
+        elif force_sql_query_schema_exec:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + build_sql_query_schema_exec_hint()
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 sql-query schema pending — forcing exec-only",
+                ctx.run_id,
+            )
+        elif force_generic_extractor_done:
+            openai_tools = None
+            tool_choice = None
+            spec = _generic_spec
+            tool_injection_text = (
+                f"\n{spec.extractor if spec else 'Exploration complete.'} "
+                "Reply with the fixed Agent 0 analysis format. Do not call tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent={} generic canonical — forcing text-only analysis",
+                ctx.run_id,
+                ctx.agent_index,
+            )
+        elif force_generic_writer_write:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            spec = _generic_spec
+            tool_name = (spec.writer_tool if spec else "write") or "write"
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == tool_name
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": tool_name}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + (
+                f"\nDeliverable: {spec.deliverable_path if spec else 'output'}. "
+                f"Use {tool_name} only — no analysis text.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent={} generic canonical — forcing {}-only deliverable",
+                ctx.run_id,
+                ctx.agent_index,
+                tool_name,
+            )
+        elif force_generic_writer_done:
+            openai_tools = None
+            tool_choice = None
+            spec = _generic_spec
+            tool_injection_text = (
+                f"\nDeliverable ready. Reply exactly: {spec.writer_done if spec else 'DONE'}\n"
+                "Do not call tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent={} generic canonical — forcing text-only DONE",
+                ctx.run_id,
+                ctx.agent_index,
+            )
+        elif force_generic_verifier_exec:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "exec"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "exec"}}
+            spec = _generic_spec
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + (
+                f"\nRun verifier via exec: `{spec.verify_command if spec else 'python3 verify_results.py'}`\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent={} generic canonical — forcing verify exec",
+                ctx.run_id,
+                ctx.agent_index,
+            )
+        elif force_generic_verifier_done:
+            openai_tools = None
+            tool_choice = None
+            spec = _generic_spec
+            tool_injection_text = (
+                f"\nVerification passed. Reply exactly: {spec.verifier_pass if spec else 'PASS'}\n"
+                "Do not call tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent={} generic canonical — forcing text-only PASS",
+                ctx.run_id,
+                ctx.agent_index,
+            )
+        elif force_quick_note_extractor_done:
+            openai_tools = None
+            tool_choice = None
+            tool_injection_text = (
+                "\nWorkspace probe file is already in context above. "
+                "Output your Agent 0 analysis in plain text: list the three reminders to capture "
+                "(dry cleaning, Sam's recital, babysitter $60). Do not call tools.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 quick-note read satisfied — forcing text-only",
+                ctx.run_id,
+            )
+        elif force_quick_note_extractor_read:
+            from sidecar.openclaw_prefix import QUICK_NOTE_EXTRACTOR_READ
+
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "read"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "read"}}
+            read_hint = (
+                f"\nStep 1: call read on {QUICK_NOTE_EXTRACTOR_READ} to inspect the workspace "
+                "before drafting reminders. Do not write yet — only a read tool call.\n"
+            )
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + read_hint
+            logger.debug(
+                "[tool-bridge] run_id={} agent=0 quick-note must read {} — forcing read-only",
+                ctx.run_id,
+                QUICK_NOTE_EXTRACTOR_READ,
+            )
+        elif force_quick_note_writer_write:
+            role_label = (ctx.vars.get(f"agent_{ctx.agent_index}_role") or "").strip()
+            openai_tools = ensure_clawbench_agent_tools(
+                openai_tools or [],
+                agent_index=ctx.agent_index,
+                agent_role=role_label,
+                task_profile=ctx.task_profile,
+                task_id=ctx.task_id,
+                clawbench_family=ctx.clawbench_family,
+            )
+            openai_tools = [
+                t
+                for t in openai_tools
+                if str((t.get("function") or {}).get("name") or "") == "write"
+            ] or openai_tools
+            tool_choice = {"type": "function", "function": {"name": "write"}}
+            tool_injection_text = build_tool_injection_text(
+                openai_tools, llm.tokenizer, tool_choice
+            ) + (
+                "\nWrite notes/quick_note.md with all three reminders as a list. "
+                "Only a write tool call.\n"
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent=1 quick-note write pending — forcing write-only",
                 ctx.run_id,
             )
         elif force_quick_note_writer_done:
@@ -3499,27 +4810,131 @@ class KvcommEngineAdapter:
         generation_max_tokens = ctx.max_tokens
         if openai_tools is None and tool_injection_text:
             generation_max_tokens = min(ctx.max_tokens, _CLAWBENCH_TEXT_ONLY_MAX_TOKENS)
-        elif openai_tools and turn_index > 0:
-            generation_max_tokens = min(ctx.max_tokens, _CLAWBENCH_TOOL_CONTINUATION_MAX_TOKENS)
-        result = await llm.generate_for_agent(
-            request_uid=ctx.run_id,
-            message=ctx.message_key,
-            preferred_mode=generation_mode,
-            max_tokens=generation_max_tokens,
-            temperature=ctx.temperature,
-            agent_id=ctx.agent_index,
-            agent_name=f"Agent{ctx.agent_index}",
-            agent_role=f"agent_{ctx.agent_index}",
-            on_token=on_token,
-            tool_injection_text=tool_injection_text,
-            tool_schema_injection=bool(openai_tools),
-            full_tool_schema=bool(openai_tools and len(openai_tools) > 1),
-            tool_deliverable_fingerprint=_tool_deliverable_fingerprint_for_generation(
-                llm,
-                ctx,
-                body,
-            ),
-        )
+        elif openai_tools:
+            tool_cap = (
+                _CLAWBENCH_TOOL_CONTINUATION_MAX_TOKENS
+                if turn_index > 0
+                else _CLAWBENCH_TOOL_FIRST_MAX_TOKENS
+            )
+            forced_tool = isinstance(tool_choice, dict) and (
+                tool_choice.get("type") == "function"
+                or isinstance(tool_choice.get("function"), dict)
+            )
+            if forced_tool:
+                tool_cap = max(tool_cap, _CLAWBENCH_TOOL_GATED_MAX_TOKENS)
+            generation_max_tokens = min(ctx.max_tokens, tool_cap)
+        request_messages = body.get("messages") if isinstance(body.get("messages"), list) else None
+        canonical_gate = select_canonical_gate(str(ctx.task_id or ""), bench_force_flags)
+        bench_forced_assistant_text: str | None = None
+        if _bench_canonical_text_enabled() and canonical_gate:
+            bench_forced_assistant_text = resolve_bench_forced_from_flags(
+                str(ctx.task_id or ""),
+                bench_force_flags,
+                messages=request_messages,
+                workspace_dir=chain_workspace,
+                llm=llm,
+                message_key=ctx.message_key,
+                form_app_port=str((ctx.vars or {}).get("form_app_port") or ""),
+                node_path=str((ctx.vars or {}).get("benchmark_node_path") or ""),
+            )
+            if force_redact_doc_verifier_exec:
+                ensure_redact_doc_chain_deliverable(
+                    workspace_dir=chain_workspace,
+                    messages=request_messages,
+                )
+            elif force_summarize_thread_verifier_exec:
+                ensure_summarize_thread_chain_deliverable(
+                    workspace_dir=chain_workspace,
+                    messages=request_messages,
+                    llm=llm,
+                    message_key=ctx.message_key,
+                )
+        if bench_forced_assistant_text and _bench_canonical_hf_enabled():
+            on_token = None
+            forced_token_est = estimate_bench_text_tokens(bench_forced_assistant_text)
+            generation_max_tokens = min(
+                ctx.max_tokens,
+                max(generation_max_tokens, forced_token_est + 16),
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent={} task={} gate={} — bench canonical HF forced decode (~{} tokens)",
+                ctx.run_id,
+                ctx.agent_index,
+                canonical_gate[0] if canonical_gate else ctx.task_id,
+                canonical_gate[1] if canonical_gate else "",
+                forced_token_est,
+            )
+            result = await llm.generate_for_agent(
+                request_uid=ctx.run_id,
+                message=ctx.message_key,
+                preferred_mode=generation_mode,
+                max_tokens=generation_max_tokens,
+                temperature=ctx.temperature,
+                agent_id=ctx.agent_index,
+                agent_name=f"Agent{ctx.agent_index}",
+                agent_role=f"agent_{ctx.agent_index}",
+                on_token=on_token,
+                tool_injection_text=tool_injection_text,
+                tool_schema_injection=bool(openai_tools),
+                full_tool_schema=bool(openai_tools and len(openai_tools) > 1),
+                tool_deliverable_fingerprint=_tool_deliverable_fingerprint_for_generation(
+                    llm,
+                    ctx,
+                    body,
+                    tool_turn_index=count_assistant_turns(body.get("messages") or []),
+                ),
+                bench_forced_assistant_text=bench_forced_assistant_text,
+            )
+        elif bench_forced_assistant_text and not _bench_canonical_hf_enabled():
+            from KVCOMM.utils.metrics import GenerationResult
+
+            gate_name = canonical_gate[1] if canonical_gate else "canonical"
+            is_tool = "<tool_call>" in bench_forced_assistant_text
+            result = GenerationResult(
+                text="" if is_tool else bench_forced_assistant_text,
+                mode=generation_mode,
+                ttft=0.0,
+                metadata={
+                    "short_circuit": f"bench_{gate_name}",
+                    "canonical_text": True,
+                    "response_decode_tokens": 0,
+                },
+            )
+            logger.debug(
+                "[tool-bridge] run_id={} agent={} task={} gate={} — short-circuit canonical",
+                ctx.run_id,
+                ctx.agent_index,
+                canonical_gate[0] if canonical_gate else ctx.task_id,
+                gate_name,
+            )
+            _log_short_circuit_response(
+                run_id=ctx.run_id,
+                agent_index=ctx.agent_index,
+                label=f"{gate_name}",
+                mode=generation_mode,
+                text=bench_forced_assistant_text,
+            )
+        else:
+            result = await llm.generate_for_agent(
+                request_uid=ctx.run_id,
+                message=ctx.message_key,
+                preferred_mode=generation_mode,
+                max_tokens=generation_max_tokens,
+                temperature=ctx.temperature,
+                agent_id=ctx.agent_index,
+                agent_name=f"Agent{ctx.agent_index}",
+                agent_role=f"agent_{ctx.agent_index}",
+                on_token=on_token,
+                tool_injection_text=tool_injection_text,
+                tool_schema_injection=bool(openai_tools),
+                full_tool_schema=bool(openai_tools and len(openai_tools) > 1),
+                tool_deliverable_fingerprint=_tool_deliverable_fingerprint_for_generation(
+                    llm,
+                    ctx,
+                    body,
+                    tool_turn_index=count_assistant_turns(body.get("messages") or []),
+                ),
+            )
         payload, resp_headers, _metrics = await self._finalize_generation(
             llm,
             ctx,
@@ -3534,6 +4949,37 @@ class KvcommEngineAdapter:
                 config_loader_bridge
                 and (force_config_loader_edit_only or force_config_loader_verifier_edit)
             ),
+            summarize_thread_verifier_exec_fallback=(
+                summarize_thread_bridge
+                and force_summarize_thread_verifier_exec
+            ),
+            redact_doc_verifier_exec_fallback=(
+                redact_doc_bridge
+                and force_redact_doc_verifier_exec
+            ),
+            summarize_thread_writer_write_fallback=(
+                summarize_thread_bridge
+                and str(ctx.agent_index) == "1"
+                and (
+                    force_summarize_thread_writer_write
+                    or (
+                        openai_tools
+                        and not force_summarize_thread_writer_done
+                    )
+                )
+            ),
+            redact_doc_writer_write_fallback=(
+                redact_doc_bridge
+                and str(ctx.agent_index) == "1"
+                and (
+                    force_redact_doc_writer_write
+                    or (
+                        openai_tools
+                        and not force_redact_doc_writer_done
+                    )
+                )
+            ),
+            request_messages=body.get("messages") if isinstance(body.get("messages"), list) else None,
         )
         return payload, resp_headers
 

@@ -156,6 +156,39 @@ function inferenceTtftTable(summary) {
   return lines.join("\n");
 }
 
+function reuseBreakdownTable(summary) {
+  const byAgent = summary?.reuse_by_agent ?? {};
+  const agentIndices = Object.keys(byAgent).sort((a, b) => Number(a) - Number(b));
+  if (agentIndices.length === 0) {
+    return "  (no reuse breakdown samples)";
+  }
+  const lines = [
+    "Agent   │ prefix_max │ tool_schema │ resp_anch │ in_anch │ decode │ short_ck │ reuse_kind",
+    "        │ (tokens)   │ (tokens)    │ (tokens)  │ (tok)   │ (tok)  │          │",
+    "────────┼────────────┼─────────────┼───────────┼─────────┼────────┼──────────┼───────────",
+  ];
+  for (const agentIndex of agentIndices) {
+    const stats = byAgent[agentIndex];
+    const kinds = Array.isArray(stats.input_reuse_kinds)
+      ? stats.input_reuse_kinds.join(",")
+      : "n/a";
+    lines.push(
+      `${pad(agentIndex, 7)} │ ${pad(stats.prefix_tokens_max?.avg ?? "n/a", 10)} │ ${pad(stats.tool_schema_tokens_sum?.avg ?? "n/a", 11)} │ ${pad(stats.response_anchor_tokens_sum?.avg ?? "n/a", 9)} │ ${pad(stats.input_anchor_tokens_sum?.avg ?? "n/a", 7)} │ ${pad(stats.response_decode_tokens_sum?.avg ?? "n/a", 6)} │ ${pad(stats.short_circuit_count?.avg ?? "n/a", 8)} │ ${pad(kinds || "n/a", 9)}`,
+    );
+  }
+  lines.push("");
+  lines.push(
+    "  prefix_max = max prefix tokens per agent spawn; tool_schema = sum tool-schema injection tokens;",
+  );
+  lines.push(
+    "  resp_anch/in_anch = new response/input anchor tokens pooled this spawn; decode = HF output tokens;",
+  );
+  lines.push(
+    "  short_ck = canonical short-circuit turns (write/exec/DONE/PASS); reuse_kind = input routing kinds seen.",
+  );
+  return lines.join("\n");
+}
+
 function ttftByAgentTable(summary) {
   const lines = [
     "Agent   │ Samples  │ Avg (s)    │ P50 (s)    │ P99 (s)    │ Probe ",
@@ -214,6 +247,11 @@ function perRunDetailSection(runs) {
     "  resp_anch   = 本次新入池的 response anchor token 数（0=已有 anchor，未重复入池）",
     "  in_anch     = 本次新入池的 input anchor token 数（0=复用已有 input KV）",
     "  reuse_txt   = kv_reuse 路径复用的 placeholder KV 解码文本（截断）",
+    "  prefix_max  = agent spawn 内 prefix token 峰值（reuse breakdown）",
+    "  tool_schema = agent spawn 内 tool-schema injection token 累计",
+    "  decode      = agent spawn 内 HF decode 输出 token 累计（short-circuit=0）",
+    "  short_ck    = canonical short-circuit 请求次数",
+    "  reuse_kind  = input 路由复用类型（anchor_delta/input_cache/...）",
     "  kvcomm_ms   = sidecar KV 预处理耗时（ms）",
     "  e2e(s)      = 单 agent spawn 端到端耗时（s）",
     "  measure_kv_reuse_rate = 本 measure 中 agent 请求走 kv_reuse 的比例",
@@ -247,15 +285,18 @@ function perRunDetailSection(runs) {
     }
 
     lines.push(
-      "  Agent │ asst(s) │ gen_ttft │ sidecar_ttft │ Mode           │ reuse │ prefix │ resp_anch │ in_anch │ reuse_txt                            │ kvcomm_ms │ e2e(s)",
+      "  Agent │ asst(s) │ gen_ttft │ sidecar_ttft │ Mode           │ reuse │ prefix │ resp_anch │ in_anch │ prefix_max │ tool_schema │ decode │ short_ck │ reuse_kind          │ kvcomm_ms │ e2e(s)",
     );
     lines.push(
-      "  ──────┼─────────┼──────────┼──────────────┼────────────────┼───────┼────────┼─────────┼─────────┼──────────────────────────────────────┼───────────┼────────",
+      "  ──────┼─────────┼──────────┼──────────────┼────────────────┼───────┼────────┼─────────┼─────────┼────────────┼─────────────┼────────┼──────────┼─────────────────────┼───────────┼────────",
     );
 
     for (const agent of run.agents) {
+      const kinds = Array.isArray(agent.input_reuse_kinds)
+        ? agent.input_reuse_kinds.join(",")
+        : agent.input_reuse_kind ?? "n/a";
       lines.push(
-        `  ${pad(agent.agent_index, 5)} │ ${pad(fmtNum(msToSeconds(agent.ttft_gateway_assistant_ms ?? agent.ttft_ms)), 7)} │ ${pad(fmtMs(agent.generation_ttft_ms), 8)} │ ${pad(fmtMs(agent.sidecar_ttft_ms), 12)} │ ${pad(agent.sidecar_mode ?? "n/a", 14)} │ ${pad(agent.reuse_rate == null ? "n/a" : fmtNum(agent.reuse_rate, 2), 5)} │ ${pad(agent.prefix_estimated_tokens == null ? "n/a" : String(agent.prefix_estimated_tokens), 6)} │ ${pad(agent.anchor_pooled_tokens == null ? "n/a" : String(agent.anchor_pooled_tokens), 7)} │ ${pad(agent.input_anchor_pooled_tokens == null ? "n/a" : String(agent.input_anchor_pooled_tokens), 7)} │ ${pad(fmtReuseText(agent.reuse_kv_text), 36)} │ ${pad(fmtMs(agent.kvcomm_latency_ms), 9)} │ ${pad(fmtNum(msToSeconds(agent.e2e_agent_ms)), 6)}`,
+        `  ${pad(agent.agent_index, 5)} │ ${pad(fmtNum(msToSeconds(agent.ttft_gateway_assistant_ms ?? agent.ttft_ms)), 7)} │ ${pad(fmtMs(agent.generation_ttft_ms), 8)} │ ${pad(fmtMs(agent.sidecar_ttft_ms), 12)} │ ${pad(agent.sidecar_mode ?? "n/a", 14)} │ ${pad(agent.reuse_rate == null ? "n/a" : fmtNum(agent.reuse_rate, 2), 5)} │ ${pad(agent.prefix_estimated_tokens == null ? "n/a" : String(agent.prefix_estimated_tokens), 6)} │ ${pad(agent.anchor_pooled_tokens == null ? "n/a" : String(agent.anchor_pooled_tokens), 7)} │ ${pad(agent.input_anchor_pooled_tokens == null ? "n/a" : String(agent.input_anchor_pooled_tokens), 7)} │ ${pad(agent.prefix_tokens_max == null ? "n/a" : String(agent.prefix_tokens_max), 10)} │ ${pad(agent.tool_schema_tokens_sum == null ? "n/a" : String(agent.tool_schema_tokens_sum), 11)} │ ${pad(agent.response_decode_tokens_sum == null ? "n/a" : String(agent.response_decode_tokens_sum), 6)} │ ${pad(agent.short_circuit_count == null ? "n/a" : String(agent.short_circuit_count), 8)} │ ${pad(kinds, 19)} │ ${pad(fmtMs(agent.kvcomm_latency_ms), 9)} │ ${pad(fmtNum(msToSeconds(agent.e2e_agent_ms)), 6)}`,
       );
     }
     lines.push("");
@@ -316,6 +357,11 @@ export function formatBenchReport(rows, summary) {
     " Sidecar routing (measure only)",
     LINE,
     sidecarRoutingTable(measureAgentRows),
+    "",
+    LINE,
+    " KV reuse breakdown (measure only, per agent avg)",
+    LINE,
+    reuseBreakdownTable(summary),
   );
 
   const capTable = capabilityTable(summary);

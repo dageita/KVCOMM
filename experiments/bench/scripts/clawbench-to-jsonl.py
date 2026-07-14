@@ -342,15 +342,19 @@ def task_row_from_yaml(task: dict, *, agent_count: int, template: str) -> dict:
     roles = roles_for_family(family, agent_count)
 
     setup = task.get("setup") or {}
+    clawbench_ref: dict = {
+        "yaml_id": task_id,
+        "asset_packs": list(setup.get("asset_packs") or []),
+        "tier": str(task.get("tier") or ""),
+        "family": family,
+    }
+    background_services = setup.get("background_services")
+    if isinstance(background_services, list) and background_services:
+        clawbench_ref["background_services"] = background_services
     row = {
         "task_id": task_id,
         "task_body": task_body,
-        "clawbench_ref": {
-            "yaml_id": task_id,
-            "asset_packs": list(setup.get("asset_packs") or []),
-            "tier": str(task.get("tier") or ""),
-            "family": family,
-        },
+        "clawbench_ref": clawbench_ref,
         "agent_roles": roles,
         "agent_tasks": build_text_agent_tasks(roles),
     }

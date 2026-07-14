@@ -70,17 +70,50 @@ def test_each_measure_run_clears_consumer_stable() -> None:
     pending: list[bool] = []
     fake = _fake_gpt_chat_module(shared=shared, pending=pending)
 
-    with patch.dict(sys.modules, {"KVCOMM.llm.gpt_chat": fake}):
+    with patch.dict(sys.modules, {"KVCOMM.llm.gpt_chat": fake}), patch(
+        "sidecar.kvcomm_adapter._purge_bench_tool_schema_branches"
+    ) as purge:
         _note_agent0_bench_register("run-a", "dense_prefill")
         _note_agent0_bench_register("run-b", "kv_reuse")
         assert not shared["1"].get("_consumer_tool_schema_stable")
         assert pending == [True]
+        purge.assert_not_called()
 
         shared["1"]["_consumer_tool_schema_stable"] = {"task": True}
         pending.clear()
+        purge.reset_mock()
         _note_agent0_bench_register("run-c", "kv_reuse")
         assert not shared["1"].get("_consumer_tool_schema_stable")
         assert pending == [False]
+        purge.assert_not_called()
+
+
+def test_measure_register_retains_tool_schema_branches() -> None:
+    _reset_register_globals()
+    reset_store_registry = __import__(
+        "sidecar.stores.registry", fromlist=["reset_store_registry"]
+    ).reset_store_registry
+    reset_store_registry()
+    stores = __import__(
+        "sidecar.stores.registry", fromlist=["get_store_registry"]
+    ).get_store_registry()
+    stores.tool_schema_branches.put(
+        consumer_node_id="1",
+        message_key="task",
+        schema_hash="schema_warmup",
+        deliverable_hash="deliv_warmup",
+        prefix_boundary_len=50,
+        schema_token_len=10,
+        absolute_kv=None,
+        token_ids={},
+    )
+    fake = _fake_gpt_chat_module()
+
+    with patch.dict(sys.modules, {"KVCOMM.llm.gpt_chat": fake}):
+        _note_agent0_bench_register("run-warmup", "dense_prefill")
+        _note_agent0_bench_register("run-measure-1", "kv_reuse")
+        hit = stores.tool_schema_branches.get("1", "task", "schema_warmup", "deliv_warmup")
+        assert hit is not None
 
 
 def test_register_pending_context_wires_agent0_note() -> None:

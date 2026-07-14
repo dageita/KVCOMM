@@ -28,8 +28,14 @@ def _reset_engine_state():
     from KVCOMM.llm.gpt_chat import LLMChat
     from KVCOMM.llm.kvcomm_engine import KVCOMMEngine
 
-    LLMChat._shared_kv_cache_memory.clear()
-    LLMChat._initialization.clear()
+    if LLMChat._shared_kv_cache_memory is None:
+        LLMChat._shared_kv_cache_memory = {}
+    else:
+        LLMChat._shared_kv_cache_memory.clear()
+    if LLMChat._initialization is None:
+        LLMChat._initialization = {}
+    else:
+        LLMChat._initialization.clear()
     for store in (
         KVCOMMEngine.anchors,
         KVCOMMEngine.anchor_dict,
@@ -38,8 +44,12 @@ def _reset_engine_state():
     ):
         store.clear()
     KVCOMMEngine._staged_commits.clear()
-    KVCOMMEngine._active_requests.clear()
+    LLMChat.set_consumer_first_measure_dense_pending(False)
     yield
+    if LLMChat._shared_kv_cache_memory is not None:
+        LLMChat._shared_kv_cache_memory.clear()
+    LLMChat.set_consumer_first_measure_dense_pending(False)
+    KVCOMMEngine._active_requests.clear()
 
 
 @pytest.mark.skipif(torch is None, reason="torch not installed")
@@ -345,6 +355,15 @@ def test_should_force_dense_when_unstable_or_pending() -> None:
     assert chat._should_force_dense_consumer_tool_schema(
         message="msg",
         request_uid="run-pending",
+        full_tool_schema=True,
+    )
+    # First-measure dense must clear pending via mark_stable so later turns can kv_reuse.
+    chat.mark_consumer_tool_schema_stable("msg")
+    assert LLMChat.consumer_first_measure_dense_pending() is False
+    assert chat.consumer_tool_schema_stable("msg") is True
+    assert not chat._should_force_dense_consumer_tool_schema(
+        message="msg",
+        request_uid="run-after-mark",
         full_tool_schema=True,
     )
     LLMChat.set_consumer_first_measure_dense_pending(False)

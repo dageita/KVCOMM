@@ -66,6 +66,37 @@ test("purgeStaleCodingArtifacts removes cross-task pollution for config-loader",
   }
 });
 
+test("purgeStaleCodingArtifacts keeps agent-authored test_normalizer for mutable-tests task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawbench-purge-normalizer-"));
+  try {
+    await mkdir(join(root, "tests"), { recursive: true });
+    await writeFile(join(root, "normalizer.py"), "# fixture\n", "utf8");
+    await writeFile(
+      join(root, "tests", "test_normalizer.py"),
+      "from normalizer import normalize_title\ndef test_x(): pass\n",
+      "utf8",
+    );
+    await writeFile(join(root, "tests", "test_pricing.py"), "def test_stale(): pass\n", "utf8");
+    await writeFile(join(root, "pricing.py"), "# stale\n", "utf8");
+
+    const task = {
+      task_id: "t2-add-tests-normalizer",
+      clawbench_ref: {
+        family: "coding",
+        asset_packs: ["t2_add_tests_normalizer"],
+      },
+    };
+    const { removed } = await purgeStaleCodingArtifacts(root, task);
+    assert.ok(removed.includes("pricing.py"));
+    assert.ok(removed.includes("tests/test_pricing.py"));
+    assert.equal(removed.includes("tests/test_normalizer.py"), false);
+    assert.equal(existsSync(join(root, "tests", "test_normalizer.py")), true);
+    assert.equal(existsSync(join(root, "normalizer.py")), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("purgeStaleCodingArtifacts keeps bugfix task fixtures", async () => {
   const root = await mkdtemp(join(tmpdir(), "clawbench-purge-bugfix-"));
   try {

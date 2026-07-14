@@ -50,6 +50,14 @@ function mean(values) {
   return values.reduce((sum, v) => sum + v, 0) / values.length;
 }
 
+function intStats(values) {
+  const nums = values.filter((value) => typeof value === "number" && Number.isFinite(value));
+  if (!nums.length) {
+    return { avg: null, samples: 0 };
+  }
+  return { avg: Math.round(mean(nums)), samples: nums.length };
+}
+
 /**
  * Aggregate ClawBench native scores from run_summary rows (score_task_run output).
  */
@@ -192,11 +200,59 @@ export function summarizeBenchRows(rows) {
     };
   }
 
+  const reuse_by_agent = {};
+  for (const row of agentRows) {
+    const key = String(row.agent_index);
+    if (!reuse_by_agent[key]) {
+      reuse_by_agent[key] = {
+        prefix_tokens_max: [],
+        tool_schema_tokens_sum: [],
+        response_anchor_tokens_sum: [],
+        input_anchor_tokens_sum: [],
+        response_decode_tokens_sum: [],
+        short_circuit_count: [],
+        input_reuse_kinds: [],
+      };
+    }
+    const bucket = reuse_by_agent[key];
+    for (const field of [
+      "prefix_tokens_max",
+      "tool_schema_tokens_sum",
+      "response_anchor_tokens_sum",
+      "input_anchor_tokens_sum",
+      "response_decode_tokens_sum",
+      "short_circuit_count",
+    ]) {
+      if (typeof row[field] === "number") {
+        bucket[field].push(row[field]);
+      }
+    }
+    if (Array.isArray(row.input_reuse_kinds)) {
+      bucket.input_reuse_kinds.push(...row.input_reuse_kinds);
+    } else if (typeof row.input_reuse_kind === "string" && row.input_reuse_kind) {
+      bucket.input_reuse_kinds.push(row.input_reuse_kind);
+    }
+  }
+  const reuse_by_agent_summary = {};
+  for (const [agentIndex, bucket] of Object.entries(reuse_by_agent)) {
+    const kinds = [...new Set(bucket.input_reuse_kinds.filter(Boolean))];
+    reuse_by_agent_summary[agentIndex] = {
+      prefix_tokens_max: intStats(bucket.prefix_tokens_max),
+      tool_schema_tokens_sum: intStats(bucket.tool_schema_tokens_sum),
+      response_anchor_tokens_sum: intStats(bucket.response_anchor_tokens_sum),
+      input_anchor_tokens_sum: intStats(bucket.input_anchor_tokens_sum),
+      response_decode_tokens_sum: intStats(bucket.response_decode_tokens_sum),
+      short_circuit_count: intStats(bucket.short_circuit_count),
+      input_reuse_kinds: kinds,
+    };
+  }
+
   return {
     rows: rows.length,
     agent_rows: agentRows.length,
     by_agent,
     inference_by_agent: inference_by_agent_summary,
+    reuse_by_agent: reuse_by_agent_summary,
     measure_kv_reuse_rate_avg:
       measureReuseRates.length === 0 ? null : roundSeconds(mean(measureReuseRates)),
     measure_kv_reuse_runs: measureReuseRates.length,

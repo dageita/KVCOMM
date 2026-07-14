@@ -68,3 +68,20 @@ def test_purge_message_clears_both_sides() -> None:
 
     reg.purge_message(node_id="0", message_key="msg")
     assert reg.get_producer("0", "msg", "agent_0_current", "h0") is None
+
+
+def test_find_producer_for_ph_ignores_stale_hash() -> None:
+    reg = UpstreamAgentSlotRegistry()
+    reg.put_producer(
+        producer_node_id="0",
+        message_key="msg",
+        ph_id="agent_0_current",
+        content_hash="sanitized-hash",
+        absolute_kv={"kv": 1},
+        token_ids={"input_ids": [[1, 2]]},
+        prefix_token_len=10,
+    )
+    assert reg.get_producer("0", "msg", "agent_0_current", "raw-hash") is None
+    found = reg.find_producer_for_ph("0", "msg", "agent_0_current")
+    assert found is not None
+    assert found.content_hash == "sanitized-hash"

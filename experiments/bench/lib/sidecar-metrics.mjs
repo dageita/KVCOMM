@@ -73,8 +73,16 @@ export async function fetchSidecarAgentMetrics({ runId, agentIndex, sidecarUrl =
       anchor_pooled_tokens: row.anchor_pooled_tokens ?? null,
       input_anchor_pooled_tokens: row.input_anchor_pooled_tokens ?? null,
       input_routing_mode: row.input_routing_mode ?? null,
+      input_reuse_kind: row.input_reuse_kind ?? null,
+      input_reuse_kinds: Array.isArray(row.input_reuse_kinds) ? row.input_reuse_kinds : null,
       reuse_kv_text: row.reuse_kv_text ?? null,
       prefix_estimated_tokens: row.prefix_estimated_tokens ?? null,
+      prefix_tokens_max: row.prefix_tokens_max ?? null,
+      tool_schema_tokens_sum: row.tool_schema_tokens_sum ?? null,
+      response_anchor_tokens_sum: row.response_anchor_tokens_sum ?? null,
+      input_anchor_tokens_sum: row.input_anchor_tokens_sum ?? null,
+      response_decode_tokens_sum: row.response_decode_tokens_sum ?? null,
+      short_circuit_count: row.short_circuit_count ?? null,
       emitted_tool_calls: Array.isArray(row.emitted_tool_calls) ? row.emitted_tool_calls : [],
     };
   } catch {

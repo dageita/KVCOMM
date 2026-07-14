@@ -7,7 +7,13 @@ import {
 } from "./gateway-client.mjs";
 import { resolveCapabilitySubagentTools } from "./openclaw-config.mjs";
 import { fetchSidecarAgentMetrics, registerKvcommContext, shouldFetchSidecarMetrics } from "./sidecar-metrics.mjs";
-import { restoreImmutableCodingFiles, syncEditableBrowserFiles, syncEditableCodingFiles, isCodingLikeTask } from "./clawbench-chain.mjs";
+import {
+  restoreImmutableCodingFiles,
+  syncEditableBrowserFiles,
+  syncEditableCodingFiles,
+  syncToolsFamilyAssetsToDefault,
+  isCodingLikeTask,
+} from "./clawbench-chain.mjs";
 import { buildKvcommMetaPrefix, renderTemplateKvReuse, renderTemplateStrict, sha256Short } from "./template.mjs";
 
 const TOOL_JSON_PATTERN =
@@ -135,6 +141,10 @@ export async function runChainStackSpawn(client, params) {
   const runUid = runId?.slice(0, 8) ?? "unknown";
   const capabilitySubagentTools =
     spawnMode === "capability" ? await resolveCapabilitySubagentTools() : null;
+
+  if (spawnMode === "capability" && workspaceDir) {
+    await syncToolsFamilyAssetsToDefault(workspaceDir, taskRow);
+  }
 
   for (let agentIndex = 0; agentIndex < agentCount; agentIndex += 1) {
     if (spawnMode === "capability" && workspaceDir) {
@@ -410,8 +420,16 @@ export async function runChainStackSpawn(client, params) {
       anchor_pooled_tokens: sidecarMetrics?.anchor_pooled_tokens ?? null,
       input_anchor_pooled_tokens: sidecarMetrics?.input_anchor_pooled_tokens ?? null,
       input_routing_mode: sidecarMetrics?.input_routing_mode ?? null,
+      input_reuse_kind: sidecarMetrics?.input_reuse_kind ?? null,
+      input_reuse_kinds: sidecarMetrics?.input_reuse_kinds ?? null,
       reuse_kv_text: sidecarMetrics?.reuse_kv_text ?? null,
       prefix_estimated_tokens: sidecarMetrics?.prefix_estimated_tokens ?? null,
+      prefix_tokens_max: sidecarMetrics?.prefix_tokens_max ?? null,
+      tool_schema_tokens_sum: sidecarMetrics?.tool_schema_tokens_sum ?? null,
+      response_anchor_tokens_sum: sidecarMetrics?.response_anchor_tokens_sum ?? null,
+      input_anchor_tokens_sum: sidecarMetrics?.input_anchor_tokens_sum ?? null,
+      response_decode_tokens_sum: sidecarMetrics?.response_decode_tokens_sum ?? null,
+      short_circuit_count: sidecarMetrics?.short_circuit_count ?? null,
       sidecar_emitted_tool_calls: sidecarMetrics?.emitted_tool_calls ?? [],
       bench_no_think: sidecarMetrics?.bench_no_think ?? true,
       e2e_agent_ms: Date.now() - spawnStartedAt,

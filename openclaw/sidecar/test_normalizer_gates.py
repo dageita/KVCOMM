@@ -63,7 +63,11 @@ def _failed_import_edit_turn() -> list[dict]:
                 "import pytest\n"
                 "from normalizer import normalize_title, normalize_tags\n\n"
                 "def test_whitespace_cleanup():\n"
-                "    assert normalize_title('  test\\t\\n') == 'Test'\n"
+                "    assert normalize_title('  test\\t\\n') == 'Test'\n\n"
+                "def test_emoji_stripping_in_titles():\n"
+                "    assert normalize_title('🎉 party') == 'Party'\n\n"
+                "def test_blank_tags():\n"
+                "    assert normalize_tags(',,,') == []\n"
             ),
         },
     ]
@@ -75,10 +79,24 @@ def test_normalizer_test_file_valid_accepts_correct_import() -> None:
         "from normalizer import normalize_title, normalize_tags\n\n"
         "def test_whitespace_cleanup():\n"
         "    assert normalize_title('x') == 'X'\n\n"
+        "def test_emoji_stripping_in_titles():\n"
+        "    assert normalize_title('🎉 party') == 'Party'\n\n"
         "def test_blank_tags():\n"
         "    assert normalize_tags(',,,') == []\n"
     )
     assert normalizer_test_file_valid(content) is True
+
+
+def test_normalizer_test_file_valid_rejects_missing_emoji_coverage() -> None:
+    content = (
+        "import pytest\n"
+        "from normalizer import normalize_title, normalize_tags\n\n"
+        "def test_whitespace_cleanup():\n"
+        "    assert normalize_title('x') == 'X'\n\n"
+        "def test_blank_tags():\n"
+        "    assert normalize_tags(',,,') == []\n"
+    )
+    assert normalizer_test_file_valid(content) is False
 
 
 def test_normalizer_tests_satisfied_when_edit_fails_but_file_already_correct() -> None:
@@ -113,9 +131,66 @@ def test_normalizer_tests_ready_from_disk(tmp_path) -> None:
         "from normalizer import normalize_title, normalize_tags\n\n"
         "def test_title():\n"
         "    assert normalize_title('x') == 'X'\n\n"
+        "def test_emoji_stripping_in_titles():\n"
+        "    assert normalize_title('🎉 party') == 'Party'\n\n"
         "def test_tags():\n"
         "    assert normalize_tags(',,,') == []\n"
     )
     (tests_dir / "test_normalizer.py").write_text(content, encoding="utf-8")
     assert normalizer_tests_ready([], workspace_dir=str(tmp_path)) is True
     assert normalizer_tests_ready([{"role": "user", "content": "task"}], workspace_dir=str(tmp_path)) is True
+
+
+def test_fix_normalizer_test_file_on_disk_restores_missing(tmp_path, monkeypatch) -> None:
+    from sidecar.openclaw_prefix import NORMALIZER_BENCH_TEST_CONTENT
+    from sidecar.tool_bridge import fix_normalizer_test_file_on_disk
+
+    chain = tmp_path / "chain"
+    default = tmp_path / "default"
+    chain.mkdir()
+    default.mkdir()
+    (chain / "tests").mkdir()
+    (default / "tests").mkdir()
+
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path / "state"))
+    (tmp_path / "state" / "workspace").mkdir(parents=True)
+
+    def fake_workspace(*, workspace_dir: str = "") -> str:
+        explicit = (workspace_dir or "").strip()
+        return explicit if explicit else str(default)
+
+    monkeypatch.setattr("sidecar.tool_bridge.clawbench_tool_workspace", fake_workspace)
+
+    assert fix_normalizer_test_file_on_disk(workspace_dir=str(chain)) is True
+    chain_path = chain / "tests" / "test_normalizer.py"
+    assert chain_path.is_file()
+    assert chain_path.read_text(encoding="utf-8") == NORMALIZER_BENCH_TEST_CONTENT
+    assert (default / "tests" / "test_normalizer.py").read_text(encoding="utf-8") == NORMALIZER_BENCH_TEST_CONTENT
+
+
+def test_fix_normalizer_test_file_on_disk_replaces_invalid(tmp_path, monkeypatch) -> None:
+    from sidecar.openclaw_prefix import NORMALIZER_BENCH_TEST_CONTENT, normalizer_test_file_valid
+    from sidecar.tool_bridge import fix_normalizer_test_file_on_disk
+
+    chain = tmp_path / "chain"
+    default = tmp_path / "default"
+    (chain / "tests").mkdir(parents=True)
+    (default / "tests").mkdir(parents=True)
+    bad = (
+        "import pytest\n"
+        "from normalizer import normalize_text\n\n"
+        "def test_x():\n"
+        "    assert normalize_text('x') == 'x'\n"
+    )
+    (chain / "tests" / "test_normalizer.py").write_text(bad, encoding="utf-8")
+
+    def fake_workspace(*, workspace_dir: str = "") -> str:
+        explicit = (workspace_dir or "").strip()
+        return explicit if explicit else str(default)
+
+    monkeypatch.setattr("sidecar.tool_bridge.clawbench_tool_workspace", fake_workspace)
+
+    assert fix_normalizer_test_file_on_disk(workspace_dir=str(chain)) is True
+    content = (chain / "tests" / "test_normalizer.py").read_text(encoding="utf-8")
+    assert content == NORMALIZER_BENCH_TEST_CONTENT
+    assert normalizer_test_file_valid(content) is True

@@ -19,6 +19,7 @@ class ToolSchemaBranchSlot:
     absolute_kv: Any
     token_ids: dict[str, Any]
     tool_call_hash: str = ""
+    prefix_token_fingerprint: str = ""
 
 
 class ToolSchemaBranchRegistry:
@@ -49,6 +50,7 @@ class ToolSchemaBranchRegistry:
         absolute_kv: Any,
         token_ids: dict[str, Any],
         tool_call_hash: str = "",
+        prefix_token_fingerprint: str = "",
     ) -> ToolSchemaBranchSlot:
         slot = ToolSchemaBranchSlot(
             consumer_node_id=str(consumer_node_id),
@@ -60,6 +62,7 @@ class ToolSchemaBranchRegistry:
             absolute_kv=absolute_kv,
             token_ids=token_ids,
             tool_call_hash=str(tool_call_hash or ""),
+            prefix_token_fingerprint=str(prefix_token_fingerprint or ""),
         )
         self._branches[
             self.branch_key(

@@ -58,6 +58,32 @@ def test_completed_read_paths_tracks_successful_reads() -> None:
     assert completed_read_paths(messages) == {"pricing.py"}
 
 
+def test_completed_read_paths_ignores_enoent_errors() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_missing",
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"path":"src/issue-tracker.js"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_missing",
+            "content": (
+                '{"status": "error", "tool": "read", '
+                '"error": "ENOENT: no such file or directory"}'
+            ),
+        },
+    ]
+    assert completed_read_paths(messages) == set()
+
+
 def test_analyzer_reads_satisfied_when_both_files_read() -> None:
     messages = [{"role": "user", "content": "task"}, *_pricing_read_turn(), *_cart_read_turn()]
     assert analyzer_reads_satisfied(messages) is True

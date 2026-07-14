@@ -124,3 +124,39 @@ def test_config_loader_import_error_retries_exec_not_read() -> None:
     assert pytest_collection_or_import_failed(messages) is True
     assert config_loader_verifier_should_force_exec(messages) is True
     assert config_loader_verifier_should_force_read(messages) is False
+
+
+def test_config_loader_failed_pytest_recovery_cycle() -> None:
+    """Failed assertion pytest → read → edit → re-exec (no endless exec loop)."""
+    from sidecar.openclaw_prefix import config_loader_verifier_should_force_edit
+
+    failed = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_exec",
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": '{"command": "pytest -q tests/test_config_loader.py"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_exec",
+            "content": "FF\n2 failed in 0.02s\n(Command exited with code 1)",
+        },
+    ]
+    assert config_loader_verifier_should_force_exec(failed) is False
+    assert config_loader_verifier_should_force_read(failed) is True
+
+    after_read = failed + _read_call("config_loader.py", call_id="call_read")
+    assert config_loader_verifier_should_force_read(after_read) is False
+    assert config_loader_verifier_should_force_edit(after_read) is True
+
+    after_edit = after_read + _edit_call("config_loader.py", call_id="call_edit2")
+    assert config_loader_verifier_should_force_edit(after_edit) is False
+    assert config_loader_verifier_should_force_exec(after_edit) is True

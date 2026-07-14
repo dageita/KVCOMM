@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
+from sidecar.bench_canonical import (
+    find_that_analyzer_reads_satisfied,
+    find_that_missing_analyzer_reads,
+    find_that_search_done,
+)
 from sidecar.openclaw_prefix import (
     find_that_copy_satisfied,
     find_that_source_located,
@@ -26,12 +33,44 @@ def _exec_call(command: str, *, call_id: str = "call_exec", body: str = "ok") ->
     ]
 
 
+def _read_calls(paths: list[str], *, body: str = "sheet content") -> list[dict]:
+    tool_calls = []
+    tool_msgs = []
+    for i, path in enumerate(paths):
+        call_id = f"call_read_{i}"
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "arguments": json.dumps({"path": path}),
+                },
+            }
+        )
+        tool_msgs.append({"role": "tool", "tool_call_id": call_id, "content": body})
+    return [{"role": "assistant", "tool_calls": tool_calls}, *tool_msgs]
+
+
 def test_find_that_source_located_after_find_exec() -> None:
     messages = _exec_call(
         'find . -name "*q3*marketing*budget*.xlsx"',
         body="./Documents/q3_marketing_budget_v3.xlsx",
     )
     assert find_that_source_located(messages) is True
+    assert find_that_search_done(messages) is True
+
+
+def test_find_that_analyzer_reads_after_three_candidates() -> None:
+    messages = _read_calls(
+        [
+            "Documents/q2_marketing_budget.xlsx",
+            "Documents/q3_sales_breakdown.xlsx",
+            "Documents/q3_marketing_budget_v3.xlsx",
+        ]
+    )
+    assert find_that_missing_analyzer_reads(messages) == frozenset()
+    assert find_that_analyzer_reads_satisfied(messages) is True
 
 
 def test_find_that_copy_satisfied_after_desktop_cp() -> None:

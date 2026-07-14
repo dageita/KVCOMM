@@ -70,6 +70,24 @@ def test_required_tools_use_role_for_non_bugfix_tasks() -> None:
     assert "read" in bugfix_tools
 
 
+def test_required_tools_normalizer_includes_exec() -> None:
+    from sidecar.bench_prompt_compose import ADD_TESTS_NORMALIZER_TASK_ID
+
+    patcher = _required_tools_for_agent(
+        agent_index=1,
+        agent_role="Patcher",
+        task_id=ADD_TESTS_NORMALIZER_TASK_ID,
+    )
+    assert "exec" in patcher
+    assert "write" in patcher
+    verifier = _required_tools_for_agent(
+        agent_index=2,
+        agent_role="Verifier",
+        task_id=ADD_TESTS_NORMALIZER_TASK_ID,
+    )
+    assert verifier == frozenset({"read", "edit", "write", "exec"})
+
+
 def test_required_tools_tools_family_includes_exec() -> None:
     extractor = _required_tools_for_agent(
         agent_index=0,

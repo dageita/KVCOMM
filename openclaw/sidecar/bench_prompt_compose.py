@@ -12,6 +12,10 @@ QUICK_NOTE_TASK_ID = "t1-fs-quick-note"
 ADD_TESTS_NORMALIZER_TASK_ID = "t2-add-tests-normalizer"
 CONFIG_LOADER_TASK_ID = "t2-config-loader"
 FIND_THAT_TASK_ID = "t2-fs-find-that-thing"
+SUMMARIZE_THREAD_TASK_ID = "t2-msg-summarize-thread"
+SUMMARIZE_THREAD_TOOL_RESULT_MAX_CHARS = 4096
+SUMMARIZE_THREAD_ASSISTANT_MAX_CHARS = 8192
+REDACT_DOC_TASK_ID = "t2-priv-redact-doc"
 BROWSER_FORM_FIX_TASK_ID = "t2-browser-form-fix"
 QUICK_NOTE_VERIFIER_READ = frozenset({"quick_note.md"})
 
@@ -85,6 +89,20 @@ def is_find_that_task(ctx) -> bool:
     if ctx is None:
         return False
     return str(getattr(ctx, "task_id", "") or "").strip() == FIND_THAT_TASK_ID
+
+
+def is_summarize_thread_task(ctx) -> bool:
+    """True when the active bench row is the tier2 summarize-thread tools task."""
+    if ctx is None:
+        return False
+    return str(getattr(ctx, "task_id", "") or "").strip() == SUMMARIZE_THREAD_TASK_ID
+
+
+def is_redact_doc_task(ctx) -> bool:
+    """True when the active bench row is the tier2 redact-document tools task."""
+    if ctx is None:
+        return False
+    return str(getattr(ctx, "task_id", "") or "").strip() == REDACT_DOC_TASK_ID
 
 
 def is_browser_family_task(ctx) -> bool:

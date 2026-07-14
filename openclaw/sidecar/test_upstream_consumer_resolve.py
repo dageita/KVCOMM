@@ -39,10 +39,11 @@ def test_downstream_node_uses_consumer_not_producer() -> None:
         slot_token_start=5,
     )
 
-    LLMChat._shared_kv_cache_memory["0"] = {
+    shared = LLMChat._ensure_shared_kv_memory()
+    shared["0"] = {
         "response_ids": {"msg": [{"input_ids": [[1, 2, 3]]}]},
     }
-    LLMChat._shared_kv_cache_memory["1"] = {
+    shared["1"] = {
         "placeholder_info": {"agent_0_current": {"start": 5, "end": 15}},
     }
 
@@ -65,7 +66,7 @@ def test_downstream_node_uses_consumer_not_producer() -> None:
     assert prod.materialization == "producer_contextual"
     assert prod.absolute_kv == {"kind": "producer"}
 
-    LLMChat._shared_kv_cache_memory.clear()
+    shared.clear()
 
 
 def test_consumer_slot_rejected_when_placeholder_start_mismatch() -> None:
@@ -85,10 +86,11 @@ def test_consumer_slot_rejected_when_placeholder_start_mismatch() -> None:
         slot_token_start=5,
     )
 
-    LLMChat._shared_kv_cache_memory["0"] = {
+    shared = LLMChat._ensure_shared_kv_memory()
+    shared["0"] = {
         "response_ids": {"msg": [{"input_ids": [[1, 2, 3]]}]},
     }
-    LLMChat._shared_kv_cache_memory["1"] = {
+    shared["1"] = {
         "placeholder_info": {"agent_0_current": {"start": 99, "end": 109}},
     }
 
@@ -101,33 +103,76 @@ def test_consumer_slot_rejected_when_placeholder_start_mismatch() -> None:
     )()
 
     assert chat._resolve_upstream_consumer_slot("agent_0_current", "msg") is None
-    LLMChat._shared_kv_cache_memory.clear()
+    shared.clear()
 
 
 def test_upstream_response_token_ids_reads_producer_bucket() -> None:
     from KVCOMM.llm.gpt_chat import LLMChat
 
-    LLMChat._shared_kv_cache_memory["0"] = {
+    shared = LLMChat._ensure_shared_kv_memory()
+    shared["0"] = {
         "response_ids": {"msg": [{"input_ids": [[11, 12]]}]},
     }
     chat = object.__new__(LLMChat)
     entry = chat._upstream_response_token_ids("0", "msg")
     assert entry == {"input_ids": [[11, 12]]}
-    LLMChat._shared_kv_cache_memory.clear()
+    shared.clear()
 
 
 def test_upstream_content_hash_uses_producer_response_not_stale_meta() -> None:
-    from KVCOMM.llm.gpt_chat import LLMChat
+    from KVCOMM.llm.gpt_chat import LLMChat, _finalize_stored_response_text
 
-    LLMChat._shared_kv_cache_memory["0"] = {
+    raw = "measure-run text"
+    shared = LLMChat._ensure_shared_kv_memory()
+    shared["0"] = {
         "response_ids": {"msg": [{"input_ids": [[1, 2]]}]},
     }
     chat = object.__new__(LLMChat)
     chat.tokenizer = type(
         "Tok",
         (),
-        {"decode": staticmethod(lambda ids, skip_special_tokens=True: "measure-run text")},
+        {"decode": staticmethod(lambda ids, skip_special_tokens=True: raw)},
     )()
     h = chat._upstream_agent_content_hash("agent_0_current", "msg")
-    assert h == sha256_text("measure-run text")
-    LLMChat._shared_kv_cache_memory.clear()
+    assert h == sha256_text(_finalize_stored_response_text(raw) or raw)
+    shared.clear()
+
+
+def test_resolve_upstream_falls_back_to_latest_producer_when_hash_mismatch() -> None:
+    from KVCOMM.llm.gpt_chat import LLMChat, _finalize_stored_response_text
+
+    reset_store_registry()
+    stores = get_store_registry()
+    raw = "\n\n**Decisions Made**\n- Option B selected.\n"
+    sanitized = _finalize_stored_response_text(raw)
+    stores.upstream_agent_slots.put_producer(
+        producer_node_id="0",
+        message_key="msg",
+        ph_id="agent_0_current",
+        content_hash=sha256_text(sanitized or raw),
+        absolute_kv={"kind": "producer"},
+        token_ids={"input_ids": [[1, 2, 3]]},
+        prefix_token_len=10,
+    )
+    shared = LLMChat._ensure_shared_kv_memory()
+    shared["0"] = {
+        "response_ids": {"msg": [{"input_ids": [[1, 2, 3]]}]},
+    }
+
+    chat = object.__new__(LLMChat)
+    chat.node_id = "1"
+    chat.tokenizer = type(
+        "Tok",
+        (),
+        {"decode": staticmethod(lambda ids, skip_special_tokens=True: raw)},
+    )()
+    chat._get_store_registry = lambda: stores  # type: ignore[method-assign]
+
+    decoded = chat.decode_upstream_agent_response_text("agent_0_current", "msg")
+    assert "Option B" in decoded
+
+    slot = chat.resolve_upstream_agent_slot("agent_0_current", "msg")
+    assert slot is not None
+    assert slot.materialization == "producer_contextual"
+
+    shared.clear()

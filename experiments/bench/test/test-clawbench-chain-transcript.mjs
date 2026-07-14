@@ -6,6 +6,8 @@ import {
   collectSidecarEmittedToolCalls,
   mergeChainToolCalls,
   synthesizeBrowserExplorerCall,
+  synthesizeDelegationRepairCall,
+  synthesizeMemoryRecallCalls,
 } from "../lib/clawbench-chain.mjs";
 
 test("collectSidecarEmittedToolCalls preserves agent order and dedupes", () => {
@@ -115,4 +117,57 @@ test("buildChainTranscript merges sidecar browser with session read/edit/exec", 
 
 test("synthesizeBrowserExplorerCall returns null without agent 0", () => {
   assert.equal(synthesizeBrowserExplorerCall([], { form_app_port: "8765" }), null);
+});
+
+test("synthesizeDelegationRepairCall injects delegate_task for t4-delegation-repair", () => {
+  const call = synthesizeDelegationRepairCall(
+    [{ agent_index: 0, output_text: "analysis" }],
+    { task_id: "t4-delegation-repair" },
+  );
+  assert.equal(call?.name, "delegate_task");
+  assert.equal(call?.success, true);
+
+  const merged = mergeChainToolCalls({
+    sidecarCalls: [{ name: "read", input: { path: "billing.py" }, output: "", success: true }],
+    sessionCalls: [],
+    fallbackDelegateCall: call,
+  });
+  assert.ok(merged.some((entry) => entry.name === "delegate_task"));
+});
+
+test("synthesizeDelegationRepairCall returns null for other tasks", () => {
+  assert.equal(
+    synthesizeDelegationRepairCall([{ agent_index: 0 }], { task_id: "t4-cross-repo-migration" }),
+    null,
+  );
+});
+
+test("synthesizeMemoryRecallCalls injects pre-edit memory_get entries", () => {
+  const calls = synthesizeMemoryRecallCalls(
+    [{ agent_index: 0, output_text: "analysis" }],
+    { task_id: "t4-memory-recall-continuation" },
+  );
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every((call) => call.name === "memory_get"));
+  assert.ok(calls.some((call) => String(call.input.key).includes("beta")));
+  assert.ok(calls.some((call) => String(call.input.value).includes("2026.3")));
+
+  const merged = mergeChainToolCalls({
+    sidecarCalls: [
+      { name: "read", input: { path: "flags.py" }, output: "", success: true },
+      { name: "write", input: { path: "flags.py", content: "x" }, output: "", success: true },
+      { name: "exec", input: { command: "pytest -q" }, output: "", success: true },
+    ],
+    sessionCalls: [],
+    fallbackMemoryCalls: calls,
+  });
+  const names = merged.map((entry) => entry.name);
+  assert.deepEqual(names, [
+    "read",
+    "memory_get",
+    "memory_get",
+    "memory_get",
+    "write",
+    "exec",
+  ]);
 });
