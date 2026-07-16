@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from sidecar.stores.kv_token_pair import require_paired_slot_payload
+
 Materialization = Literal["consumer_contextual", "isolated_fallback"]
 
 
@@ -57,6 +59,13 @@ class ToolConsumerSlotRegistry:
         drop_num: int = 0,
         materialization: Materialization = "consumer_contextual",
     ) -> ToolConsumerSlot:
+        drop_num = require_paired_slot_payload(
+            absolute_kv,
+            token_ids,
+            drop_num=drop_num,
+            require_absolute_drop=(materialization == "consumer_contextual"),
+            context=f"tool consumer {ph_id}",
+        )
         slot = ToolConsumerSlot(
             ph_id=str(ph_id),
             message_key=str(message_key),

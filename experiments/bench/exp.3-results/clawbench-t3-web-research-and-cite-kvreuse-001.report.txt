@@ -1,0 +1,160 @@
+════════════════════════════════════════════════════════════════════════
+ BENCH RUN SUMMARY
+════════════════════════════════════════════════════════════════════════
+
+  Experiment:    clawbench-chain
+  Task:          t3-web-research-and-cite
+  Model:         kvcomm/Qwen3-32B
+  Inference:     kv_reuse / kvcomm_sidecar
+  Profile:       clawbench
+  Workload:      clawbench_chain
+  Agents:        3
+  Spawn:         capability
+  Runs:          6 total (1 warmup, 5 measure)
+
+────────────────────────────────────────────────────────────────────────
+ Overview (measure runs only)
+────────────────────────────────────────────────────────────────────────
+  Rows: 24  |  Agent rows (measure): 15  |  comms_ok: 100%
+  Measure kv_reuse rate (avg across runs): 86.7% (5 run(s))
+
+────────────────────────────────────────────────────────────────────────
+ Inference TTFT (measure only, sidecar/HF)
+────────────────────────────────────────────────────────────────────────
+Agent   │ gen_ttft   │ kvcomm_ms  │ sidecar_ttft │ Samples 
+        │ avg (ms)   │ avg (ms)   │ avg (ms)     │         
+────────┼────────────┼────────────┼──────────────┼─────────
+0       │ 260        │ 201        │ 461          │ 5      
+1       │ 262        │ 206        │ 530          │ 5      
+2       │ 247        │ 216        │ 581          │ 5      
+
+  gen_ttft = HF 首 decode token；kvcomm_ms = KV 预处理；sidecar_ttft = preprocess + decode 总 TTFT
+  对比 kv_reuse vs dense_prefill 时请分别跑两次 bench，对照本表（勿用 asst(s)，含 OpenClaw 编排开销）
+
+────────────────────────────────────────────────────────────────────────
+ Gateway TTFT by agent (seconds, measure only — includes orchestration)
+────────────────────────────────────────────────────────────────────────
+Agent   │ Samples  │ Avg (s)    │ P50 (s)    │ P99 (s)    │ Probe 
+────────┼──────────┼────────────┼────────────┼────────────┼───────
+0       │ 5        │ 19.028     │ 19.042     │ 19.144     │      
+1       │ 5        │ 10.584     │ 10.522     │ 11.020     │      
+2       │ 5        │ 12.380     │ 12.302     │ 12.830     │ yes  
+
+ Probe agent: avg=12.380s p50=12.302s p99=12.830s (n=5)
+
+────────────────────────────────────────────────────────────────────────
+ Sidecar routing (measure only)
+────────────────────────────────────────────────────────────────────────
+Agent   │ kv_reuse   │ dense      │ reuse avg   
+────────┼────────────┼────────────┼─────────────
+0       │ 10/10      │ 0/10       │ 1.00       
+1       │ 9/10       │ 1/10       │ 0.90       
+2       │ 9/10       │ 1/10       │ 0.90       
+
+────────────────────────────────────────────────────────────────────────
+ KV reuse breakdown (measure only, per agent avg)
+────────────────────────────────────────────────────────────────────────
+Agent   │ prefix_max │ tool_schema │ resp_anch │ in_anch │ decode │ short_ck │ reuse_kind
+        │ (tokens)   │ (tokens)    │ (tokens)  │ (tok)   │ (tok)  │          │
+────────┼────────────┼─────────────┼───────────┼─────────┼────────┼──────────┼───────────
+0       │ 548        │ 833         │ 0         │ 18      │ 105    │ 0        │ input_anc
+1       │ 550        │ 302         │ 0         │ 0       │ 56     │ 0        │ anchor_de
+2       │ 518        │ 622         │ 0         │ 0       │ 65     │ 0        │ anchor_de
+
+  prefix_max = max prefix tokens per agent spawn; tool_schema = sum tool-schema injection tokens;
+  resp_anch/in_anch = new response/input anchor tokens pooled this spawn; decode = HF output tokens;
+  short_ck = canonical short-circuit turns (write/exec/DONE/PASS); reuse_kind = input routing kinds seen.
+
+────────────────────────────────────────────────────────────────────────
+ ClawBench capability (0–1, pass ≥ 0.7)
+────────────────────────────────────────────────────────────────────────
+#    │ run_uid    │ Run     │ C       │ T       │ B       │ Status  
+─────┼────────────┼─────────┼─────────┼─────────┼─────────┼─────────
+1    │ e510dc4d   │ 1.0     │ 1.0     │ 0.9     │ 1.0     │ PASS   
+2    │ 5b67e146   │ 1.0     │ 1.0     │ 0.9     │ 1.0     │ PASS   
+3    │ 487652be   │ 1.0     │ 1.0     │ 0.9     │ 1.0     │ PASS   
+4    │ 54cc8930   │ 1.0     │ 1.0     │ 0.9     │ 1.0     │ PASS   
+5    │ 7c4d9489   │ 1.0     │ 1.0     │ 0.9     │ 1.0     │ PASS   
+
+ Aggregate (5 run(s)): run=1.0 C=1.0 T=0.9 B=1.0 pass_rate=100%
+
+────────────────────────────────────────────────────────────────────────
+ Per-run / per-agent detail
+────────────────────────────────────────────────────────────────────────
+  asst(s)     = Gateway WS 首条可见 assistant delta（用户可感知 TTFT）
+  gen_ttft    = HF sidecar 首个 decode token 延迟（ms）
+  sidecar_ttft= sidecar 推理总 TTFT：preprocess + decode（ms）
+  Mode        = sidecar 实际推理路径（kv_reuse / dense_prefill）
+  reuse       = 本请求是否走 kv_reuse（1.0/0.0）
+  prefix      = OpenClaw prefix 估算 token 数
+  resp_anch   = 本次新入池的 response anchor token 数（0=已有 anchor，未重复入池）
+  in_anch     = 本次新入池的 input anchor token 数（0=复用已有 input KV）
+  reuse_txt   = kv_reuse 路径复用的 placeholder KV 解码文本（截断）
+  prefix_max  = agent spawn 内 prefix token 峰值（reuse breakdown）
+  tool_schema = agent spawn 内 tool-schema injection token 累计
+  decode      = agent spawn 内 HF decode 输出 token 累计（short-circuit=0）
+  short_ck    = canonical short-circuit 请求次数
+  reuse_kind  = input 路由复用类型（anchor_delta/input_cache/...）
+  kvcomm_ms   = sidecar KV 预处理耗时（ms）
+  e2e(s)      = 单 agent spawn 端到端耗时（s）
+  measure_kv_reuse_rate = 本 measure 中 agent 请求走 kv_reuse 的比例
+
+Run 1 [warmup]  run_uid=6e5925cf
+  e2e_run_ms=86255
+  Agent │ asst(s) │ gen_ttft │ sidecar_ttft │ Mode           │ reuse │ prefix │ resp_anch │ in_anch │ prefix_max │ tool_schema │ decode │ short_ck │ reuse_kind          │ kvcomm_ms │ e2e(s)
+  ──────┼─────────┼──────────┼──────────────┼────────────────┼───────┼────────┼─────────┼─────────┼────────────┼─────────────┼────────┼──────────┼─────────────────────┼───────────┼────────
+  0     │ 41.962  │ 614      │ 1028         │ dense_prefill  │ 0.00  │ 538    │ 0       │ n/a     │ 538        │ 833         │ 99     │ 0        │                     │ 30        │ 46.145
+  1     │ 12.226  │ 621      │ 946          │ dense_prefill  │ 0.00  │ 550    │ 0       │ n/a     │ 550        │ 302         │ 56     │ 0        │                     │ 32        │ 16.201
+  2     │ 14.785  │ 515      │ 1185         │ dense_prefill  │ 0.00  │ 518    │ 0       │ n/a     │ 518        │ 622         │ 65     │ 0        │                     │ 32        │ 18.524
+
+Run 2 [measure #1]  run_uid=e510dc4d
+  e2e_run_ms=58180
+  capability: run=1.0 C=1.0 T=0.9 B=1.0
+  measure_kv_reuse_rate=1/3 (33%)
+  Agent │ asst(s) │ gen_ttft │ sidecar_ttft │ Mode           │ reuse │ prefix │ resp_anch │ in_anch │ prefix_max │ tool_schema │ decode │ short_ck │ reuse_kind          │ kvcomm_ms │ e2e(s)
+  ──────┼─────────┼──────────┼──────────────┼────────────────┼───────┼────────┼─────────┼─────────┼────────────┼─────────────┼────────┼──────────┼─────────────────────┼───────────┼────────
+  0     │ 19.068  │ 258      │ 462          │ kv_reuse       │ 1.00  │ 548    │ 0       │ 0       │ 548        │ 833         │ 105    │ 0        │ input_anchor_new,in │ 204       │ 23.383
+  1     │ 11.020  │ 254      │ 784          │ partial_kv_reu │ 0.50  │ 550    │ 0       │ 0       │ 550        │ 302         │ 56     │ 0        │ anchor_delta        │ 222       │ 14.895
+  2     │ 12.830  │ 248      │ 1052         │ partial_kv_reu │ 0.50  │ 518    │ 0       │ 0       │ 518        │ 622         │ 64     │ 0        │ anchor_delta        │ 213       │ 16.852
+
+Run 3 [measure #2]  run_uid=5b67e146
+  e2e_run_ms=59236
+  capability: run=1.0 C=1.0 T=0.9 B=1.0
+  measure_kv_reuse_rate=3/3 (100%)
+  Agent │ asst(s) │ gen_ttft │ sidecar_ttft │ Mode           │ reuse │ prefix │ resp_anch │ in_anch │ prefix_max │ tool_schema │ decode │ short_ck │ reuse_kind          │ kvcomm_ms │ e2e(s)
+  ──────┼─────────┼──────────┼──────────────┼────────────────┼───────┼────────┼─────────┼─────────┼────────────┼─────────────┼────────┼──────────┼─────────────────────┼───────────┼────────
+  0     │ 19.042  │ 261      │ 459          │ kv_reuse       │ 1.00  │ 548    │ 0       │ 0       │ 548        │ 833         │ 105    │ 0        │ input_cache_no_ph_i │ 198       │ 23.012
+  1     │ 10.476  │ 255      │ 473          │ kv_reuse       │ 1.00  │ 550    │ 0       │ 0       │ 550        │ 302         │ 56     │ 0        │ anchor_delta        │ 218       │ 14.518
+  2     │ 12.214  │ 246      │ 461          │ kv_reuse       │ 1.00  │ 518    │ 0       │ 0       │ 518        │ 622         │ 66     │ 0        │ anchor_delta        │ 215       │ 19.131
+
+Run 4 [measure #3]  run_uid=487652be
+  e2e_run_ms=56192
+  capability: run=1.0 C=1.0 T=0.9 B=1.0
+  measure_kv_reuse_rate=3/3 (100%)
+  Agent │ asst(s) │ gen_ttft │ sidecar_ttft │ Mode           │ reuse │ prefix │ resp_anch │ in_anch │ prefix_max │ tool_schema │ decode │ short_ck │ reuse_kind          │ kvcomm_ms │ e2e(s)
+  ──────┼─────────┼──────────┼──────────────┼────────────────┼───────┼────────┼─────────┼─────────┼────────────┼─────────────┼────────┼──────────┼─────────────────────┼───────────┼────────
+  0     │ 18.872  │ 260      │ 464          │ kv_reuse       │ 1.00  │ 548    │ 0       │ 0       │ 548        │ 833         │ 105    │ 0        │ input_cache_no_ph_i │ 204       │ 23.334
+  1     │ 10.534  │ 272      │ 495          │ kv_reuse       │ 1.00  │ 550    │ 0       │ 0       │ 550        │ 302         │ 56     │ 0        │ anchor_delta        │ 223       │ 14.216
+  2     │ 12.302  │ 245      │ 471          │ kv_reuse       │ 1.00  │ 518    │ 0       │ 0       │ 518        │ 622         │ 65     │ 0        │ anchor_delta        │ 226       │ 15.978
+
+Run 5 [measure #4]  run_uid=54cc8930
+  e2e_run_ms=56189
+  capability: run=1.0 C=1.0 T=0.9 B=1.0
+  measure_kv_reuse_rate=3/3 (100%)
+  Agent │ asst(s) │ gen_ttft │ sidecar_ttft │ Mode           │ reuse │ prefix │ resp_anch │ in_anch │ prefix_max │ tool_schema │ decode │ short_ck │ reuse_kind          │ kvcomm_ms │ e2e(s)
+  ──────┼─────────┼──────────┼──────────────┼────────────────┼───────┼────────┼─────────┼─────────┼────────────┼─────────────┼────────┼──────────┼─────────────────────┼───────────┼────────
+  0     │ 19.012  │ 261      │ 462          │ kv_reuse       │ 1.00  │ 548    │ 0       │ 0       │ 548        │ 833         │ 105    │ 0        │ input_cache_no_ph_i │ 200       │ 23.319
+  1     │ 10.367  │ 274      │ 428          │ kv_reuse       │ 1.00  │ 550    │ 0       │ 0       │ 550        │ 302         │ 56     │ 0        │ anchor_delta        │ 154       │ 14.296
+  2     │ 12.221  │ 249      │ 468          │ kv_reuse       │ 1.00  │ 518    │ 0       │ 0       │ 518        │ 622         │ 65     │ 0        │ anchor_delta        │ 219       │ 16.070
+
+Run 6 [measure #5]  run_uid=7c4d9489
+  e2e_run_ms=56602
+  capability: run=1.0 C=1.0 T=0.9 B=1.0
+  measure_kv_reuse_rate=3/3 (100%)
+  Agent │ asst(s) │ gen_ttft │ sidecar_ttft │ Mode           │ reuse │ prefix │ resp_anch │ in_anch │ prefix_max │ tool_schema │ decode │ short_ck │ reuse_kind          │ kvcomm_ms │ e2e(s)
+  ──────┼─────────┼──────────┼──────────────┼────────────────┼───────┼────────┼─────────┼─────────┼────────────┼─────────────┼────────┼──────────┼─────────────────────┼───────────┼────────
+  0     │ 19.144  │ 261      │ 458          │ kv_reuse       │ 1.00  │ 548    │ 0       │ 0       │ 548        │ 833         │ 105    │ 0        │ input_cache_no_ph_i │ 197       │ 23.286
+  1     │ 10.522  │ 258      │ 471          │ kv_reuse       │ 1.00  │ 550    │ 0       │ 0       │ 550        │ 302         │ 56     │ 0        │ anchor_delta        │ 214       │ 14.518
+  2     │ 12.333  │ 248      │ 456          │ kv_reuse       │ 1.00  │ 518    │ 0       │ 0       │ 518        │ 622         │ 66     │ 0        │ anchor_delta        │ 208       │ 16.212
+
+════════════════════════════════════════════════════════════════════════

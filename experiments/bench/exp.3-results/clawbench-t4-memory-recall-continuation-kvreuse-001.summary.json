@@ -1,0 +1,299 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 22.675,
+      "ttft_p50_s": 22.678,
+      "ttft_p99_s": 22.809,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 43.914,
+      "ttft_p50_s": 43.844,
+      "ttft_p99_s": 44.3,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 14.664,
+      "ttft_p50_s": 14.481,
+      "ttft_p99_s": 15.085,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 305.66,
+        "p50_ms": 305.96,
+        "p99_ms": 306.57
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 193.64,
+        "p50_ms": 196.69,
+        "p99_ms": 199.59
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 499.3,
+        "p50_ms": 502.84,
+        "p99_ms": 505.17
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 285.69,
+        "p50_ms": 284.49,
+        "p99_ms": 294.46
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 210,
+        "p50_ms": 215.61,
+        "p99_ms": 217.11
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 557.86,
+        "p50_ms": 499.58,
+        "p99_ms": 792.42
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 252.39,
+        "p50_ms": 252.36,
+        "p99_ms": 253.14
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 211.07,
+        "p50_ms": 208.03,
+        "p99_ms": 218.6
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 583.35,
+        "p50_ms": 460.39,
+        "p99_ms": 1069.4
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 961,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 462,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 19,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 137,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": [
+        "input_anchor_new",
+        "input_cache",
+        "input_cache_no_ph_info"
+      ]
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 808,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 314,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 297,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": [
+        "anchor_delta"
+      ]
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 590,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 632,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 75,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": [
+        "anchor_delta"
+      ]
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0.867,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 14.664,
+    "ttft_p50_s": 14.481,
+    "ttft_p99_s": 15.085,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "a7456dda-42f7-4e98-9ce7-ec72e82c36d1",
+        "run_uid": "a7456dda",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0.3333333333333333,
+        "measure_kv_reuse_count": 1,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "7dad7866-925e-4b77-aa14-3997bf68d795",
+        "run_uid": "7dad7866",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 1,
+        "measure_kv_reuse_count": 3,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "0d03f752-c3b8-4eac-ab00-5735d479340a",
+        "run_uid": "0d03f752",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 1,
+        "measure_kv_reuse_count": 3,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "b3b82a6d-3fba-4b07-abb9-6b3e5dd96bdb",
+        "run_uid": "b3b82a6d",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 1,
+        "measure_kv_reuse_count": 3,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "c2d4e83b-ee06-4448-a9dc-c7289d2940bb",
+        "run_uid": "c2d4e83b",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 1,
+        "measure_kv_reuse_count": 3,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}

@@ -1,0 +1,291 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 21.846,
+      "ttft_p50_s": 21.804,
+      "ttft_p99_s": 22.053,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 23.085,
+      "ttft_p50_s": 23.106,
+      "ttft_p99_s": 23.189,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 15.442,
+      "ttft_p50_s": 15.337,
+      "ttft_p99_s": 15.89,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 762.39,
+        "p50_ms": 762.34,
+        "p99_ms": 770.31
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 22.11,
+        "p50_ms": 21.7,
+        "p99_ms": 24.74
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 784.5,
+        "p50_ms": 784.04,
+        "p99_ms": 793.42
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 753.09,
+        "p50_ms": 752.71,
+        "p99_ms": 755.32
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 30.03,
+        "p50_ms": 30.51,
+        "p99_ms": 30.8
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 950.3,
+        "p50_ms": 949.24,
+        "p99_ms": 962.1
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 529.26,
+        "p50_ms": 529.35,
+        "p99_ms": 530.63
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 29.13,
+        "p50_ms": 30.69,
+        "p99_ms": 30.83
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1202.19,
+        "p50_ms": 1199.2,
+        "p99_ms": 1214.52
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 761,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 455,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 60,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 133,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 694,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 304,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 119,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 136,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 560,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 625,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 62,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 66,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 15.442,
+    "ttft_p50_s": 15.337,
+    "ttft_p99_s": 15.89,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t4-delegation-repair",
+        "run_id": "f00af69a-39d8-47c9-98c4-c65d10740492",
+        "run_uid": "f00af69a",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t4-delegation-repair",
+        "run_id": "6953101c-3aac-4fd9-bd9e-5e68bbd7b0b9",
+        "run_uid": "6953101c",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t4-delegation-repair",
+        "run_id": "4b77bfff-8f88-4f21-82c7-d461e9fbf161",
+        "run_uid": "4b77bfff",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t4-delegation-repair",
+        "run_id": "8fac982b-7f9c-4c58-94c1-7a967fa56d6f",
+        "run_uid": "8fac982b",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t4-delegation-repair",
+        "run_id": "b1f09014-db09-4ad4-bb5d-7a62e066a6da",
+        "run_uid": "b1f09014",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}

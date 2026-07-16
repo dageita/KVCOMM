@@ -35,6 +35,17 @@ from KVCOMM.llm.config import KVCommConfig
 
 from KVCOMM.llm.token_ops import *
 from KVCOMM.llm.kvcomm_engine import KVCOMMEngine, _RequestState
+
+try:
+    from sidecar.stores.kv_token_pair import (
+        check_kv_token_length_pair,
+        token_ids_seq_length,
+    )
+except ImportError:  # pragma: no cover
+    from KVCOMM.llm.kvcomm_engine import (  # type: ignore
+        check_kv_token_length_pair,
+        token_ids_seq_length,
+    )
 from KVCOMM.utils.metrics import GenerationResult
 from KVCOMM.utils.log import logger
 
@@ -1007,7 +1018,7 @@ class LLMChat(LLM):
         if schema_token_len <= 0:
             return None
 
-        schema_kv = full_kv_cache.slice_(start=int(prefix_token_length), end=int(generation_prompt_length))
+        schema_kv = full_kv_cache.slice(start=int(prefix_token_length), end=int(generation_prompt_length))
         schema_relative = self.kv_engine.apply_rotary_pos_emb(
             schema_kv,
             offset=-int(prefix_token_length),
@@ -1876,11 +1887,17 @@ class LLMChat(LLM):
         input_cache = output.past_key_values
 
         global_buckets = self._ensure_global_input_buckets()
-        global_buckets["input"].setdefault(message, []).append(
-            input_cache.copy().slice_(start=0, end=token_ids["input_ids"].shape[-1])
+        sliced_input = input_cache.copy().slice_(start=0, end=token_ids["input_ids"].shape[-1])
+        self._append_paired_shared_kv(
+            global_buckets["input"],
+            global_buckets["input_ids"],
+            global_buckets["input_drop_num"],
+            message,
+            sliced_input,
+            token_ids,
+            drop_num=drop_num,
+            context=f"input KV message={message!r}",
         )
-        global_buckets["input_ids"].setdefault(message, []).append(token_ids)
-        global_buckets["input_drop_num"].setdefault(message, []).append(drop_num)
 
         anchor_store = state.anchors.setdefault(anchor_namespace, {})
         input_anchor_list = list(anchor_store.values())
@@ -2203,6 +2220,61 @@ class LLMChat(LLM):
                 raise TimeoutError("Thread task timeout") from exc
             except Exception as exc:
                 raise RuntimeError("Thread task failed") from exc
+
+    @staticmethod
+    def _append_paired_shared_kv(
+        kv_bucket: Dict[str, list],
+        ids_bucket: Dict[str, list],
+        drop_bucket: Dict[str, list],
+        message: str,
+        kv: Any,
+        token_ids: Dict[str, Any],
+        drop_num: int = 0,
+        *,
+        context: str = "shared KV append",
+    ) -> None:
+        """Append KV/ids/drop_num atomically after length pair validation.
+
+        Small mismatches are aligned by truncating the longer side (token-authoritative
+        when trimming KV; KV-authoritative when trimming tokens) instead of failing the
+        whole generation — response export can briefly disagree after tool-schema pooling.
+        """
+        try:
+            kv_len = int(kv.get_seq_length())
+        except Exception:
+            kv_len = int(getattr(kv, "_seen_tokens", 0) or 0)
+        tok_len = token_ids_seq_length(token_ids)
+        drop = int(drop_num or 0)
+        err = check_kv_token_length_pair(
+            kv_len,
+            tok_len,
+            drop_num=drop,
+            allow_empty=False,
+        )
+        if err:
+            if kv_len > 0 and tok_len > 0 and drop == 0:
+                aligned = min(kv_len, tok_len)
+                logger.warning(
+                    "{}: {} — aligning to length {}",
+                    context,
+                    err,
+                    aligned,
+                )
+                if kv_len > aligned and hasattr(kv, "slice"):
+                    kv = kv.slice(start=0, end=aligned)
+                if tok_len > aligned and isinstance(token_ids, dict):
+                    token_ids = {
+                        key: (value[:, :aligned] if isinstance(value, torch.Tensor) else value)
+                        for key, value in token_ids.items()
+                    }
+                kv_len = aligned
+                tok_len = aligned
+                err = check_kv_token_length_pair(kv_len, tok_len, drop_num=drop, allow_empty=False)
+            if err:
+                raise RuntimeError(f"{context}: {err}")
+        kv_bucket.setdefault(message, []).append(kv)
+        ids_bucket.setdefault(message, []).append(token_ids)
+        drop_bucket.setdefault(message, []).append(drop)
 
     def set_id(self, node_id: str, role: str):
         """Bind the chat instance to a graph node id and role."""
@@ -2575,7 +2647,7 @@ class LLMChat(LLM):
         past_kv = merged_prefix_kv.slice_(start=0, end=past_end)
         if kv_len > prefix_token_length:
             logger.debug(
-                "kv_reuse tool boundary: slice prefix KV {}→{} tokens",
+                "kv_reuse tool boundary: slice prefix KV {}→{} tokens (token-authoritative)",
                 kv_len,
                 prefix_token_length,
             )
@@ -3086,13 +3158,32 @@ class LLMChat(LLM):
             return self._forward_text_to_kv_sync(stored_text or " ")
 
         end = int(prefix_token_len) + resp_len
-        response_kv_cache = full_kv_cache.slice_(start=int(prefix_token_len), end=end)
+        # Non-destructive slice: callers may still need the full generation cache.
+        response_kv_cache = full_kv_cache.slice(start=int(prefix_token_len), end=end)
         response_kv_cache = self.kv_engine.apply_rotary_pos_emb(
             response_kv_cache,
             offset=-int(prefix_token_len),
             drop_num=0,
         )
         response_tokens = response_token_ids.unsqueeze(0) if response_token_ids.dim() == 1 else response_token_ids
+        kv_len = int(response_kv_cache.get_seq_length())
+        tok_len = int(response_tokens.shape[-1])
+        if kv_len > 0 and tok_len > kv_len:
+            logger.warning(
+                "response export trim tokens {}→{} to match KV (prefix_token_len={})",
+                tok_len,
+                kv_len,
+                prefix_token_len,
+            )
+            response_tokens = response_tokens[:, :kv_len]
+        elif tok_len > 0 and kv_len > tok_len:
+            logger.warning(
+                "response export trim KV {}→{} to match tokens (prefix_token_len={})",
+                kv_len,
+                tok_len,
+                prefix_token_len,
+            )
+            response_kv_cache = response_kv_cache.slice(start=0, end=tok_len)
         token_dict: Dict[str, torch.Tensor] = {
             "input_ids": response_tokens.to(self.model.device),
             "attention_mask": torch.ones_like(response_tokens).to(self.model.device),
@@ -3792,6 +3883,26 @@ class LLMChat(LLM):
                 m["drop_num"] = int(getattr(slot, "drop_num", 0))
             ph_cache = m["ph_cache"]
             drop_num = int(m.get("drop_num") or 0)
+            try:
+                kv_full_len = int(ph_cache.get_seq_length())
+            except Exception:
+                kv_full_len = int(getattr(ph_cache, "_seen_tokens", 0) or 0)
+            tok_full_len = token_ids_seq_length(m.get("ph_cache_ids"))
+            pair_err = check_kv_token_length_pair(
+                kv_full_len,
+                tok_full_len,
+                drop_num=drop_num,
+                allow_empty=False,
+            )
+            if pair_err:
+                logger.warning(
+                    "meta KV/token mismatch after refresh ph_id={} kv={} tokens={} drop_num={} ({})",
+                    ph_id,
+                    kv_full_len,
+                    tok_full_len,
+                    drop_num,
+                    pair_err,
+                )
             real_len = int(ph_cache._seen_tokens - drop_num)
             templ_len = int(m["end"]) - int(m["start"])
             delta_len = real_len - templ_len
@@ -4759,14 +4870,24 @@ class LLMChat(LLM):
             ]
             results = list(self._map_in_pool(self.kv_engine.update_kv_cache_segment, tasks, timeout=30))
             blend_failed = [m["ph_id"] for m, result in zip(meta, results) if not result[3]]
-            if blend_failed:
-                blend_fallback = True
-                self.purge_incompatible_anchor_deltas(request_uid, message, blend_failed)
-                logger.debug(
-                    "kv_reuse anchor blend failed node_id={} placeholders={} -> dense_prefill rematerialize",
-                    self.node_id,
-                    blend_failed,
-                )
+            length_mismatch = [
+                m["ph_id"] for m, result in zip(meta, results) if len(result) > 4 and not result[4]
+            ]
+            if blend_failed or length_mismatch:
+                if blend_failed:
+                    blend_fallback = True
+                    self.purge_incompatible_anchor_deltas(request_uid, message, blend_failed)
+                    logger.debug(
+                        "kv_reuse anchor blend failed node_id={} placeholders={} -> dense_prefill rematerialize",
+                        self.node_id,
+                        blend_failed,
+                    )
+                if length_mismatch:
+                    logger.warning(
+                        "kv_reuse segment KV/token mismatch node_id={} placeholders={} -> dense_prefill",
+                        self.node_id,
+                        length_mismatch,
+                    )
                 mode = "dense_prefill"
                 results = list(
                     self._map_in_pool(
@@ -4864,7 +4985,8 @@ class LLMChat(LLM):
             drift = abs(kv_len - int(prefix_token_length))
             if kv_len < int(prefix_token_length) or drift > _MAX_PREFIX_LENGTH_DRIFT:
                 logger.debug(
-                    "kv_reuse tool injection KV/token drift kv={} tokens={} drift={} -> dense_prefill",
+                    "kv_reuse tool injection KV/token drift kv={} tokens={} drift={} "
+                    "-> dense_prefill (safety net)",
                     kv_len,
                     prefix_token_length,
                     drift,
@@ -5060,13 +5182,17 @@ class LLMChat(LLM):
         response_tokens = generated_ids.unsqueeze(0)
         response_kv_cache, token_dict = self._export_producer_contextual_response_kv(
             full_kv_cache=full_kv_cache,
-            prefix_token_len=int(prefix_token_length),
+            # Response KV starts after the full generation prompt (prefix + optional tool suffix).
+            prefix_token_len=int(generation_prompt_length),
             response_token_ids=generated_ids,
             message=message,
             stored_text=stored_text or " ",
         )
+        response_tokens = token_dict["input_ids"]
         attn_len = response_tokens.size(1)
-        response_mask = torch.ones(response_tokens.size(0), attn_len, device=self.model.device)
+        response_mask = token_dict.get("attention_mask")
+        if response_mask is None:
+            response_mask = torch.ones(response_tokens.size(0), attn_len, device=self.model.device)
 
         mem = LLMChat._shared_kv_cache_memory.get(self.node_id) or {}
         if not isinstance(mem, dict):
@@ -5092,14 +5218,16 @@ class LLMChat(LLM):
         ]
         anchor_active_list: List[int] = list(anchor_info_bucket.values())
 
-        resp.setdefault(message, []).append(response_kv_cache)
-        resp_ids.setdefault(message, []).append(
-            {
-                "input_ids": response_tokens,
-                "attention_mask": response_mask,
-            }
+        self._append_paired_shared_kv(
+            resp,
+            resp_ids,
+            resp_drop,
+            message,
+            response_kv_cache,
+            token_dict,
+            drop_num=0,
+            context=f"response KV node={self.node_id}",
         )
-        resp_drop.setdefault(message, []).append(0)
 
         accumulate_len = 0
         for key in state.anchor_len_dict.keys():
@@ -5390,14 +5518,24 @@ class LLMChat(LLM):
             ]
             results = list(self._map_in_pool(self.kv_engine.update_kv_cache_segment, tasks, timeout=30))
             blend_failed = [m["ph_id"] for m, result in zip(meta, results) if not result[3]]
-            if blend_failed:
-                blend_fallback = True
-                self.purge_incompatible_anchor_deltas(request_uid, message, blend_failed)
-                logger.debug(
-                    "kv_reuse anchor blend failed node_id={} placeholders={} -> dense_prefill rematerialize",
-                    self.node_id,
-                    blend_failed,
-                )
+            length_mismatch = [
+                m["ph_id"] for m, result in zip(meta, results) if len(result) > 4 and not result[4]
+            ]
+            if blend_failed or length_mismatch:
+                if blend_failed:
+                    blend_fallback = True
+                    self.purge_incompatible_anchor_deltas(request_uid, message, blend_failed)
+                    logger.debug(
+                        "kv_reuse anchor blend failed node_id={} placeholders={} -> dense_prefill rematerialize",
+                        self.node_id,
+                        blend_failed,
+                    )
+                if length_mismatch:
+                    logger.warning(
+                        "kv_reuse segment KV/token mismatch node_id={} placeholders={} -> dense_prefill",
+                        self.node_id,
+                        length_mismatch,
+                    )
                 mode = "dense_prefill"
                 results = list(
                     self._map_in_pool(
@@ -5524,14 +5662,19 @@ class LLMChat(LLM):
         ]
         anchor_active_list: List[int] = list(anchor_info_bucket.values())
 
-        resp.setdefault(message, []).append(response_kv_cache)
-        resp_ids.setdefault(message, []).append(
+        self._append_paired_shared_kv(
+            resp,
+            resp_ids,
+            resp_drop,
+            message,
+            response_kv_cache,
             {
                 "input_ids": response_tokens,
                 "attention_mask": response_mask,
-            }
+            },
+            drop_num=0,
+            context=f"response KV node={self.node_id}",
         )
-        resp_drop.setdefault(message, []).append(0)
 
         accumulate_len = 0
         for key in state.anchor_len_dict.keys():

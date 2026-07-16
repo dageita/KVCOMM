@@ -1,0 +1,291 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 21.745,
+      "ttft_p50_s": 21.736,
+      "ttft_p99_s": 21.799,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 55.397,
+      "ttft_p50_s": 55.398,
+      "ttft_p99_s": 55.686,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 13.348,
+      "ttft_p50_s": 13.371,
+      "ttft_p99_s": 13.485,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 867.43,
+        "p50_ms": 867.8,
+        "p99_ms": 870.48
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 66.2,
+        "p50_ms": 67.08,
+        "p99_ms": 70.81
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 933.63,
+        "p50_ms": 934.88,
+        "p99_ms": 941.29
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 1320.85,
+        "p50_ms": 1320.06,
+        "p99_ms": 1333.57
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 58.55,
+        "p50_ms": 62.06,
+        "p99_ms": 65.43
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1379.4,
+        "p50_ms": 1375.43,
+        "p99_ms": 1396.09
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 1013.77,
+        "p50_ms": 1013.65,
+        "p99_ms": 1014.68
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 164.45,
+        "p50_ms": 163.42,
+        "p99_ms": 171.24
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1178.22,
+        "p50_ms": 1177.79,
+        "p99_ms": 1184.41
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 923,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 1098,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 23,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 98,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 850,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 1672,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 23,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 299,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 472,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 662,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 49,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 53,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 13.348,
+    "ttft_p50_s": 13.371,
+    "ttft_p99_s": 13.485,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t2-config-loader",
+        "run_id": "1337bfe2-624a-44a4-ab2b-8e9b8f3b2098",
+        "run_uid": "1337bfe2",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t2-config-loader",
+        "run_id": "e9ef009a-188d-462f-8ff3-bbb961e52066",
+        "run_uid": "e9ef009a",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t2-config-loader",
+        "run_id": "2dc145af-45b8-4077-ae4a-f43306f6bee8",
+        "run_uid": "2dc145af",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t2-config-loader",
+        "run_id": "0b6477e4-4b6a-4de7-a0ca-1953bf7487fb",
+        "run_uid": "0b6477e4",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t2-config-loader",
+        "run_id": "b02a295a-ca55-4a7e-b651-5ceabb4af2e8",
+        "run_uid": "b02a295a",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}

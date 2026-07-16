@@ -21,8 +21,51 @@ from transformers.cache_utils import DynamicCache
 from KVCOMM.llm.token_ops import concat
 from KVCOMM.utils.log import logger
 
+try:
+    from sidecar.stores.kv_token_pair import (
+        check_kv_token_length_pair,
+        token_ids_seq_length,
+    )
+except ImportError:  # pragma: no cover - sidecar not on path in some unit contexts
+    def token_ids_seq_length(token_ids: Any) -> int:
+        if not isinstance(token_ids, dict):
+            return 0
+        input_ids = token_ids.get("input_ids")
+        if input_ids is None:
+            return 0
+        try:
+            return int(input_ids.shape[-1])
+        except (AttributeError, TypeError, IndexError):
+            try:
+                return int(len(input_ids[0]))
+            except (TypeError, IndexError):
+                return 0
+
+    def check_kv_token_length_pair(
+        kv_len: int,
+        token_len: int,
+        *,
+        drop_num: int = 0,
+        allow_empty: bool = False,
+    ) -> Optional[str]:
+        kv_len = int(kv_len)
+        token_len = int(token_len)
+        drop_num = int(drop_num or 0)
+        if kv_len == 0 and token_len == 0:
+            return None if allow_empty else "empty KV and token_ids"
+        if kv_len > 0 and token_len <= 0:
+            return f"empty token_ids with non-empty KV (kv={kv_len})"
+        if token_len > 0 and kv_len <= 0:
+            return f"empty KV with non-empty token_ids (tokens={token_len})"
+        if drop_num < 0 or drop_num > kv_len or drop_num > token_len:
+            return f"drop_num={drop_num} out of range for kv={kv_len} tokens={token_len}"
+        if kv_len != token_len:
+            return f"kv_len={kv_len} != token_len={token_len} (drop_num={drop_num})"
+        return None
+
 _MISSING = object()
 _DELETED = object()
+
 
 def _is_layered_cache(cache: DynamicCache) -> bool:
     """Return True if the cache uses the newer `layers` structure."""
@@ -259,7 +302,7 @@ def _slice_inplace(cache: DynamicCache, start: Optional[int], end: Optional[int]
                 new_value = value[..., slice_start:slice_end, :].clone()
             _set_layer_kv(cache, idx, new_key, new_value)
 
-    _set_seen_tokens(cache, end - start)
+    _set_seen_tokens(cache, _safe_seq_len(cache))
     return cache
 
 
@@ -1236,6 +1279,33 @@ class KVCOMMEngine:
         new_ph_cache.key_cache = list(kv_rot)
         return new_ph_cache
 
+    def _guard_fetched_kv_token_pair(
+        self,
+        ph_id: str,
+        ph_cache: Any,
+        ph_cache_ids: Any,
+        drop_num: Any,
+    ) -> Tuple[DynamicCache, Dict[str, torch.Tensor], int]:
+        """Validate fetched (KV, token_ids, drop_num) pair before use."""
+        drop = int(drop_num or 0)
+        if ph_cache is None:
+            raise RuntimeError(f"fetch_shared_cache: placeholder {ph_id} returned empty KV")
+        try:
+            kv_len = int(ph_cache.get_seq_length())
+        except Exception:
+            kv_len = int(getattr(ph_cache, "_seen_tokens", 0) or 0)
+        tok_len = token_ids_seq_length(ph_cache_ids)
+        err = check_kv_token_length_pair(kv_len, tok_len, drop_num=drop, allow_empty=False)
+        if err:
+            msg = f"fetch_shared_cache: {ph_id} KV/token pair invalid: {err}"
+            if kv_len > 0 and tok_len <= 0:
+                raise RuntimeError(msg)
+            self._log_warning(msg)
+            raise RuntimeError(msg)
+        if not isinstance(ph_cache_ids, dict):
+            raise RuntimeError(f"fetch_shared_cache: {ph_id} token_ids must be a dict")
+        return ph_cache, ph_cache_ids, drop
+
     def fetch_shared_cache(
         self,
         ph_id: str,
@@ -1245,7 +1315,8 @@ class KVCOMMEngine:
         shared_memory = self.llm._shared_kv_cache_memory
 
         if "user_question" in ph_id:
-            return (
+            return self._guard_fetched_kv_token_pair(
+                ph_id,
                 shared_memory["input"][message][-1],
                 shared_memory["input_ids"][message][-1],
                 shared_memory["input_drop_num"][message][-1],
@@ -1267,7 +1338,8 @@ class KVCOMMEngine:
                                 if isinstance(consumer.token_ids, dict)
                                 else {}
                             )
-                            return (
+                            return self._guard_fetched_kv_token_pair(
+                                ph_id,
                                 consumer.absolute_kv,
                                 token_ids,
                                 int(consumer.drop_num),
@@ -1275,7 +1347,8 @@ class KVCOMMEngine:
                         if slot.kv_ref:
                             tool_entry = stores.tool_kv.get(slot.kv_ref)
                             if tool_entry is not None:
-                                return (
+                                return self._guard_fetched_kv_token_pair(
+                                    ph_id,
                                     tool_entry.absolute_kv,
                                     tool_entry.token_ids,
                                     slot.drop_num,
@@ -1288,7 +1361,8 @@ class KVCOMMEngine:
                                 if isinstance(branch.token_ids, dict)
                                 else {}
                             )
-                            return (
+                            return self._guard_fetched_kv_token_pair(
+                                ph_id,
                                 branch.absolute_kv,
                                 token_ids,
                                 int(branch.drop_num),
@@ -1296,7 +1370,12 @@ class KVCOMMEngine:
                 except ImportError:
                     pass
                 if slot.absolute_kv is not None and slot.token_ids is not None:
-                    return slot.absolute_kv, slot.token_ids, slot.drop_num
+                    return self._guard_fetched_kv_token_pair(
+                        ph_id,
+                        slot.absolute_kv,
+                        slot.token_ids,
+                        slot.drop_num,
+                    )
 
             node_memory = shared_memory.get(node_id) or {}
             if not isinstance(node_memory, dict):
@@ -1312,7 +1391,12 @@ class KVCOMMEngine:
                 raise RuntimeError(
                     f"fetch_shared_cache: turn placeholder {ph_id} for message='{message}' not found."
                 )
-            return entry["kv"], entry["ids"], entry.get("drop_num", 0)
+            return self._guard_fetched_kv_token_pair(
+                ph_id,
+                entry["kv"],
+                entry["ids"],
+                entry.get("drop_num", 0),
+            )
 
         type_str, node_id, *rest = ph_id.split("_")
         is_current = (rest and rest[0] == "current")
@@ -1324,7 +1408,8 @@ class KVCOMMEngine:
                     if isinstance(consumer_slot.token_ids, dict)
                     else {}
                 )
-                return (
+                return self._guard_fetched_kv_token_pair(
+                    ph_id,
                     consumer_slot.absolute_kv,
                     token_ids,
                     int(consumer_slot.drop_num),
@@ -1332,7 +1417,12 @@ class KVCOMMEngine:
             upstream_slot = self.llm.resolve_upstream_agent_slot(ph_id, message)
             if upstream_slot is not None and upstream_slot.absolute_kv is not None:
                 token_ids = upstream_slot.token_ids if isinstance(upstream_slot.token_ids, dict) else {}
-                return upstream_slot.absolute_kv, token_ids, int(upstream_slot.drop_num)
+                return self._guard_fetched_kv_token_pair(
+                    ph_id,
+                    upstream_slot.absolute_kv,
+                    token_ids,
+                    int(upstream_slot.drop_num),
+                )
 
         key_prefix = "condition" if type_str == "condition" else "response"
         slot_idx = -1 if is_current else -2
@@ -1364,7 +1454,7 @@ class KVCOMMEngine:
                 f"fetch_shared_cache: placeholder {ph_id} for message='{message}' not found."
             )
 
-        return ph_cache, ph_cache_ids, drop_num
+        return self._guard_fetched_kv_token_pair(ph_id, ph_cache, ph_cache_ids, drop_num)
 
     @staticmethod
     def trim_token_ids(ids_dict: Dict[str, torch.Tensor], drop_num: int) -> Dict[str, torch.Tensor]:
@@ -1375,32 +1465,113 @@ class KVCOMMEngine:
             for key, value in ids_dict.items()
         }
 
+    def _check_segment_kv_token_alignment(
+        self,
+        m: Dict[str, Any],
+        seg_cache: DynamicCache,
+        seg_token_ids: Dict[str, torch.Tensor],
+        *,
+        ph_len: Optional[int] = None,
+        pf_len: Optional[int] = None,
+    ) -> bool:
+        """Return True when segment KV length matches trimmed token length.
+
+        Only **segment totals** gate dense fallback. Optional pre-concat ph/pf
+        lengths are logged for diagnosis — never measured after ``concat_``,
+        which mutates the placeholder cache in place and would false-positive.
+        """
+        ph_id = str(m.get("ph_id", "?"))
+        idx = m.get("idx")
+        drop_num = int(m.get("drop_num") or 0)
+        seg_kv_len = int(seg_cache.get_seq_length())
+        seg_tok_len = token_ids_seq_length(seg_token_ids)
+        err = check_kv_token_length_pair(
+            seg_kv_len,
+            seg_tok_len,
+            drop_num=0,
+            allow_empty=(seg_kv_len == 0 and seg_tok_len == 0),
+        )
+        if err is None and ph_len is not None and pf_len is not None:
+            ph_ids = self.trim_token_ids(m.get("ph_cache_ids") or {}, drop_num)
+            ph_tok = token_ids_seq_length(ph_ids)
+            pf_tok = token_ids_seq_length(m.get("pf_ids"))
+            if (
+                int(ph_len) != ph_tok
+                or int(pf_len) != pf_tok
+                or (int(ph_len) + int(pf_len)) != seg_kv_len
+            ):
+                # Diagnostic only: segment totals already match, keep kv_reuse.
+                logger.debug(
+                    "segment ph/pf split note ph_id={} idx={} ph_kv={} ph_tok={} "
+                    "pf_kv={} pf_tok={} seg_kv={} seg_tok={} (non-fatal)",
+                    ph_id,
+                    idx,
+                    ph_len,
+                    ph_tok,
+                    pf_len,
+                    pf_tok,
+                    seg_kv_len,
+                    seg_tok_len,
+                )
+        if err is None:
+            return True
+        logger.warning(
+            "segment KV/token mismatch ph_id={} idx={} kv={} tokens={} drop_num={} ({}) "
+            "action=dense",
+            ph_id,
+            idx,
+            seg_kv_len,
+            seg_tok_len,
+            drop_num,
+            err,
+        )
+        return False
+
     def update_kv_cache_segment(
         self,
         request_uid: str,
         message: str,
         m: Dict[str, Any],
         anchors_for_ph: List[Dict],
-    ) -> Tuple[int, DynamicCache, Dict[str, torch.Tensor], bool]:
-        """Rotate and offset a single placeholder/prefix segment for kv_reuse mode."""
+    ) -> Tuple[int, DynamicCache, Dict[str, torch.Tensor], bool, bool]:
+        """Rotate and offset a single placeholder/prefix segment for kv_reuse mode.
+
+        Returns:
+            ``(idx, seg_cache, seg_token_ids, blended, length_ok)``.
+        """
         new_ph, new_pf = self._rotate_segment_caches(m)
         new_ph, new_pf, blended = self.offset_kv_cache_pair(
             m["ph_id"], message, request_uid, new_ph, new_pf, anchors_for_ph, temperature=1
         )
 
+        # Capture lengths before in-place concat_ mutates new_ph.
+        ph_len = int(new_ph.get_seq_length())
+        pf_len = int(new_pf.get_seq_length())
         seg_cache = new_ph.concat_([new_pf])
         seg_token_ids = concat(self.trim_token_ids(m["ph_cache_ids"], m["drop_num"]), m["pf_ids"])
+        length_ok = self._check_segment_kv_token_alignment(
+            m, seg_cache, seg_token_ids, ph_len=ph_len, pf_len=pf_len
+        )
 
-        return m["idx"], seg_cache, seg_token_ids, blended
+        return m["idx"], seg_cache, seg_token_ids, blended, length_ok
 
     def process_anchor(
         self,
         message: str,
         m: Dict[str, Any],
-    ) -> Tuple[int, DynamicCache, Dict[str, torch.Tensor]]:
-        """Rotate and concatenate a single segment for dense_prefill mode."""
+    ) -> Tuple[int, DynamicCache, Dict[str, torch.Tensor], bool]:
+        """Rotate and concatenate a single segment for dense_prefill mode.
+
+        Returns:
+            ``(idx, seg_cache, seg_token_ids, length_ok)``.
+        """
         new_ph, new_pf = self._rotate_segment_caches(m)
+        ph_len = int(new_ph.get_seq_length())
+        pf_len = int(new_pf.get_seq_length())
         seg_cache = new_ph.concat_([new_pf])
         seg_token_ids = concat(self.trim_token_ids(m["ph_cache_ids"], m["drop_num"]), m["pf_ids"])
+        length_ok = self._check_segment_kv_token_alignment(
+            m, seg_cache, seg_token_ids, ph_len=ph_len, pf_len=pf_len
+        )
 
-        return m["idx"], seg_cache, seg_token_ids
+        return m["idx"], seg_cache, seg_token_ids, length_ok

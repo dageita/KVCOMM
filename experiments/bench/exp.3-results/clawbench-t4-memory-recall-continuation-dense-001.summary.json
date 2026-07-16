@@ -1,0 +1,291 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 23.679,
+      "ttft_p50_s": 23.67,
+      "ttft_p99_s": 23.765,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 45.793,
+      "ttft_p50_s": 45.806,
+      "ttft_p99_s": 45.962,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 17.192,
+      "ttft_p50_s": 17.15,
+      "ttft_p99_s": 17.328,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 1002.95,
+        "p50_ms": 1003.72,
+        "p99_ms": 1005.33
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 21.69,
+        "p50_ms": 21.31,
+        "p99_ms": 25.19
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1024.64,
+        "p50_ms": 1024.35,
+        "p99_ms": 1028.91
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 879.75,
+        "p50_ms": 880.52,
+        "p99_ms": 881.21
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 30.07,
+        "p50_ms": 29.62,
+        "p99_ms": 34.86
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 954.1,
+        "p50_ms": 956.11,
+        "p99_ms": 958.67
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 542.97,
+        "p50_ms": 543.13,
+        "p99_ms": 544.79
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 30.36,
+        "p50_ms": 31.34,
+        "p99_ms": 33.05
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1215.15,
+        "p50_ms": 1220.35,
+        "p99_ms": 1227.59
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 961,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 462,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 61,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 137,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 808,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 314,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 269,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 297,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 590,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 632,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 71,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 76,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 17.192,
+    "ttft_p50_s": 17.15,
+    "ttft_p99_s": 17.328,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "8b9af7db-18ca-4275-9e05-d7ae87b58730",
+        "run_uid": "8b9af7db",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "34929d57-cf32-4711-9d74-b7ddcc7a8895",
+        "run_uid": "34929d57",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "56d5b78c-5020-4a0e-8fa5-0af4a5abf1fc",
+        "run_uid": "56d5b78c",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "2665c904-8516-4426-a232-b32f5263fcb5",
+        "run_uid": "2665c904",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t4-memory-recall-continuation",
+        "run_id": "66460655-f478-45a4-b9f6-666b9e9f9cc5",
+        "run_uid": "66460655",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}

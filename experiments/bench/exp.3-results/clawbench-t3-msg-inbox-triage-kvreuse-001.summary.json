@@ -1,0 +1,299 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 30.162,
+      "ttft_p50_s": 30.121,
+      "ttft_p99_s": 30.401,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 54.603,
+      "ttft_p50_s": 54.552,
+      "ttft_p99_s": 54.963,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 14.572,
+      "ttft_p50_s": 14.467,
+      "ttft_p99_s": 15.037,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 316.32,
+        "p50_ms": 316.74,
+        "p99_ms": 317.88
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 229.27,
+        "p50_ms": 237.11,
+        "p99_ms": 248.82
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 545.59,
+        "p50_ms": 554.99,
+        "p99_ms": 566.04
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 267.75,
+        "p50_ms": 274.42,
+        "p99_ms": 275.29
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 188.37,
+        "p50_ms": 193.45,
+        "p99_ms": 211.17
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 517.27,
+        "p50_ms": 450.42,
+        "p99_ms": 791.79
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 251.81,
+        "p50_ms": 251.7,
+        "p99_ms": 252.5
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 213.4,
+        "p50_ms": 212.61,
+        "p99_ms": 222.24
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 582.24,
+        "p50_ms": 473.22,
+        "p99_ms": 1050.27
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 1222,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 482,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 18,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 192,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": [
+        "input_anchor_new",
+        "input_cache",
+        "input_cache_no_ph_info"
+      ]
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 560,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 301,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 380,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": [
+        "anchor_delta"
+      ]
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 575,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 639,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 80,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": [
+        "anchor_delta"
+      ]
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0.867,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 14.572,
+    "ttft_p50_s": 14.467,
+    "ttft_p99_s": 15.037,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t3-msg-inbox-triage",
+        "run_id": "b3c9bfd6-cd04-4f46-8e8b-c451fd5d0115",
+        "run_uid": "b3c9bfd6",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0.3333333333333333,
+        "measure_kv_reuse_count": 1,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t3-msg-inbox-triage",
+        "run_id": "d80ee44f-b98e-4451-9b35-60f88c253324",
+        "run_uid": "d80ee44f",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 1,
+        "measure_kv_reuse_count": 3,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t3-msg-inbox-triage",
+        "run_id": "c6e8a7fa-db8f-4d54-9d15-73a9d1f736ea",
+        "run_uid": "c6e8a7fa",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 1,
+        "measure_kv_reuse_count": 3,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t3-msg-inbox-triage",
+        "run_id": "db15fd38-5af0-4e1a-8737-b1fa5114e00a",
+        "run_uid": "db15fd38",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 1,
+        "measure_kv_reuse_count": 3,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t3-msg-inbox-triage",
+        "run_id": "7111156a-2e7f-42e0-b2b2-fdec27a61732",
+        "run_uid": "7111156a",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 1,
+        "measure_kv_reuse_count": 3,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}

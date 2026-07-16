@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from sidecar.stores.kv_token_pair import require_paired_slot_payload
+
 Materialization = Literal["producer_contextual", "consumer_contextual", "isolated"]
 
 
@@ -49,6 +51,13 @@ class UpstreamAgentSlotRegistry:
         prefix_token_len: int,
         drop_num: int = 0,
     ) -> UpstreamAgentSlot:
+        drop_num = require_paired_slot_payload(
+            absolute_kv,
+            token_ids,
+            drop_num=drop_num,
+            require_absolute_drop=True,
+            context=f"upstream producer {ph_id}",
+        )
         slot = UpstreamAgentSlot(
             ph_id=str(ph_id),
             message_key=str(message_key),
@@ -77,6 +86,13 @@ class UpstreamAgentSlotRegistry:
         slot_token_start: int,
         drop_num: int = 0,
     ) -> UpstreamAgentSlot:
+        drop_num = require_paired_slot_payload(
+            absolute_kv,
+            token_ids,
+            drop_num=drop_num,
+            require_absolute_drop=True,
+            context=f"upstream consumer {ph_id}",
+        )
         slot = UpstreamAgentSlot(
             ph_id=str(ph_id),
             message_key=str(message_key),

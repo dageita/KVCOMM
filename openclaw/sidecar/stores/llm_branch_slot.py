@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from sidecar.stores.kv_token_pair import require_paired_slot_payload
+
 Materialization = Literal["consumer_contextual", "isolated_fallback"]
 
 
@@ -53,6 +55,13 @@ class LlmBranchSlotRegistry:
         drop_num: int = 0,
         materialization: Materialization = "consumer_contextual",
     ) -> LlmBranchSlot:
+        drop_num = require_paired_slot_payload(
+            absolute_kv,
+            token_ids,
+            drop_num=drop_num,
+            require_absolute_drop=(materialization == "consumer_contextual"),
+            context=f"llm branch {ph_id}",
+        )
         slot = LlmBranchSlot(
             ph_id=str(ph_id),
             message_key=str(message_key),

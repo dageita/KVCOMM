@@ -1,0 +1,291 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 17.972,
+      "ttft_p50_s": 18.021,
+      "ttft_p99_s": 18.038,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 28.086,
+      "ttft_p50_s": 28.098,
+      "ttft_p99_s": 28.185,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 14.465,
+      "ttft_p50_s": 14.492,
+      "ttft_p99_s": 14.603,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 763.23,
+        "p50_ms": 762.43,
+        "p99_ms": 767.21
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 21.14,
+        "p50_ms": 21.99,
+        "p99_ms": 22.63
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 784.37,
+        "p50_ms": 785.03,
+        "p99_ms": 789.2
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 529.24,
+        "p50_ms": 529.16,
+        "p99_ms": 531.03
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 30.84,
+        "p50_ms": 30.61,
+        "p99_ms": 32.49
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1053.49,
+        "p50_ms": 1051.46,
+        "p99_ms": 1058.85
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 503.5,
+        "p50_ms": 503.56,
+        "p99_ms": 505.27
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 29.32,
+        "p50_ms": 30.47,
+        "p99_ms": 32.71
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1161.24,
+        "p50_ms": 1163.11,
+        "p99_ms": 1183.79
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 819,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 432,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 60,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 105,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 491,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 472,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 166,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 172,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 472,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 624,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 58,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 62,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 14.465,
+    "ttft_p50_s": 14.492,
+    "ttft_p99_s": 14.603,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t3-feature-export",
+        "run_id": "9a96ded4-7a09-4a92-be1a-0280648dbc24",
+        "run_uid": "9a96ded4",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t3-feature-export",
+        "run_id": "56effcac-e6e6-47c8-ab75-01d9607602c4",
+        "run_uid": "56effcac",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t3-feature-export",
+        "run_id": "d66ad64d-d1cb-4bf1-b205-be56a44814f4",
+        "run_uid": "d66ad64d",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t3-feature-export",
+        "run_id": "68c93cc3-8ccf-46f1-b5ad-27091bb112b6",
+        "run_uid": "68c93cc3",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t3-feature-export",
+        "run_id": "e5753adf-9493-46a4-95c5-1a1ee7ad005a",
+        "run_uid": "e5753adf",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}

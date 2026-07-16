@@ -1,0 +1,291 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 34.002,
+      "ttft_p50_s": 34.006,
+      "ttft_p99_s": 34.125,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 25.555,
+      "ttft_p50_s": 25.567,
+      "ttft_p99_s": 25.692,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 15.063,
+      "ttft_p50_s": 15.055,
+      "ttft_p99_s": 15.314,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 899.98,
+        "p50_ms": 901.04,
+        "p99_ms": 901.76
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 36.79,
+        "p50_ms": 34.22,
+        "p99_ms": 43.03
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1010.11,
+        "p50_ms": 1010.58,
+        "p99_ms": 1011.32
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 638.52,
+        "p50_ms": 638.14,
+        "p99_ms": 641.02
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 75.97,
+        "p50_ms": 31.32,
+        "p99_ms": 262.69
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 851.76,
+        "p50_ms": 842.11,
+        "p99_ms": 900.47
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 506.67,
+        "p50_ms": 505.8,
+        "p99_ms": 508.39
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 26.74,
+        "p50_ms": 27.25,
+        "p99_ms": 28.54
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1162.24,
+        "p50_ms": 1174.55,
+        "p99_ms": 1179.55
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 985,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 1060,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 58,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 197,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 619,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 302,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 146,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 159,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 490,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 624,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 62,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 66,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 15.063,
+    "ttft_p50_s": 15.055,
+    "ttft_p99_s": 15.314,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t4-cross-repo-migration",
+        "run_id": "e4e01e95-4c35-48da-b6b0-8c9a89ffc5a8",
+        "run_uid": "e4e01e95",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t4-cross-repo-migration",
+        "run_id": "58d489e6-152c-46ef-8f2a-36ea1cba16e1",
+        "run_uid": "58d489e6",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t4-cross-repo-migration",
+        "run_id": "4394b675-8705-4912-844c-7bebc4f24c7f",
+        "run_uid": "4394b675",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t4-cross-repo-migration",
+        "run_id": "d79181f7-a98d-4f63-9bf6-b1f01f43fb07",
+        "run_uid": "d79181f7",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t4-cross-repo-migration",
+        "run_id": "2d5aeb32-cb27-499a-8f3f-a90d53fd3031",
+        "run_uid": "2d5aeb32",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}

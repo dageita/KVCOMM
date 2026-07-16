@@ -1,0 +1,291 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 10.13,
+      "ttft_p50_s": 10.101,
+      "ttft_p99_s": 10.338,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 39.655,
+      "ttft_p50_s": 39.612,
+      "ttft_p99_s": 39.987,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 13.805,
+      "ttft_p50_s": 13.819,
+      "ttft_p99_s": 13.974,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 596.21,
+        "p50_ms": 596.15,
+        "p99_ms": 596.84
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 8.69,
+        "p50_ms": 8.53,
+        "p99_ms": 9.95
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 604.9,
+        "p50_ms": 604.84,
+        "p99_ms": 606.1
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 1437.59,
+        "p50_ms": 1444.75,
+        "p99_ms": 1450.27
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 53.46,
+        "p50_ms": 53.58,
+        "p99_ms": 59.85
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1491.05,
+        "p50_ms": 1500.15,
+        "p99_ms": 1504.6
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 1031.56,
+        "p50_ms": 1031.65,
+        "p99_ms": 1031.93
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 160.91,
+        "p50_ms": 158.51,
+        "p99_ms": 171.89
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1192.47,
+        "p50_ms": 1189.89,
+        "p99_ms": 1203.58
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 537,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 395,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 23,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 48,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 859,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 1641,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 23,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 190,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 491,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 680,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 51,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 55,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 13.805,
+    "ttft_p50_s": 13.819,
+    "ttft_p99_s": 13.974,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t2-add-tests-normalizer",
+        "run_id": "501cf289-0303-4a69-b35c-cc35f02deeac",
+        "run_uid": "501cf289",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t2-add-tests-normalizer",
+        "run_id": "fb68bce3-f13b-4402-9014-cad98766d30f",
+        "run_uid": "fb68bce3",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t2-add-tests-normalizer",
+        "run_id": "52a52fd4-53fb-43ce-915f-69c8f5f71a78",
+        "run_uid": "52a52fd4",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t2-add-tests-normalizer",
+        "run_id": "8042a833-36bd-4ef9-b7aa-2a588c83fb12",
+        "run_uid": "8042a833",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t2-add-tests-normalizer",
+        "run_id": "df3e99ec-e2da-46ab-874e-8fc066bb40ad",
+        "run_uid": "df3e99ec",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}

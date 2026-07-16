@@ -1,0 +1,291 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 15.713,
+      "ttft_p50_s": 15.701,
+      "ttft_p99_s": 15.922,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 44.778,
+      "ttft_p50_s": 44.757,
+      "ttft_p99_s": 44.921,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 14.423,
+      "ttft_p50_s": 14.395,
+      "ttft_p99_s": 14.556,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 537.75,
+        "p50_ms": 538.09,
+        "p99_ms": 539.01
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 21.76,
+        "p50_ms": 22.22,
+        "p99_ms": 26.23
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 559.51,
+        "p50_ms": 560.67,
+        "p99_ms": 564.32
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 527.82,
+        "p50_ms": 527.77,
+        "p99_ms": 528.23
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 30.69,
+        "p50_ms": 30.13,
+        "p99_ms": 35.47
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1061.46,
+        "p50_ms": 1064.62,
+        "p99_ms": 1067.68
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 503.82,
+        "p50_ms": 503.71,
+        "p99_ms": 504.84
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 29.91,
+        "p50_ms": 30.14,
+        "p99_ms": 34.52
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1165.2,
+        "p50_ms": 1169.43,
+        "p99_ms": 1182.46
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 506,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 381,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 46,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 94,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 498,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 470,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 286,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 290,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 457,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 623,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 59,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 63,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 14.423,
+    "ttft_p50_s": 14.395,
+    "ttft_p99_s": 14.556,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t3-data-pipeline-report",
+        "run_id": "86ec41bc-1ccb-48fd-825b-03c9c156d3ac",
+        "run_uid": "86ec41bc",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t3-data-pipeline-report",
+        "run_id": "1fcb7f38-2223-47c4-81fc-5dfe4fe08c42",
+        "run_uid": "1fcb7f38",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t3-data-pipeline-report",
+        "run_id": "af5ed608-06d8-4ce7-a1fe-f1f2328ba42c",
+        "run_uid": "af5ed608",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t3-data-pipeline-report",
+        "run_id": "b186838a-a95b-4f9f-9183-9af5222163a1",
+        "run_uid": "b186838a",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t3-data-pipeline-report",
+        "run_id": "7bc033bd-576e-4290-8811-88480f62a528",
+        "run_uid": "7bc033bd",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}

@@ -1,0 +1,291 @@
+{
+  "rows": 24,
+  "agent_rows": 15,
+  "by_agent": {
+    "0": {
+      "samples": 5,
+      "ttft_avg_s": 29.395,
+      "ttft_p50_s": 29.424,
+      "ttft_p99_s": 29.513,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "1": {
+      "samples": 5,
+      "ttft_avg_s": 59.864,
+      "ttft_p50_s": 59.805,
+      "ttft_p99_s": 60.145,
+      "probe": false,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    },
+    "2": {
+      "samples": 5,
+      "ttft_avg_s": 17.214,
+      "ttft_p50_s": 17.203,
+      "ttft_p99_s": 17.28,
+      "probe": true,
+      "ttft_fallback_rate": 0,
+      "output_format_ok_rate": 0
+    }
+  },
+  "inference_by_agent": {
+    "0": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 1350.91,
+        "p50_ms": 1349.94,
+        "p99_ms": 1355.13
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 21.49,
+        "p50_ms": 21.5,
+        "p99_ms": 22.51
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1372.4,
+        "p50_ms": 1372.45,
+        "p99_ms": 1376.62
+      }
+    },
+    "1": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 644.47,
+        "p50_ms": 644.42,
+        "p99_ms": 646.65
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 29.39,
+        "p50_ms": 30.29,
+        "p99_ms": 31.1
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 962.69,
+        "p50_ms": 965.86,
+        "p99_ms": 967.97
+      }
+    },
+    "2": {
+      "gen_ttft": {
+        "samples": 5,
+        "avg_ms": 539.86,
+        "p50_ms": 539.82,
+        "p99_ms": 540.34
+      },
+      "kvcomm_ms": {
+        "samples": 5,
+        "avg_ms": 29.44,
+        "p50_ms": 28.86,
+        "p99_ms": 32.26
+      },
+      "sidecar_ttft_ms": {
+        "samples": 5,
+        "avg_ms": 1224.56,
+        "p50_ms": 1226.25,
+        "p99_ms": 1231.17
+      }
+    }
+  },
+  "reuse_by_agent": {
+    "0": {
+      "prefix_tokens_max": {
+        "avg": 1310,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 483,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 81,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 168,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "1": {
+      "prefix_tokens_max": {
+        "avg": 595,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 304,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 381,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 399,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    },
+    "2": {
+      "prefix_tokens_max": {
+        "avg": 601,
+        "samples": 5
+      },
+      "tool_schema_tokens_sum": {
+        "avg": 635,
+        "samples": 5
+      },
+      "response_anchor_tokens_sum": {
+        "avg": 72,
+        "samples": 5
+      },
+      "input_anchor_tokens_sum": {
+        "avg": 0,
+        "samples": 5
+      },
+      "response_decode_tokens_sum": {
+        "avg": 77,
+        "samples": 5
+      },
+      "short_circuit_count": {
+        "avg": 0,
+        "samples": 5
+      },
+      "input_reuse_kinds": []
+    }
+  },
+  "measure_kv_reuse_rate_avg": 0,
+  "measure_kv_reuse_runs": 5,
+  "probe": {
+    "samples": 5,
+    "ttft_avg_s": 17.214,
+    "ttft_p50_s": 17.203,
+    "ttft_p99_s": 17.28,
+    "ttft_fallback_rate": 0
+  },
+  "comms_ok_rate": 1,
+  "units": {
+    "ttft": "s"
+  },
+  "clawbench_capability": {
+    "runs": 5,
+    "scored_runs": 5,
+    "run_score_avg": 1,
+    "completion_score_avg": 1,
+    "trajectory_score_avg": 1,
+    "behavior_score_avg": 1,
+    "pass_rate": 1,
+    "by_measure": [
+      {
+        "measure_index": 1,
+        "task_id": "t4-life-trip-plan",
+        "run_id": "67a30467-f23f-409c-8ff0-c8845e7b2608",
+        "run_uid": "67a30467",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 2,
+        "task_id": "t4-life-trip-plan",
+        "run_id": "765d13d7-f706-459a-814f-ee1a2183fba9",
+        "run_uid": "765d13d7",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 3,
+        "task_id": "t4-life-trip-plan",
+        "run_id": "39ebaa4a-4567-4e34-820e-feeef998e237",
+        "run_uid": "39ebaa4a",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 4,
+        "task_id": "t4-life-trip-plan",
+        "run_id": "8231d867-d719-46cf-9584-4e8edd3defe5",
+        "run_uid": "8231d867",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      },
+      {
+        "measure_index": 5,
+        "task_id": "t4-life-trip-plan",
+        "run_id": "7c73073f-85b5-4d98-8ec4-716a30a3666a",
+        "run_uid": "7c73073f",
+        "run_score": 1,
+        "completion_score": 1,
+        "trajectory_score": 1,
+        "behavior_score": 1,
+        "judge_score": null,
+        "measure_kv_reuse_rate": 0,
+        "measure_kv_reuse_count": 0,
+        "measure_sidecar_requests": 3,
+        "passed": true,
+        "failed_assertions": [],
+        "trajectory_violations": []
+      }
+    ],
+    "units": {
+      "scores": "0-1 (ClawBench score_task_run)",
+      "pass_threshold": 0.7
+    }
+  }
+}
